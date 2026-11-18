@@ -570,22 +570,22 @@ bool copy_depth(ID3D12GraphicsCommandList *gl,
     return true;
 }
 
-bool copy_mvec(ID3D12GraphicsCommandList *gl,
-               const D3D12_TEXTURE_COPY_LOCATION &src,
-               const D3D12_TEXTURE_COPY_LOCATION &dst)
-{
-    // This source already keeps motion vectors on the direct path (see the
-    // depth-lane contract above). Returning false makes the caller record that
-    // direct copy; do not pretend the unused staging members are a live lane.
-    (void)gl; (void)src; (void)dst;
-    return false;
-}
-
 // StageCopy off: exactly the old call.
 // StageCopy on: the game's queue signals g_sf (its copies into the staging ring are
 // done), the copy queue waits on that, moves every slot not yet moved up to f into
 // gxfer, and signals gfence. Then the game's queue is told to wait - ON THE GPU -
 // for gfence f+2-RING, so the slot its next frame writes has been moved out.
+// Motion vectors stay on the direct lane: the staged ring is only for colour
+// and depth. Returning false makes the caller record the original cross-adapter
+// copy, exactly as R333 describes ("motion vectors and seal remain direct").
+bool copy_mvec(ID3D12GraphicsCommandList *gl,
+               const D3D12_TEXTURE_COPY_LOCATION &src,
+               const D3D12_TEXTURE_COPY_LOCATION &dst)
+{
+    (void)gl; (void)src; (void)dst;
+    return false;
+}
+
 bool signal(ID3D12CommandQueue *gq, ID3D12Fence *gfence, unsigned long long f)
 {
     if (!active() || g_cq == nullptr || g_sf == nullptr)

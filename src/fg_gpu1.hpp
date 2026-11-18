@@ -48,6 +48,10 @@ bool sync_neural(bool neural);
 // A false return always means the worker presents the current real nr_final.
 bool handoff(float r, float g, float b);
 
+// Rolling FPS of the frames this module's pacing thread actually presented
+// (generated + real). 0 before the first pair. Overlay read, benign race.
+double display_fps();
+
 // Join outside the stream lock; its present path takes that lock.
 void stop();
 

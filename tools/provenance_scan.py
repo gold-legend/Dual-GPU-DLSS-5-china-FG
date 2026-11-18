@@ -103,3 +103,4 @@ for f in sorted(os.listdir(mine)):
         span = ' '.join(t[r[0]:r[0]+N+ (r[1]-r[0])])
         print(f"    run of {r[1]-r[0]+N} tokens  <- {r[2][0]}")
         print(f"      {span[:150]}")
+

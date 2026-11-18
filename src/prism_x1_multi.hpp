@@ -2,7 +2,6 @@
 
 #include <windows.h>
 #include <d3d12.h>
-#include "prism_x1_motion.hpp"
 
 // Three independent PX1 instances. A pass never reads another pass's history,
 // GuidedFit coefficients, descriptor heap or intensity/guard state.
@@ -23,8 +22,7 @@ bool compose(unsigned pass, ID3D12GraphicsCommandList *cl, unsigned parity,
              ID3D12Resource *base, ID3D12Resource *mask_base,
              ID3D12Resource *low_proxy, ID3D12Resource *low_neural, ID3D12Resource *out,
              unsigned low_width, unsigned low_height,
-             ID3D12Resource *depth, bool limit_residual,
-             const MgpuPrismMotion &motion);
+             ID3D12Resource *depth, bool limit_residual);
 
 void set_intensity(unsigned pass, float value);
 float intensity(unsigned pass);

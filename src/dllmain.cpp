@@ -70,7 +70,7 @@
 // R141: the log must say which build wrote it. 0.2.5 + R210 + R208 (FP16, off).
 // R369: bumped to 0.5.1. It was NOT bumped for 0.5.0 - every 0.5.0 log says "MGPU Bridge 0.4.0" (the
 // R173 hazard above, again; the first 0.5.0 report quoted it).
-#define MGPU_VERSION_STR "2.1.0-prism"
+#define MGPU_VERSION_STR "0.6.0-prism"
 
 
 // ---- P6.4: the overlay panel ----

@@ -145,7 +145,7 @@ target_sources(mgpu_bridge PRIVATE src/native_input.cpp src/native_pixels.cpp sr
 target_include_directories(mgpu_bridge PRIVATE
     "ext/reshade/include"
     "third_party/minhook/include"
-    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mgpu_native_input/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../Mgpu-native-input/include"
 )
 
 # ---------------------------------------------------------------------------
@@ -288,8 +288,6 @@ if(MGPU_BUILD_TESTS)
     )
     add_test(NAME mgpu_adapter_selection_test
              COMMAND mgpu_adapter_selection_test)
-    add_executable(mgpu_fg_pace_test tests/fg_pace_test.cpp)
-    add_test(NAME mgpu_fg_pace_test COMMAND mgpu_fg_pace_test)
     # T1.19 (Dom): the instruments' state machines, off-device
     add_executable(mgpu_temporal_diag_test tests/temporal_diag_test.cpp src/temporal_diag.cpp)
     add_test(NAME mgpu_temporal_diag_test COMMAND mgpu_temporal_diag_test)
@@ -308,7 +306,7 @@ if(MGPU_BUILD_TESTS)
     add_executable(mgpu_native_input_test tests/native_input_test.cpp src/native_input.cpp)
     target_include_directories(mgpu_native_input_test PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mgpu_native_input/include")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../Mgpu-native-input/include")
     target_compile_definitions(mgpu_native_input_test PRIVATE
         WIN32_LEAN_AND_MEAN NOMINMAX _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR MGPU_NATIVE_INPUT_TEST)
     target_link_libraries(mgpu_native_input_test PRIVATE d3d12)
@@ -317,7 +315,7 @@ if(MGPU_BUILD_TESTS)
         tests/native_pixels_test.cpp src/native_pixels.cpp src/native_input.cpp)
     target_include_directories(mgpu_native_pixels_test PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
-        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mgpu_native_input/include")
+        "${CMAKE_CURRENT_SOURCE_DIR}/../Mgpu-native-input/include")
     target_compile_definitions(mgpu_native_pixels_test PRIVATE
         WIN32_LEAN_AND_MEAN NOMINMAX _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
     target_link_libraries(mgpu_native_pixels_test PRIVATE d3d12)

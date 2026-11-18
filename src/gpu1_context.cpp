@@ -68,8 +68,8 @@
 #include "prism_x1_multi.hpp" // PX1: independent current-frame reconstruction/history for each NR pass
 #include "prism_ensemble.hpp" // Three same-original NR passes + current-frame robust composite
 #include "gpu0_stage.hpp" // R333: StageCopy, GPU 0 async staging (Dave's OPT5 design). Off unless StageCopy=1
-#include "fg_gpu1.hpp"    // R341: DLSS Frame Generation on the neural card (Dave's DLSSG1 design). Off unless FrameGen=4
-#include "fg_instr.hpp"   // R371/R403: read-only verification after the bridge chain presents
+#include "fg_gpu1.hpp"
+#include "fg_instr.hpp"    // R341: DLSS Frame Generation on the neural card (Dave's DLSSG1 design). Off unless FrameGen=4
 #include "fg_map.hpp"     // D2.0 NR step one: read-only frame-gen vector map. Off unless NRFrameFilter=1 (one load per site)
 #include "b1_contract.hpp" // B1: strict same-frame + same-generation NR acceptance
 
@@ -2411,7 +2411,6 @@ bool present_frame(float r, float g, float b)
     if (mgpu::strace::on()) mgpu::strace::note_bridge_present((unsigned)hr, mgpu::strace::now_ms() - r313_p0);   // R313
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
-    mgpu::fginstr::after_present(sc);
 
     // ---- R111: THE SUCCESS CODES PRESENT RETURNS, WHICH WERE INVISIBLE ----
     //
@@ -2448,6 +2447,11 @@ bool present_frame(float r, float g, float b)
             mgpu::diag::warn(occl);
         }
     }
+
+    // FGInstr (R371/R386/R403): the thread that presented feeds the frame-
+    // statistics sampler after a successful, displayed Present. Read-only.
+    if (hr == S_OK)
+        mgpu::fginstr::after_present(sc);
 
     // D6: NO WAIT HERE. This is the stall the ring exists to remove - a full
     // GPU round trip taken on the consume thread, once per presented frame,
@@ -9805,7 +9809,6 @@ namespace
         //                              interesting one
         unsigned long long q_hist[8] = {};
         unsigned long long q_sum = 0, q_n = 0, q_max = 0;
-        unsigned long long q_live_next = 1200; // read-only live L1 report; no rendering behavior
         unsigned long long consumed = 0;   // frames whose seal has been checked
         unsigned long long last_seen = 0;
 
@@ -10280,8 +10283,8 @@ namespace
         UINT cv_inc = 0;
         unsigned long long cv_built = 0, cv_fb_far = 0, cv_fb_old = 0, cv_fb_slot = 0;
         unsigned long long cv_late = 0;           // frames more than one game frame late
-        static const UINT EV_MAX = 12;            // PX1: three read-only marks for each of three passes
-        static const unsigned EV_ROLES = 28;      // PX1: per-pass input/down, NGX and reconstruction brackets
+        static const UINT EV_MAX = 6;             // R217: + shrink, chain, stretch around 2 passes
+        static const unsigned EV_ROLES = 19;      // R216: + shrink, stretch, crop, cut, SR; R217: chain
         ID3D12QueryHeap *evheap = nullptr;
         ID3D12Resource *evread = nullptr;
         bool ev_ok = false;
@@ -10495,6 +10498,7 @@ namespace
         // Decides the fix (a deeper ring, or copy timing = LateLatch) from numbers; changes nothing itself.
         unsigned re_on = 0u;
         unsigned long long re_hist[8] = {}, re_nodepth[8] = {}, re_nomvec[8] = {}, re_report_at = 0ull;
+        unsigned long long fg_diag_n = 0ull;   // FG input diagnostic counter
 
         std::atomic<unsigned long long> mvec_copies{0}, mvec_missing{0};
         std::atomic<unsigned long long> mvec_copies_tap{0};   // R280o: the subset of mvec_copies made by the R277 tap
@@ -20196,14 +20200,6 @@ void ui_set_intensity(unsigned pass_1based, float v)
         for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.intensity[i] = v;
     else if (pass_1based <= stream_state::MAX_PASSES)
         s.intensity[pass_1based - 1] = v;
-    // B1/native-DLSS performs the visible 0..300% edit in PX1 on GPU1.
-    // Update that destination immediately as well as the per-frame stream copy;
-    // saving Intensity alone cannot alter this pipeline (NGX intentionally runs at 1.0).
-    if (pass_1based == 0)
-        for (unsigned i = 0; i < stream_state::MAX_PASSES && i < mgpu::prism_x1m::kMaxPasses; ++i)
-            mgpu::prism_x1m::set_intensity(i, v);
-    else if (pass_1based <= mgpu::prism_x1m::kMaxPasses)
-        mgpu::prism_x1m::set_intensity(pass_1based - 1u, v);
     ++s.intensity_edits;
     // P7.4: touching a value by hand means the shape is no longer a preset.
     // Silently keeping the preset label over hand-edited numbers is how a run
@@ -23781,19 +23777,16 @@ static inline bool r331_depth_in_slot(const stream_state &s, unsigned slot, unsi
     return s.depth_slot_valid[slot] != 0u;
 }
 // R331 (OPT4). With the copy queue the lane was copied one poll before the bind:
-// require both that the copy was recorded and that this exact frame's seal is now
-// present. Mode 2 may record that copy speculatively, before the CPU can see the
-// seal; copied bytes alone must never make an invalid lane eligible for DLSS.
+// bind what was copied. Without it the inline copy is in this same list and the
+// slot test is the truth. Key absent: the slot test, as before.
 static inline bool r331_mvec_bound(const stream_state &s, unsigned slot, unsigned long long f, bool use_cq, unsigned ii)
 {
-    if (s.seal_valid_on != 0u && use_cq)
-        return s.cq_mvec_ok[ii] != 0u && r331_mvec_in_slot(s, slot, f);
+    if (s.seal_valid_on != 0u && use_cq) return s.cq_mvec_ok[ii] != 0u;
     return r331_mvec_in_slot(s, slot, f);
 }
 static inline bool r331_depth_bound(const stream_state &s, unsigned slot, unsigned long long f, bool use_cq, unsigned ii)
 {
-    if (s.seal_valid_on != 0u && use_cq)
-        return s.cq_depth_ok[ii] != 0u && r331_depth_in_slot(s, slot, f);
+    if (s.seal_valid_on != 0u && use_cq) return s.cq_depth_ok[ii] != 0u;
     return r331_depth_in_slot(s, slot, f);
 }
 
@@ -23994,11 +23987,8 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
     // transitions from there - which is what the before-state comment in
     // stream_poll is about.
     bool r331_depth_copied = false, r331_mvec_copied = false;   // R331 (OPT4)
-    // Mode 2 can arm f+1 before its CPU-side seal exists. The GPU fence below
-    // guarantees arrival before these copies execute, so record all three lanes
-    // together; r331_*_bound still requires the exact frame's valid seal at use.
     if (s.depth_mode != 0 && s.tex_depth[ii] != nullptr &&
-        s.depth_bytes != 0 && (s.cq_gated || r331_depth_in_slot(s, slot, f)))
+        s.depth_bytes != 0 && r331_depth_in_slot(s, slot, f))
     {
         r331_depth_copied = true;
         D3D12_TEXTURE_COPY_LOCATION dsu{}, ddu{};
@@ -24021,7 +24011,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)
     r338_mvec_source(s, slot, f, r338_slot, r338_f);
     s.r338_slot_ii[ii] = r338_slot; s.r338_f_ii[ii] = r338_f;   // R338a: the pair every gate of frame f reads
     if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-        s.mvec_bytes2 != 0 && (s.cq_gated || r331_mvec_in_slot(s, r338_slot, r338_f)))
+        s.mvec_bytes2 != 0 && r331_mvec_in_slot(s, r338_slot, r338_f))
     {
         r331_mvec_copied = true;
         D3D12_TEXTURE_COPY_LOCATION msu{}, mdu{};
@@ -24624,24 +24614,6 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 }
                 D3D12_RANGE en{0, 0};
                 s.evread->Unmap(0, &en);
-            }
-        }
-        // Live PX1 stage totals: some ReShade/game exit paths unregister the add-on
-        // without reaching the final stream summary, so do not make the data depend on exit.
-        if (s.ev_ok && run_nr && s.ts_n != 0ull && s.ts_n % 600ull == 0ull)
-        {
-            for (unsigned p = 0u; p < 3u; ++p)
-            {
-                const unsigned ri = 19u + p, rn = 22u + p, rc = 25u + p;
-                if (s.ev_n[ri] == 0ull || s.ev_n[rn] == 0ull || s.ev_n[rc] == 0ull) continue;
-                char pl[300];
-                snprintf(pl, sizeof pl,
-                         "[MGPU][PX1PERF] cumulative GPU1 ms P%u | input+Down=%.3f | NGX=%.3f | Fit+Compose=%.3f | n=%llu/%llu/%llu",
-                         p + 1u, s.ev_sum[ri] / (double)s.ev_n[ri],
-                         s.ev_sum[rn] / (double)s.ev_n[rn],
-                         s.ev_sum[rc] / (double)s.ev_n[rc],
-                         s.ev_n[ri], s.ev_n[rn], s.ev_n[rc]);
-                mgpu::diag::info(pl);
             }
         }
 
@@ -25387,15 +25359,6 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 if (lat > s.lat_max) { s.lat_max = lat; s.lat_max_frame = got.frame_index; }
                 if (s.lat_n == 0) s.first_lat = lat;
                 s.lat_sum += lat; ++s.lat_n;
-                // R394 was declared and printed but never fed. Feed the existing
-                // read-only instrument at the actual consume point; the fence
-                // query is non-blocking and is skipped when instruments are off.
-                if (mgpu::fginstr::on())
-                {
-                    const unsigned long long arrived = (s.nfence != nullptr)
-                        ? (unsigned long long)s.nfence->GetCompletedValue() : 0ull;
-                    mgpu::fginstr::note_consume(lat, got.frame_index, s.produced, arrived, got.qpc_submit);
-                }
 
                 // L2: from the fence sighting, not from the record.
                 if (s.seen_fence_at != 0 && s.freq.QuadPart > 0)
@@ -25407,7 +25370,6 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         if (rl < s.ready_min) s.ready_min = rl;
                         if (rl > s.ready_max) s.ready_max = rl;
                         s.ready_sum += rl; ++s.ready_n;
-                        mgpu::fginstr::note_ready(rl);
                     }
                 }
                 if (slot < stream_state::RING) ++s.slot_hits[slot];
@@ -25541,24 +25503,6 @@ void stream_poll()
         for (int bi = 0; bi < 8; ++bi) bk.hist[bi] = s.q_hist[bi];
         bk.sum = s.q_sum; bk.n = s.q_n; bk.max = s.q_max;
         mgpu::pdiag::periodic(s.produced, bk);
-    }
-
-    // Live L1: expose the existing copy-record queue samples before exit.
-    // This only formats counters already recorded by stream_on_finish_effects;
-    // it does not wait on either GPU or change production, transport or pacing.
-    if (s.gfence != nullptr && s.q_n > 0 && s.produced >= s.q_live_next)
-    {
-        s.q_live_next = s.produced + 1200;
-        char ql[720]; int qw = 0;
-        qw += snprintf(ql + qw, sizeof ql - (size_t)qw,
-                       "[MGPU][L1L] GPU0 BACKLOG LIVE at copy-record, produced=%llu n=%llu mean=%.2f max=%llu | frames behind:",
-                       s.produced, s.q_n, (double)s.q_sum / (double)s.q_n, s.q_max);
-        for (unsigned b = 0; b < 8 && qw < (int)sizeof ql - 100; ++b)
-            qw += snprintf(ql + qw, sizeof ql - (size_t)qw, " %u%s=%llu",
-                           b, (b == 7) ? "+" : "", s.q_hist[b]);
-        snprintf(ql + qw, sizeof ql - (size_t)qw,
-                 ". Cumulative this run; read-only, no fence wait. SEAL starts at command recording, so this is its CPU-lead component, not PCIe copy time.");
-        mgpu::diag::info(ql);
     }
 
     // ---- V28: THE INNER LOOP. Decide, then fall through to the commit. ----
@@ -27572,19 +27516,6 @@ void stream_poll()
                         ++s.cv_built;
                         vr_mark(s, 18u);
                     }
-                    // Live proof, not only a normal-exit total: a running game can
-                    // show whether late frames actually consume the chain or keep
-                    // falling back while the user is looking at the artefact.
-                    if (s.cv_late != 0ull && s.cv_late % 600ull == 0ull)
-                    {
-                        char cl[320];
-                        snprintf(cl, sizeof cl,
-                                 "[MGPU][R217][LIVE] f=%llu game=%llu late=%llu chained=%llu "
-                                 "this-frame=%d elapsed=%.0f | fallback far=%llu old=%llu slot=%llu",
-                                 f, gnow, s.cv_late, s.cv_built, cv_ran ? 1 : 0,
-                                 (double)mv_el_frame, s.cv_fb_far, s.cv_fb_old, s.cv_fb_slot);
-                        mgpu::diag::info(cl);
-                    }
                 }
                 const bool cv_nr_on = cv_ran && s.cv_nr != 0u;
                 // R300a1 / R300a7 (T1.19, any temporal key only). Keys absent: nothing is called and tdec / jout
@@ -27628,36 +27559,29 @@ void stream_poll()
                     jout = mgpu::tdiag::jitter_decide(ji);
                 }
                 // R323 (HistoryGate=1): one decision per consumed frame, every pass follows it.
-                // Yihuan's temporal path also clears history when that frame has no valid motion
-                // input. Native-DLSS titles need the same guard: a colour-only evaluate must not
-                // become the history anchor for the next three-pass chain.
                 bool gate_rst = false;
                 if (g_hist_gate.load(std::memory_order_relaxed) != 0)
                 {
                     const int gd = (int)s.slot_dlss[slot].load(std::memory_order_acquire);
                     const bool no_dlss = (gd == 0);   // -1: no table on this title, the gate cannot tell, history as before
-                    const bool no_mvec = (s.mvec_mode == 3 && !mvec_here);
-                    const bool bad_history_input = no_dlss || no_mvec;
-                    gate_rst = bad_history_input || s.gate_break;
-                    if (bad_history_input && !s.gate_break)
+                    gate_rst = no_dlss || s.gate_break;
+                    if (no_dlss && !s.gate_break)
                     {
                         ++s.gate_stretches; s.gate_since = f;
                         if (s.gate_stretches <= 3u)
                         {
-                            char gl[240];
-                            snprintf(gl, sizeof gl, "[MGPU][R323] %s at f=%llu: Reset=1 on every pass until valid history input returns (stretch %u).",
-                                     no_mvec ? "no same-frame motion vectors" : "no DLSS from the game",
-                                     f, s.gate_stretches);
+                            char gl[200];
+                            snprintf(gl, sizeof gl, "[MGPU][R323] no DLSS from the game at f=%llu: Reset=1 on every pass until it returns (stretch %u).", f, s.gate_stretches);
                             mgpu::diag::info(gl);
                         }
                     }
-                    else if (!bad_history_input && s.gate_break && s.gate_stretches <= 3u)
+                    else if (!no_dlss && s.gate_break && s.gate_stretches <= 3u)
                     {
-                        char gl[220];
-                        snprintf(gl, sizeof gl, "[MGPU][R323] valid history input is back at f=%llu after %llu frame(s): one more Reset=1, then temporal history resumes.", f, f - s.gate_since);
+                        char gl[200];
+                        snprintf(gl, sizeof gl, "[MGPU][R323] DLSS is back at f=%llu after %llu frame(s): one more Reset=1, then history from the game.", f, f - s.gate_since);
                         mgpu::diag::info(gl);
                     }
-                    s.gate_break = bad_history_input;
+                    s.gate_break = no_dlss;
                 }
                 if (!s.local_nr && s.nr_p1_recreate_req) r361_recreate_pass1(s);   // R361: before this frame's evaluates
                 if (!s.local_nr && s.nr_res_req_mask != 0u)                        // R364: the panel's Residual / Native buttons
@@ -27754,7 +27678,7 @@ void stream_poll()
                                     compose_pass, s.nl, (unsigned)(f & 7ull),
                                     s.tex_in[ii], s.tex_in[ii], low_proxy, nr_final, s.tex_out,
                                     final_w, final_h,
-                                    nullptr, false, MgpuPrismMotion{});
+                                    nullptr, false);
                             }
                             // NR outputs are UAV between frames. Compose reads in
                             // command order before this transition is executed.
@@ -27974,40 +27898,6 @@ void stream_poll()
                     // R309: stepped aside - the zero field (tex_mvec) through the synthetic branch below,
                     // fresh vectors or not. Exactly what MVec=1 with MVecDX=MVecDY=0 binds.
                     const bool r309_zero = r311e_zero && s.r309_zero_ready && s.mvec_mode == 3;   // R311e: zero until R280's verdict, or stepped aside
-                    // Native DLSS can allocate its vector target at the display extent while
-                    // writing only the render-sized corner. NR receives the game's UPSCALED
-                    // output, so both parts of that contract matter here: bind only the corner
-                    // the game declared, and convert render-pixel displacement to native pixels.
-                    // The later NRS block applies work/native as before; the product is therefore
-                    // work/render, not work/native. FG keeps receiving the untouched source.
-                    bool native_mv_contract = false;
-                    bool native_mv_subrect = false;
-                    unsigned native_mv_x = 0u, native_mv_y = 0u;
-                    unsigned native_mv_w = 0u, native_mv_h = 0u;
-                    float native_mv_kx = 1.0f, native_mv_ky = 1.0f;
-                    if (!cv_nr_on)
-                    {
-                        mgpu::calibrator::table nct{};
-                        const unsigned long long pub = s.mvec_pub_handle.load(std::memory_order_relaxed);
-                        if (mgpu::calibrator::read(nct) &&
-                            (nct.have & (mgpu::calibrator::KEY_SUBRECTS |
-                                         mgpu::calibrator::KEY_DISPLAY_EXT)) ==
-                                (mgpu::calibrator::KEY_SUBRECTS | mgpu::calibrator::KEY_DISPLAY_EXT) &&
-                            ((nct.have & mgpu::calibrator::KEY_MVEC) == 0u || pub == 0ull || nct.mvec == pub) &&
-                            nct.display_w == s.width && nct.display_h == s.height &&
-                            nct.sub_w >= 64u && nct.sub_h >= 64u &&
-                            nct.mvec_x + nct.sub_w <= s.mvec_w && nct.mvec_y + nct.sub_h <= s.mvec_h)
-                        {
-                            native_mv_contract = true;
-                            native_mv_x = nct.mvec_x; native_mv_y = nct.mvec_y;
-                            native_mv_w = nct.sub_w; native_mv_h = nct.sub_h;
-                            native_mv_kx = (float)s.width / (float)nct.sub_w;
-                            native_mv_ky = (float)s.height / (float)nct.sub_h;
-                            native_mv_subrect = !mgpu::mvecex::active() &&
-                                (nct.mvec_x != 0u || nct.mvec_y != 0u ||
-                                 nct.sub_w != s.mvec_w || nct.sub_h != s.mvec_h);
-                        }
-                    }
                     if (!r309_zero && s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                         s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u &&
                         tdec.bind_mvec)   // R300a1: false only with TemporalRequireTuple=1 on an incoherent tuple
@@ -28018,26 +27908,19 @@ void stream_poll()
                         const bool mvex_here = !cv_here && mgpu::mvecex::active() && mgpu::mvecex::output(ii) != nullptr;
                         const unsigned bind_mw = mvex_here ? s.width : s.mvec_w;
                         const unsigned bind_mh = mvex_here ? s.height : s.mvec_h;
-                        const bool use_native_subrect = native_mv_subrect && !mvex_here;
-                        const unsigned mv_sx = use_native_subrect ? native_mv_x : 0u;
-                        const unsigned mv_sy = use_native_subrect ? native_mv_y : 0u;
-                        const unsigned mv_sw = use_native_subrect ? native_mv_w : bind_mw;
-                        const unsigned mv_sh = use_native_subrect ? native_mv_h : bind_mh;
                         s.nr_params->Set("DLSSNR.MVec", cv_here ? s.cv_out :
                                          (mvex_here ? mgpu::mvecex::output(ii) : s.tex_mvec_r[ii]));
                         // R87: scaled by the frames that actually elapsed. With
                         // a consumer that never falls behind this multiplies by
                         // 1.0 and the evaluate is byte-identical to R83's.
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
-                        const float nr_scale_x = s.mvec_scale_x * (cv_here ? 1.0f : native_mv_kx);
-                        const float nr_scale_y = s.mvec_scale_y * (cv_here ? 1.0f : native_mv_ky);
                         // D2.0 NR2: one presented step of a rendered frame's
                         // motion while frame generation is active (fg_frac is
                         // 1.0 otherwise). With a thinned frame before this one
                         // mv_el is 2 and the product is one rendered step.
                         const float mv_k = cv_here ? 1.0f : ((t119_temporal && !own_el) ? tdec.mv_k : mv_el) * fg_frac;   // R217 / R300a1: tdec.mv_k == mv_el unless TemporalMV=single
-                        s.nr_params->Set("DLSSNR.MVecScaleX", nr_scale_x * mv_k);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", nr_scale_y * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
                         if (jout.apply)   // R300a7 (JitterSlot=1 only): the SLOT delta replaces R104's for this evaluate
                         {
                             s.nr_params->Set("DLSSNR.MVecOffsetX", jout.ox);
@@ -28047,37 +27930,19 @@ void stream_poll()
                             if (jout.sync) mgpu::calibrator::sync_jitter_state();   // JitterFallback=sync|zero only
                         }
                         else
-                            mgpu::calibrator::apply_jitter_offset(s.nr_params, nr_scale_x, nr_scale_y);   // R104
+                            mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
                         // R212: the region, scaled to the resource actually bound.
-                        // A declared native-DLSS corner is already in that resource's pixels;
-                        // do not run it through the foveation ratio a second time.
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", use_native_subrect ? mv_sx : (p2r_in
-                            ? (unsigned int)(((unsigned long long)rbx * bind_mw) / s.width) : 0u));
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", use_native_subrect ? mv_sy : (p2r_in
-                            ? (unsigned int)(((unsigned long long)rby * bind_mh) / s.height) : 0u));
-                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", use_native_subrect ? mv_sw : (p2r_in
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
+                            ? (unsigned int)(((unsigned long long)rbx * bind_mw) / s.width) : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
+                            ? (unsigned int)(((unsigned long long)rby * bind_mh) / s.height) : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", p2r_in
                             ? (unsigned int)(((unsigned long long)rw * bind_mw) / s.width)
-                            : bind_mw));
-                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", use_native_subrect ? mv_sh : (p2r_in
+                            : bind_mw);
+                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", p2r_in
                             ? (unsigned int)(((unsigned long long)rh * bind_mh) / s.height)
-                            : bind_mh));
-                        if (pi == 0 && sk == 0)
-                        {
-                            ++s.mvec_bound;
-                            static unsigned said_w = 0u, said_h = 0u;
-                            if (native_mv_contract && (said_w != native_mv_w || said_h != native_mv_h))
-                            {
-                                said_w = native_mv_w; said_h = native_mv_h;
-                                char nvl[360];
-                                snprintf(nvl, sizeof nvl,
-                                         "[MGPU][NRMV] native-DLSS vector contract: valid %ux%u at %u,%u in %ux%u; "
-                                         "NR colour %ux%u, render->native scale %.6f/%.6f (before elapsed and per-pass NRS). "
-                                         "The raw FG input is unchanged.",
-                                         native_mv_w, native_mv_h, native_mv_x, native_mv_y, s.mvec_w, s.mvec_h,
-                                         s.width, s.height, (double)native_mv_kx, (double)native_mv_ky);
-                                mgpu::diag::info(nvl);
-                            }
-                        }
+                            : bind_mh);
+                        if (pi == 0 && sk == 0) ++s.mvec_bound;
                     }
                     else if (!r309_zero && s.mvec_mode == 3 && fg_act && s.tex_mvec_keep != nullptr &&
                              s.mvec_keep_f != 0ull &&
@@ -28095,22 +27960,20 @@ void stream_poll()
                         // through to R61's unset below.
                         s.nr_params->Set("DLSSNR.MVec", s.tex_mvec_keep);
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
-                        const float nr_scale_x = s.mvec_scale_x * native_mv_kx;
-                        const float nr_scale_y = s.mvec_scale_y * native_mv_ky;
                         const float mv_k = mv_el * fg_frac;
-                        s.nr_params->Set("DLSSNR.MVecScaleX", nr_scale_x * mv_k);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", nr_scale_y * mv_k);
-                        mgpu::calibrator::apply_jitter_offset(s.nr_params, nr_scale_x, nr_scale_y);   // R104
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", native_mv_subrect ? native_mv_x : (p2r_in
-                            ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u));
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", native_mv_subrect ? native_mv_y : (p2r_in
-                            ? (unsigned int)(((unsigned long long)rby * s.mvec_h) / s.height) : 0u));
-                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", native_mv_subrect ? native_mv_w : (p2r_in
+                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
+                        mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
+                            ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
+                            ? (unsigned int)(((unsigned long long)rby * s.mvec_h) / s.height) : 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", p2r_in
                             ? (unsigned int)(((unsigned long long)rw * s.mvec_w) / s.width)
-                            : (unsigned int)s.mvec_w));
-                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", native_mv_subrect ? native_mv_h : (p2r_in
+                            : (unsigned int)s.mvec_w);
+                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", p2r_in
                             ? (unsigned int)(((unsigned long long)rh * s.mvec_h) / s.height)
-                            : (unsigned int)s.mvec_h));
+                            : (unsigned int)s.mvec_h);
                         if (pi == 0 && sk == 0) { ++s.mvec_bound; mgpu::fgmap::on_reuse(); }
                     }
                     else if (!r309_zero && s.mvec_mode == 3)
@@ -28525,12 +28388,8 @@ void stream_poll()
                                           ew == s.width && eh == s.height && !s.nrs_on;
                     if (rsd_here) mgpu::residual::before(s.nl, pi, ii, s.nr_params, nr_color);
 
-                    // PX1 read-only GPU brackets: Down/input -> NGX -> GuidedFit+Compose.
-                    // These marks do not alter dispatch order, synchronization or any NGX parameter.
-                    if (x1_frame) vr_mark(s, 19u + pi);
                     const NVSDK_NGX_Result er =
                         s.nr_eval(s.nl, ngx_h, s.nr_params, nullptr);
-                    if (x1_frame) vr_mark(s, 22u + pi);
 
                     if (nrs_here)
                     {
@@ -28627,20 +28486,10 @@ void stream_poll()
                                 ID3D12Resource *px1_mask_base = nrs_anchor;
                                 if (ii < stream_state::RING && s.tex_in[ii] != nullptr)
                                     px1_mask_base = s.tex_in[ii];
-                                // Current-frame motion only modulates PX1's spatial de-speckle
-                                // margin. PX1 receives no usable temporal residual history.
-                                MgpuPrismMotion px1_motion{};
-                                (void)s.nr_params->Get("DLSSNR.MVec", &px1_motion.resource);
-                                (void)s.nr_params->Get("DLSSNR.MVecScaleX", &px1_motion.scale_x);
-                                (void)s.nr_params->Get("DLSSNR.MVecScaleY", &px1_motion.scale_y);
-                                (void)s.nr_params->Get("DLSSNR.MVecSubrectBaseX", &px1_motion.base_x);
-                                (void)s.nr_params->Get("DLSSNR.MVecSubrectBaseY", &px1_motion.base_y);
-                                (void)s.nr_params->Get("DLSSNR.MVecSubrectWidth", &px1_motion.width);
-                                (void)s.nr_params->Get("DLSSNR.MVecSubrectHeight", &px1_motion.height);
                                 x1_written = mgpu::prism_x1m::compose(
                                     pi, s.nl, (unsigned)(s.nr_evals & 7ull), nrs_anchor, px1_mask_base,
                                     s.nrs_color, s.nrs_out, nr_output, nrs_pwi, nrs_phi,
-                                    nrs_depth, false, px1_motion);
+                                    nrs_depth, false); // local rejection, no periodic full-frame reset
                             }
                             if (x1_written)
                             {
@@ -28933,9 +28782,7 @@ void stream_poll()
                     }
                     if (s.ev_ok && s.ev_count < stream_state::EV_MAX)   // R214
                     {
-                        // With PX1 the two brackets above isolate input and NGX; this final
-                        // timestamp therefore measures reconstruction, not another NGX evaluate.
-                        s.ev_role[s.ev_count] = x1_frame ? (25u + pi) : role;
+                        s.ev_role[s.ev_count] = role;
                         ++s.ev_count;
                         s.nl->EndQuery(s.evheap, D3D12_QUERY_TYPE_TIMESTAMP, s.ev_count);
                     }
@@ -29434,6 +29281,14 @@ void stream_poll()
                 // official stream textures, still NON_PIXEL_SHADER_RESOURCE here.
                 if (final_pass_ok && s.nr_final != nullptr)
                 {
+                    if (s.fg_diag_n++ % 600ull == 0ull)
+                    {
+                        char dl[360];
+                        snprintf(dl, sizeof dl, "[MGPU][FG][DIAG] mvec_here=%d tex_mvec_r=%p bytes2=%zu mode=%u | depth_here=%d tex_depth=%p bytes=%zu dmode=%u",
+                                 mvec_here ? 1 : 0, (void *)s.tex_mvec_r[ii], (size_t)s.mvec_bytes2, s.mvec_mode,
+                                 depth_here ? 1 : 0, (void *)s.tex_depth[ii], (size_t)s.depth_bytes, s.depth_mode);
+                        mgpu::diag::info(dl);
+                    }
                     mgpu::fg::record(s.nl, s.nr_final,
                                      mvec_here ? s.tex_mvec_r[ii] : nullptr,
                                      depth_here ? s.tex_depth[ii] : nullptr,
@@ -29933,11 +29788,7 @@ void stream_poll()
                     "pass 2 centre", "pass 2 strip L", "pass 2 strip R",     // R215
                     "shrink", "pass 1 small", "stretch", "pass 1 crop", "pass 2 crop",
                     "cut box", "SR window", "SR cut",                         // R216
-                    "chain / B1 final GuidedFit+PX1",                         // R217 / B1
-                    "PX1 P1 input+Down", "PX1 P2 input+Down", "PX1 P3 input+Down",
-                    "PX1 P1 NGX", "PX1 P2 NGX", "PX1 P3 NGX",
-                    "PX1 P1 Fit+Compose", "PX1 P2 Fit+Compose",
-                    "PX1 P3 Fit+Compose" };
+                    "chain / B1 final GuidedFit+PX1" };                       // R217 / B1
                 char el[2000];
                 int w = snprintf(el, sizeof el,
                                  "[MGPU][R214] PER-EVALUATE GPU TIME on GPU 1, ms (each from the "

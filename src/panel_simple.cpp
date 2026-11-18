@@ -456,7 +456,7 @@ namespace mgpu::psimple
             mgpu::gpu1::ui_state st;
             mgpu::gpu1::ui_read(st);
             if (!st.nrs_on) { ImGui::TextDisabled("NRScale not set in mgpu.ini"); return; }
-            float sc = st.nrs_pscale[0] > 0.05f ? st.nrs_pscale[0] : st.nrs_scale;
+            float sc = st.nrs_scale;
             const float top = (st.nrs_cap > 1.0f) ? st.nrs_cap : 1.0f;
             ImGui::SetNextItemWidth(190.0f);
             if (ImGui::SliderFloat("##nrs_scale", &sc, 0.30f, top, "%.2f"))
@@ -1404,7 +1404,7 @@ namespace mgpu::psimple
         if (st.nrs_on)
         {
             row_label("网络分辨率", "net scale");
-            float sc = st.nrs_pscale[0] > 0.05f ? st.nrs_pscale[0] : st.nrs_scale;
+            float sc = st.nrs_scale;
             ImGui::SetNextItemWidth(ctrl_w - 52.0f);
             if (ImGui::SliderFloat("##pf.nrs", &sc, 0.30f, 1.0f, ""))
                 mgpu::gpu1::ui_nrs_stage(sc);

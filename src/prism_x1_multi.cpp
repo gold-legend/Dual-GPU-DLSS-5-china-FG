@@ -75,17 +75,16 @@ bool compose(unsigned pass, ID3D12GraphicsCommandList *cl, unsigned parity,
              ID3D12Resource *base, ID3D12Resource *mask_base,
              ID3D12Resource *low_proxy, ID3D12Resource *low_neural, ID3D12Resource *out,
              unsigned low_width, unsigned low_height,
-             ID3D12Resource *depth, bool limit_residual,
-             const MgpuPrismMotion &motion)
+             ID3D12Resource *depth, bool limit_residual)
 {
     switch (pass)
     {
     case 0: return prism_x1_p1::compose(cl, parity, base, mask_base, low_proxy, low_neural, out,
-                                        low_width, low_height, depth, limit_residual, motion);
+                                        low_width, low_height, depth, limit_residual);
     case 1: return prism_x1_p2::compose(cl, parity, base, mask_base, low_proxy, low_neural, out,
-                                        low_width, low_height, depth, limit_residual, motion);
+                                        low_width, low_height, depth, limit_residual);
     case 2: return prism_x1_p3::compose(cl, parity, base, mask_base, low_proxy, low_neural, out,
-                                        low_width, low_height, depth, limit_residual, motion);
+                                        low_width, low_height, depth, limit_residual);
     default: return false;
     }
 }

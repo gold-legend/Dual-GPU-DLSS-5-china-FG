@@ -506,6 +506,41 @@ void wait_until(const LARGE_INTEGER &t0, double ms)
     Sleep((DWORD)wait_ms);
 }
 
+namespace disp {
+std::atomic<double> fps{0.0};
+double ts[64] = {};
+unsigned head = 0, count = 0;
+
+// Rolling display FPS over the frames the pacing thread actually puts on
+// screen (generated + real). Written by the pacing thread only, read by the
+// overlay; the cached value makes the race benign.
+void note()
+{
+    static double k = -1.0;
+    if (k < 0.0)
+    {
+        LARGE_INTEGER fq{};
+        QueryPerformanceFrequency(&fq);
+        k = fq.QuadPart != 0 ? 1000.0 / (double)fq.QuadPart : 0.0;
+    }
+    LARGE_INTEGER q{};
+    QueryPerformanceCounter(&q);
+    const double t = (double)q.QuadPart * k;
+    ts[head] = t;
+    head = (head + 1u) % 64u;
+    if (count < 64u) ++count;
+    if (count >= 2u)
+    {
+        const unsigned oldest = count == 64u ? head : 0u;
+        const double span = t - ts[oldest];
+        const unsigned intervals = count == 64u ? 63u : count - 1u;
+        if (span > 0.0) fps.store((double)intervals * 1000.0 / span, std::memory_order_relaxed);
+    }
+}
+
+void reset() { fps.store(0.0, std::memory_order_relaxed); head = count = 0; }
+} // namespace disp
+
 bool present_job(const job_t &job, UINT64 &fence)
 {
     if (job.n_gen > MAX_GEN) return false;
@@ -528,7 +563,11 @@ bool present_job(const job_t &job, UINT64 &fence)
             real ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         const bool ok = mgpu::gpu1::present_frame(job.r, job.g, job.b);
         mgpu::gpu1::present_override(nullptr, D3D12_RESOURCE_STATE_COMMON);
-        if (ok) (real ? g_pres_real : g_pres_gen).fetch_add(1, std::memory_order_relaxed);
+        if (ok)
+        {
+            (real ? g_pres_real : g_pres_gen).fetch_add(1, std::memory_order_relaxed);
+            disp::note();
+        }
         fence = (std::max)(fence, mgpu::gpu1::present_last_fence_value());
         return ok;
     };
@@ -630,6 +669,7 @@ bool arm(const arm_info &i)
     g_mult_armed = g_mult_req; g_mult_cap = g_mult_req;
     g_phase_refused = g_phase_said = false; g_phase_pairs = g_phase_nofit = 0;
     g_made = g_nomv = g_busy_skips = g_errors = g_evals = g_fallbacks = 0;
+    disp::reset();
     g_pres_gen.store(0); g_pres_real.store(0); g_handoffs.store(0); g_dropped.store(0);
     g_half_sum = 0; g_half_n = 0; g_ema_ms = 0; g_last_handoff.QuadPart = 0;
     g_scene.reset(); g_clk.reset(); g_clk.clear_counts(); g_abs.reset(); g_abs.clear_counts();
@@ -742,6 +782,10 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
                            g_pfence->GetCompletedValue() < set.fence)))
     {
         ++g_busy_skips;
+        // This real NR frame never reached DLSSG. The next accepted colour is
+        // therefore not adjacent to the previous accepted colour. Re-seed the
+        // next real-frame pair instead of interpolating across a missing frame.
+        g_need_reset = true;
         return;
     }
     unsigned rw = 0, rh = 0; DXGI_FORMAT rf = DXGI_FORMAT_UNKNOWN;
@@ -1036,4 +1080,9 @@ void release()
     g_armed = false; g_up = false; g_tried = false; g_i = {};
     g_last_eval_fid = g_last_eval_color = 0; g_need_reset = true;
 }
+double display_fps()
+{
+    return disp::fps.load(std::memory_order_relaxed);
+}
+
 } // namespace mgpu::fg

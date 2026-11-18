@@ -36,6 +36,7 @@
 #include "prism_finish.hpp"
 #include "prism_sync.hpp"
 #include "prism_x1_multi.hpp"
+#include "fg_gpu1.hpp"
 #include "skinguard.hpp"
 #include "prism_grade.h"
 #include "residual.hpp"
@@ -2010,7 +2011,7 @@ std::wstring RowHelp(int r, const OvSet &s, int option)
     case kSplit:
         return L"左边原画，右边神经画面。面板打开时可以拖动画面上的分割线。";
     case kFrameGen:
-        return L"在最终神经画面之后运行副卡 DLSS 帧生成，使用游戏 DLSS 的运动向量和深度。2x 生成一张中间帧，4x 生成三张独立中间帧；驱动拒绝 4x 时明确降到 2x。切换后重启游戏生效。";
+        return L"在最终神经画面之后运行副卡 DLSS 帧生成 4x，使用真实运动向量、深度和相机输入。切换后必须重启游戏才生效；默认关闭，Dynamic 不自动开启。";
     }
     return L"";
 }
@@ -2092,7 +2093,7 @@ void DrawPanel(UINT bw, UINT bh, float dt)
     // Header: name, version, state.
     {
         const float cy = y0 + std::round((headH - LineHeight(kTitle)) * 0.5f);
-        const float nw = Text(x0 + pad, cy, L"MGPU 神经渲染", kTitle, kWhite);
+        const float nw = Text(x0 + pad, cy, L"MGPU Prism 2.2", kTitle, kWhite);
         Text(x0 + pad + nw + U(8), cy + U(2), L"0.4", kLabel, kQuiet);
         const wchar_t *state;
         uint32_t mark;
@@ -2166,9 +2167,14 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         }
         const float sizeY = vy + LineHeight(kValue) + U(6);
         Text(gx0, sizeY, sizes, kLabel, kQuiet);
-        wchar_t rateText[128];
-        std::swprintf(rateText, 128, L"神经计算 %.1f fps　·　游戏生产 %.1f fps",
-                      (double)g_stats.evalFps, (double)g_stats.renderFps);
+        wchar_t rateText[160];
+        const double fg_fps = mgpu::fg::display_fps();
+        if (fg_fps > 0.0)
+            std::swprintf(rateText, 160, L"神经计算 %.1f fps　·　游戏生产 %.1f fps　·　显示 %.1f fps（含帧生成）",
+                          (double)g_stats.evalFps, (double)g_stats.renderFps, fg_fps);
+        else
+            std::swprintf(rateText, 160, L"神经计算 %.1f fps　·　游戏生产 %.1f fps",
+                          (double)g_stats.evalFps, (double)g_stats.renderFps);
         Text(gx0, sizeY + LineHeight(kLabel) + U(2), rateText, kLabel, kQuiet);
         y += telH;
         Fill(x0, y - t, x1, y, kHair);
@@ -2385,10 +2391,7 @@ void DrawPanel(UINT bw, UINT bh, float dt)
                 char pk[16];
                 snprintf(pk, sizeof pk, "NRScale%u", pi + 1u);
                 (void)mgpu::gpu1::ui_ini_write_float(pk, apply);
-                // Native-DLSS/B1 can own NGX in its private producer state while the
-                // consumer's legacy nr_ok flag is false. That is not a reason to save-only:
-                // staging is safe before the next arm, and the running producer flushes it.
-                mgpu::gpu1::ui_set_scale(pi, apply);
+                if (live) mgpu::gpu1::ui_set_scale(pi, apply);
             }
             break;
         }
@@ -2448,27 +2451,26 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             break;
         }
         case kFrameGen: {
-            const bool enabled = mgpu::gpu1::ui_ini_read("FrameGen", 0) == 4;
-            const int cur = !enabled ? 0 : (mgpu::gpu1::ui_ini_read("FGMulti", 2) == 4 ? 2 : 1);
-            clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"关", L"2x", L"4x"}, cur, 3, 0, &hover, dt, true);
+            const int cur = mgpu::gpu1::ui_ini_read("FrameGen", 0) == 4 ? 1 : 0;
+            clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"关", L"4x"}, cur, 3, 0, &hover, dt, true);
             int want = clicked;
-            if (keyStep) want = std::clamp(cur + step, 0, 2);
-            if (focused && in.enter) want = cur >= 2 ? 0 : cur + 1;
+            if (keyStep) want = step > 0 ? 1 : 0;
+            if (focused && in.enter) want = 1 - cur;
             if (want >= 0 && want != cur)
             {
-                if (want > 0)
+                if (want == 1)
                 {
                     // Official 0.6.0 DLSS-FG defaults. Dynamic stays as the user
                     // configured it; this switch never enables it implicitly.
-                    (void)mgpu::gpu1::ui_ini_write("FGMulti", want == 2 ? 4 : 2);
-                    (void)mgpu::gpu1::ui_ini_write("FGPhase", want == 2 ? 0 : 75);
+                    (void)mgpu::gpu1::ui_ini_write("FGMulti", 4);
+                    (void)mgpu::gpu1::ui_ini_write("FGPhase", 75);
                     (void)mgpu::gpu1::ui_ini_write("FGMvScaleNow", 1);
                     (void)mgpu::gpu1::ui_ini_write("FGMvUnit", 1);
                     (void)mgpu::gpu1::ui_ini_write("FGSkipCarry", 1);
                     (void)mgpu::gpu1::ui_ini_write("FGPace", 1);
                     (void)mgpu::gpu1::ui_ini_write("FGSkipJump", 0);
                     (void)mgpu::gpu1::ui_ini_write("FrameGen", 4);
-                    Toast(want == 2 ? L"帧生成 4x 已保存，重启游戏后生效" : L"帧生成 2x 已保存，重启游戏后生效", kCaution, 3.0);
+                    Toast(L"帧生成 4x 已保存，重启游戏后生效", kCaution, 3.0);
                 }
                 else
                 {

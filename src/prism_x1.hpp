@@ -8,7 +8,6 @@
 
 #include <windows.h>
 #include <d3d12.h>
-#include "prism_x1_motion.hpp"
 
 #ifndef PRISM_X1_NAMESPACE
 #define PRISM_X1_NAMESPACE prism_x1
@@ -38,7 +37,6 @@ bool compose(ID3D12GraphicsCommandList *cl, unsigned parity,
              ID3D12Resource *low_proxy, ID3D12Resource *low_neural, ID3D12Resource *out,
              unsigned low_width, unsigned low_height,
              ID3D12Resource *depth, bool limit_residual,
-             const MgpuPrismMotion &motion,
              mark_callback mark = nullptr, void *mark_context = nullptr);
 
 void set_intensity(float value);
