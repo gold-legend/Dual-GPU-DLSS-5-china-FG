@@ -32,7 +32,6 @@
 #include "panel_simple.hpp"
 #include "prism_finish.hpp"   // PRISM-FINISH: 色彩/角色守护 rows drive the module's live atomics
 #include "prism_sync.hpp"     // PSYNC: the synchronous path owns its character guard
-#include "prism_x1.hpp"       // PX1: reduced path owns its Compose guard and intensity
 #include "prism_grade.h"      // the custom-look (Look 5) control table, verbatim from prism-core 1.5.1
 #include "t119_keys.hpp"      // PRISM-FINISH: the fps.cap row drives the live FrameCap atomic
 
@@ -59,6 +58,7 @@
 
 #include <reshade.hpp>          // the ImGui wrappers (function table), as everywhere else
 #include "gpu1_context.hpp"     // ui_ini_read / ui_ini_write / ui_nrs_* / ui_read
+#include "residual.hpp"         // R364: residual::carries for the live Residual / Native row
 #include "fg_map.hpp"           // R330: frame-generation mode/keep are live only through fgmap
 #include "diag.hpp"
 
@@ -518,7 +518,6 @@ namespace mgpu::psimple
         // ---- R330: the rows a player may also want, all live setters ----
         void row_passes()
         {
-            // PX1 replaces pass 1 in either pipeline; pass count stays selectable.
             mgpu::gpu1::ui_state st;
             mgpu::gpu1::ui_read(st);
             int p = (int)st.passes;
@@ -531,27 +530,28 @@ namespace mgpu::psimple
         {
             mgpu::gpu1::ui_state st;
             mgpu::gpu1::ui_read(st);
-            // The active reconstruction owns its Compose intensity; never amplify NGX as well.
+            // PSYNC owns its Compose intensity; do not also amplify NGX's independent intensity.
             const bool sync = mgpu::psync::active();
-            const bool x1 = mgpu::prism_x1::active();
-            float v = sync ? mgpu::psync::intensity() : x1 ? mgpu::prism_x1::intensity() : st.intensity[0];
+            float v = sync ? mgpu::psync::intensity() : st.intensity[0];
             ImGui::SetNextItemWidth(190.0f);
-            if (ImGui::SliderFloat("##intensity", &v, 0.0f, (sync || x1) ? 3.0f : 2.0f, "%.2f"))
+            if (ImGui::SliderFloat("##intensity", &v, 0.0f, 3.0f, "%.2f"))
             {
-                if (sync) mgpu::psync::set_intensity(v);
-                else if (x1) mgpu::prism_x1::set_intensity(v);
+                if (sync)
+                {
+                    mgpu::psync::set_intensity(v);
+                    (void)mgpu::gpu1::ui_ini_write_float("PrismSyncIntensity", v);
+                }
                 else mgpu::gpu1::ui_set_intensity(0, v);
-                if (sync || x1)
-                    (void)mgpu::gpu1::ui_ini_write_float(x1 ? "PrismX1Intensity" : "PrismSyncIntensity", v);
             }
             ImGui::SameLine();
             if (ImGui::SmallButton(L("ui.default", "default", "intensity").c_str()))
             {
-                if (sync) mgpu::psync::set_intensity(1.0f);
-                else if (x1) mgpu::prism_x1::set_intensity(1.0f);
+                if (sync)
+                {
+                    mgpu::psync::set_intensity(1.0f);
+                    (void)mgpu::gpu1::ui_ini_write_float("PrismSyncIntensity", 1.0f);
+                }
                 else mgpu::gpu1::ui_set_intensity(0, 2.00f);
-                if (sync || x1)
-                    (void)mgpu::gpu1::ui_ini_write_float(x1 ? "PrismX1Intensity" : "PrismSyncIntensity", 1.0f);
             }
         }
 
@@ -635,20 +635,13 @@ namespace mgpu::psimple
         {
             mgpu::gpu1::ui_state st;
             mgpu::gpu1::ui_read(st);
-            float v = st.skin_strength;
+            float v = st.face_mask_strength;
             ImGui::SetNextItemWidth(190.0f);
-            if (ImGui::SliderFloat("##skin", &v, 0.0f, 2.0f, "%.2f"))
-                mgpu::gpu1::ui_set_tuning_value(2, v);
+            if (ImGui::SliderFloat("##facemask", &v, 0.0f, 1.0f, "%.2f"))
+                mgpu::gpu1::ui_set_face_mask_strength(v);
             ImGui::SameLine();
-            if (ImGui::SmallButton(L("ui.default", "default", "skin").c_str())) mgpu::gpu1::ui_set_tuning_value(2, 1.00f);
-        }
-
-        void row_model_mask()
-        {
-            mgpu::gpu1::ui_state st;
-            mgpu::gpu1::ui_read(st);
-            bool on = st.auto_mask;
-            if (ImGui::Checkbox("##automask", &on)) mgpu::gpu1::ui_set_tuning_value(4, on ? 1.0f : 0.0f);
+            if (ImGui::SmallButton(L("ui.default", "default", "facemask").c_str()))
+                mgpu::gpu1::ui_set_face_mask_strength(0.30f);
         }
 
         void row_preset()
@@ -870,22 +863,113 @@ namespace mgpu::psimple
         void row_finish_guard()
         {
             const bool sync = mgpu::psync::active();
-            const bool x1 = mgpu::prism_x1::active();
-            if (!sync && !x1 && !mgpu::pfinish::active()) { ImGui::TextDisabled("-"); return; }
-            float v = sync ? mgpu::psync::guard() : x1 ? mgpu::prism_x1::guard() : mgpu::pfinish::guard();
+            if (!sync && !mgpu::pfinish::active()) { ImGui::TextDisabled("-"); return; }
+            float v = sync ? mgpu::psync::guard() : mgpu::pfinish::guard();
             ImGui::SetNextItemWidth(190.0f);
             if (ImGui::SliderFloat("##finish_guard", &v, 0.0f, 1.0f, "%.2f"))
             {
-                if (sync) mgpu::psync::set_guard(v);
-                else if (x1) mgpu::prism_x1::set_guard(v);
+                if (sync)
+                {
+                    mgpu::psync::set_guard(v);
+                    (void)mgpu::gpu1::ui_ini_write_float("PrismSyncGuard", v);
+                }
                 else
                 {
                     mgpu::pfinish::set_guard(v);
                     (void)mgpu::gpu1::ui_ini_write_float("FinishGuard", v);
-                    return;
                 }
-                (void)mgpu::gpu1::ui_ini_write_float(x1 ? "PrismX1Guard" : "PrismSyncGuard", v);
             }
+        }
+
+        // ---- R356 (0.5.0, Marcelo's shape, the same keys the full panel's "Pass settings" writes) ----
+        // Network: Light-FP8 (the small network, NRPreset<n>=0, green, FPS+) | Full-FP8 (the big one,
+        // NRPreset<n>=1, red, FPS-). Resolution: Residual Neural (green, FPS+) | Native (red, FPS-) -
+        // pass 1 is NRS 1|0; pass 2 is Pass2 nrs|full with NRS=1, ResidualPass 2|0 without it.
+        // All read at arm: the restart line is the full panel's.
+        bool ps_pick(const std::string &label, bool selected, bool green)
+        {
+            const ImVec4 on  = green ? ImVec4(0.18f, 0.62f, 0.30f, 1.0f) : ImVec4(0.72f, 0.24f, 0.24f, 1.0f);
+            const ImVec4 off = green ? ImVec4(0.18f, 0.62f, 0.30f, 0.28f) : ImVec4(0.72f, 0.24f, 0.24f, 0.28f);
+            ImGui::PushStyleColor(ImGuiCol_Button, selected ? on : off);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, on);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, on);
+            const bool c = ImGui::Button(label.c_str(), ImVec2(140.0f, 0.0f));
+            ImGui::PopStyleColor(3);
+            return c;
+        }
+        void ps_net(unsigned i)
+        {
+            static const char *const key[4] = { "NRPreset1", "NRPreset2", "NRPreset3", "NRPreset4" };   // literals: the mirror keeps the pointer; arm reads NRPreset<u> per pass
+            if (i >= 4u) return;
+            // R363: live. The row shows the network the pass runs now; a click rebuilds it (ui_set_network) and
+            // writes the key for the next launch (pass 1 at x2+ -> NRPreset1x2).
+            mgpu::gpu1::ui_state stn; mgpu::gpu1::ui_read(stn);
+            const bool live = stn.armed && stn.nr_ok;
+            const char *key_now = (i == 0u && stn.passes >= 2u) ? "NRPreset1x2" : key[i];
+            const int cur = live ? ((stn.nr_preset_pass[i] == 1) ? 1 : 0)
+                                 : ((mgpu::gpu1::ui_ini_read(key[i], mgpu::gpu1::ui_ini_read("NRPreset", 0)) == 1) ? 1 : 0);
+            char id[16];
+            snprintf(id, sizeof id, "psn%u0", i);
+            if (ps_pick(L("ui.light_fp8", "Light-FP8  FPS+", id), cur == 0, true) && cur != 0)
+            { (void)mgpu::gpu1::ui_ini_write(key_now, 0); if (live) mgpu::gpu1::ui_set_network(i, 0); }   // R364: ini first
+            ImGui::SameLine();
+            snprintf(id, sizeof id, "psn%u1", i);
+            if (ps_pick(L("ui.full_fp8", "Full-FP8  FPS-", id), cur == 1, false) && cur != 1)
+            { (void)mgpu::gpu1::ui_ini_write(key_now, 1); if (live) mgpu::gpu1::ui_set_network(i, 1); }
+            ImGui::SameLine();
+        }
+        void ps_res(unsigned i)
+        {
+            const bool nrs1 = (mgpu::gpu1::ui_ini_read("NRS", 0) == 1);
+            const int rp = mgpu::gpu1::ui_ini_read("ResidualPass", 0);
+            mgpu::gpu1::ui_state stn; mgpu::gpu1::ui_read(stn);
+            const bool live = stn.armed && stn.nr_ok;   // R364: the row shows and switches what the pass runs now
+            int cur;
+            if (live) cur = mgpu::residual::carries(i) ? 1 : 0;
+            else if (i == 0u) cur = nrs1 ? 1 : 0;
+            else if (i == 1u)
+            {
+                char w[16] = {};
+                mgpu::gpu1::ui_ini_read_word("Pass2", w, sizeof w);
+                cur = (nrs1 && w[0] != 0) ? ((w[0] == 'n' || w[0] == 'N') ? 1 : 0) : (rp == 2 ? 1 : 0);
+            }
+            else cur = 0;   // pass 3+: no arm-time key exists; live shows it, ini has nothing to mirror
+            auto write = [&](int v)
+            {
+                if (i == 0u) (void)mgpu::gpu1::ui_ini_write("NRS", v);
+                else if (i == 1u)
+                {
+                    if (nrs1) (void)mgpu::gpu1::ui_ini_write_word("Pass2", v ? "nrs" : "full");
+                    else      (void)mgpu::gpu1::ui_ini_write("ResidualPass", v ? 2 : 0);
+                }
+                // pass 3+: live-only, the arm reads no key for them
+                if (live) mgpu::gpu1::ui_set_resolution(i, v == 1);   // R364: after the ini write
+            };
+            char id[16];
+            snprintf(id, sizeof id, "psr%u1", i);
+            if (ps_pick(L("ui.residual_neural", "Residual Neural  FPS+", id), cur == 1, true) && cur != 1) write(1);
+            ImGui::SameLine();
+            snprintf(id, sizeof id, "psr%u0", i);
+            if (ps_pick(L("ui.native", "Native  FPS-", id), cur == 0, false) && cur != 0) write(0);
+            ImGui::SameLine();
+        }
+        void row_pass1_net() { ps_net(0u); }
+        void row_pass1_res() { ps_res(0u); }
+        void row_pass2_net() { ps_net(1u); }
+        void row_pass2_res() { ps_res(1u); }
+        // row_fg_gpu1 deliberately omitted: FrameGen is not built in this branch.
+        void row_pass_best()
+        {
+            if (ImGui::Button(L("ui.best_qp", "Best Quality-Performance", "psbest").c_str()))
+            {
+                // Marcelo's default (R360): Full-FP8 + Residual on pass 1 and on the last (2nd) pass.
+                (void)mgpu::gpu1::ui_ini_write("NRS", 1);
+                (void)mgpu::gpu1::ui_ini_write("NRPreset1", 1);
+                (void)mgpu::gpu1::ui_ini_write("NRPreset1x2", 0);   // R361: Light-FP8 on pass 1 while x2 runs
+                (void)mgpu::gpu1::ui_ini_write("NRPreset2", 1);
+                (void)mgpu::gpu1::ui_ini_write_word("Pass2", "nrs");
+            }
+            ImGui::SameLine();
         }
 
         void register_rows()
@@ -909,14 +993,18 @@ namespace mgpu::psimple
             row("model.style",     "model style",  &row_model_style);
             row("model.tone",      "tone",         &row_model_tone);
             row("model.structure", "structure",    &row_model_structure);
-            row("model.skin",      "skin",         &row_model_skin);
-            row("model.mask",      "auto mask",    &row_model_mask);
+            row("model.skin",      "face mask",    &row_model_skin);
             row("fps.cap",         "fps cap",      &row_frame_cap);
             row("colour.16bit",    "16-bit colour",&row_colour16);
             row("crop",            "crop",         &row_crop);
             // R330: these seven were written but never registered, so the DLSS / frame-generation /
             // x2 sections came up empty. A row has to be BOTH drawn and registered.
             row("x2.mode",         "2nd pass (x2)",&row_x2_mode);
+            row("pass1.network",   "pass 1 network",    &row_pass1_net);   // R356
+            row("pass1.resolution","pass 1 resolution", &row_pass1_res);
+            row("pass2.network",   "pass 2 network",    &row_pass2_net);
+            row("pass2.resolution","pass 2 resolution", &row_pass2_res);
+            row("pass.best",       "defaults",          &row_pass_best);
             row("sr.enable",       "DLSS on GPU 1",&row_sr_enable);
             row("sr.quality",      "DLSS quality", &row_sr_quality);
             row("sr.preset",       "DLSS preset",  &row_sr_preset);
@@ -1039,7 +1127,17 @@ namespace mgpu::psimple
             float v = mgpu::pfinish::grade_value(i);
             ImGui::SetNextItemWidth(w - 60.0f);
             if (ImGui::SliderFloat(w2u(s.key).c_str(), &v, s.min, s.max, ""))
+            {
                 mgpu::pfinish::set_grade_value(i, v);
+                // R375: the grade table only reaches the picture at Look 5 (自定义).
+                // Sliding any grade while a preset look is selected silently did
+                // nothing - the exact "自定义调色盘失效" report. Switch for them.
+                if (mgpu::pfinish::look() != 5u)
+                {
+                    mgpu::pfinish::set_look(5u);
+                    (void)mgpu::gpu1::ui_ini_write("FinishLook", 5);
+                }
+            }
             ImGui::SameLine();
             // show the value in the table's own units, like the prism panel does
             switch (s.unit)
@@ -1181,26 +1279,18 @@ namespace mgpu::psimple
         // counts remain internal diagnostics; game production is shown separately.
         {
             char b0[64], b1[64], b2[64];
-            snprintf(b0, sizeof b0, "%.1f", st.xess_active ? st.xess_output_fps : st.present_fps);
+            snprintf(b0, sizeof b0, "%.1f", st.present_fps);
             snprintf(b1, sizeof b1, "%.1f ms", st.fps_consumed > 0.01 ? 1000.0 / st.fps_consumed : 0.0);
             snprintf(b2, sizeof b2, "%.0f", (st.present_p99_ms > 0.01) ? 1000.0 / st.present_p99_ms : 0.0);
-            ImGui::TextDisabled("%s", st.xess_active
-                ? T_("XeSS 输出 FPS  传输帧时间  1%% 低帧    MGPU GPU",
-                     "XeSS output fps  transport ms  1% low   MGPU GPU")
-                : T_("递交 FPS   传输帧时间  1%% 低帧    MGPU GPU",
-                     "present fps   transport ms   1% low   MGPU GPU"));
+            ImGui::TextDisabled("%s", T_("画面 FPS   传输帧时间  1%% 低帧    MGPU GPU",
+                                         "present fps   transport ms   1% low   MGPU GPU"));
             ImGui::TextUnformatted(b0);
             ImGui::SameLine(140.0f); ImGui::TextUnformatted(b1);
             ImGui::SameLine(280.0f); ImGui::TextUnformatted(b2);
             ImGui::SameLine(420.0f);
             ImGui::TextUnformatted(st.nr_ok ? "ON" : "-");
-            ImGui::TextDisabled("%s", T_("游戏生产 / 神经更新 fps", "game production / neural update fps"));
-            ImGui::Text("%.1f / %.1f", st.fps_produced, st.fps_evaluated);
-            const ImVec4 overflow_colour = st.fps_overrun > 0.01
-                ? ImVec4(1.0f, 0.75f, 0.20f, 1.0f) : ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
-            ImGui::TextColored(overflow_colour,
-                               T_("溢出丢帧 %.1f/s　累计 %llu", "overflow drops %.1f/s　total %llu"),
-                               st.fps_overrun, st.overrun);
+            ImGui::TextDisabled("%s", T_("游戏生产 fps", "game production fps"));
+            ImGui::Text("%.1f", st.fps_produced);
         }
         ImGui::Separator();
         ImGui::Spacing();
@@ -1213,31 +1303,6 @@ namespace mgpu::psimple
             int cur = st.neural ? 1 : 0;
             if (segments("pf.on", it, 2, cur, ctrl_w * 0.5f))
                 mgpu::gpu1::ui_set_neural(cur == 1);
-        }
-
-        // Proxy creation is still a next-launch decision. Once it exists, OFF
-        // and X2 are live; framesPresented is the proof of the applied mode.
-        {
-            row_label("XeSS 插帧", "XeSS frame generation");
-            static const char *it[2] = {};
-            if (it[0] == nullptr) { it[0] = T_("关", "OFF"); it[1] = "X2"; }
-            const int multiplier = 2;
-            int cur = st.xess_requested ? 1 : 0;
-            if (segments("pf.xess", it, 2, cur, ctrl_w * 0.5f))
-            {
-                (void)mgpu::gpu1::ui_ini_write("XeSSFG", cur > 0 ? 1 : 0);
-                if (cur > 0) (void)mgpu::gpu1::ui_ini_write("XeSSMultiplier", 2);
-            }
-            if (st.xess_active)
-            {
-                if (!st.xess_requested)
-                    ImGui::TextDisabled("%s", T_("已实时关闭 · 代理直通原帧", "live OFF - proxy presents native frames"));
-                else
-                    ImGui::TextDisabled(T_("请求 X%d · framesPresented=%u", "requested X%d - framesPresented=%u"),
-                                        multiplier, st.xess_last_frames_presented);
-            }
-            else
-                ImGui::TextDisabled("%s", T_("本次未创建代理 · 开启后重启生效", "no proxy this launch - enable then restart"));
         }
 
         // 色彩: the prism look presets (needs the finish module armed). Segment 6 = Look 5,
@@ -1276,47 +1341,63 @@ namespace mgpu::psimple
             ImGui::TextDisabled("%s", T_("ini 无 Finish=1（重启生效）", "Finish=1 not in mgpu.ini (restart)"));
         }
 
-        // 强度: the active Compose owns it; never drive NGX's independent multiplier as well.
+        // 强度: PSYNC and legacy NGX have independent multipliers; never drive both at once.
         {
             row_label("强度", "intensity");
             const bool sync = mgpu::psync::active();
-            const bool x1 = mgpu::prism_x1::active();
-            float v = sync ? mgpu::psync::intensity() : x1 ? mgpu::prism_x1::intensity() : st.intensity[0];
+            float v = sync ? mgpu::psync::intensity() : st.intensity[0];
             ImGui::SetNextItemWidth(ctrl_w - 52.0f);
             if (ImGui::SliderFloat("##pf.intensity", &v, 0.0f, 3.0f, ""))
             {
-                if (sync) mgpu::psync::set_intensity(v);
-                else if (x1) mgpu::prism_x1::set_intensity(v);
-                else { mgpu::gpu1::ui_set_intensity(0u, v); }
-                if (sync || x1)
-                    (void)mgpu::gpu1::ui_ini_write_float(x1 ? "PrismX1Intensity" : "PrismSyncIntensity", v);
+                if (sync)
+                {
+                    mgpu::psync::set_intensity(v);
+                    (void)mgpu::gpu1::ui_ini_write_float("PrismSyncIntensity", v);
+                }
+                else mgpu::gpu1::ui_set_intensity(0u, v);
             }
             ImGui::SameLine();
             ImGui::Text("%.0f%%", (double)(v * 100.0f));
         }
 
-        // PX1 replaces pass 1 in either the one-pass or two-pass pipeline.
-        // Pass 2 stays on the original path; cadence selects evaluated versus held frames.
+        // 遍数: 1 | 2 | 3   (MAX_PASSES is 4 at runtime; 3 is the owner's target)
         {
             row_label("遍数", "passes");
-            static const char *ps[2] = { "1", "2" };
+            static const char *ps[3] = { "1", "2", "3" };
             int cur = (int)st.passes - 1;
             if (cur < 0) cur = 0;
-            if (segments("pf.passes", ps, 2, cur, ctrl_w * 0.5f))
+            if (cur > 2) cur = 2;
+            if (segments("pf.passes", ps, 3, cur, ctrl_w * 0.5f))
                 mgpu::gpu1::ui_set_passes((unsigned)(cur + 1));
         }
 
-        row_label("节奏", "cadence");
+        // 0.5.1 per-pass rows (R356/R364): every RUNNING pass gets its own network
+        // (Light-FP8 / Full-FP8) and resolution (Residual Neural / Native) pair.
+        for (unsigned i = 0; i < st.passes && i < 3u; ++i)
         {
-            // Fixed two evaluates per three consumed frames: NR, hold, NR.
-            static const char *cs[2] = {};
+            char lbl[40];
+            snprintf(lbl, sizeof lbl, "P%u 网络", i + 1u);
+            row_label(lbl, "pass network");
+            ps_net(i);
+            snprintf(lbl, sizeof lbl, "P%u 分辨率", i + 1u);
+            row_label(lbl, "pass resolution");
+            ps_res(i);
+        }
+
+        // 节奏: run the network every 1, 2 or 4 frames, independently of Passes.
+        {
+            row_label("节奏", "cadence");
+            static const char *cs[3] = {};
             if (cs[0] == nullptr)
             {
-                cs[0] = T_("每帧", "every frame"); cs[1] = T_("1.5 帧", "fixed 1.5-frame average");
+                cs[0] = T_("每 1 帧", "every 1"); cs[1] = T_("每 2 帧", "every 2"); cs[2] = T_("每 4 帧", "every 4");
             }
-            int cur = st.nr_cadence == 15 ? 1 : 0;
-            if (segments("pf.cadence", cs, 2, cur, ctrl_w))
-                mgpu::gpu1::ui_set_cadence(cur == 1 ? 15u : 1u);
+            int cur = st.nr_cadence == 4 ? 2 : st.nr_cadence == 2 ? 1 : 0;
+            if (segments("pf.cadence", cs, 3, cur, ctrl_w))
+            {
+                const unsigned v = cur == 2 ? 4u : cur == 1 ? 2u : 1u;
+                mgpu::gpu1::ui_set_cadence(v);
+            }
         }
 
         // 网络分辨率: the NRS scale slider, 0.30..1.00, live (needs NRScale= in mgpu.ini).
@@ -1336,25 +1417,25 @@ namespace mgpu::psimple
             ImGui::TextDisabled("%s", T_("ini 无 NRScale=（重启生效）", "NRScale= not in mgpu.ini (restart)"));
         }
 
-        // 角色守护: the active reconstruction owns it; otherwise PRISM-FINISH does.
+        // 角色守护: PSYNC owns it on the synchronous path; otherwise PRISM-FINISH does.
         const bool sync_guard = mgpu::psync::active();
-        const bool x1_guard = mgpu::prism_x1::active();
-        if (sync_guard || x1_guard || mgpu::pfinish::active())
+        if (sync_guard || mgpu::pfinish::active())
         {
             row_label("角色守护", "character guard");
-            float v = sync_guard ? mgpu::psync::guard() : x1_guard ? mgpu::prism_x1::guard() : mgpu::pfinish::guard();
+            float v = sync_guard ? mgpu::psync::guard() : mgpu::pfinish::guard();
             ImGui::SetNextItemWidth(ctrl_w - 52.0f);
             if (ImGui::SliderFloat("##pf.guard", &v, 0.0f, 1.0f, ""))
             {
-                if (sync_guard) mgpu::psync::set_guard(v);
-                else if (x1_guard) mgpu::prism_x1::set_guard(v);
+                if (sync_guard)
+                {
+                    mgpu::psync::set_guard(v);
+                    (void)mgpu::gpu1::ui_ini_write_float("PrismSyncGuard", v);
+                }
                 else
                 {
                     mgpu::pfinish::set_guard(v);
                     (void)mgpu::gpu1::ui_ini_write_float("FinishGuard", v);
-                    return;
                 }
-                (void)mgpu::gpu1::ui_ini_write_float(x1_guard ? "PrismX1Guard" : "PrismSyncGuard", v);
             }
             ImGui::SameLine();
             ImGui::Text("%.0f%%", (double)(v * 100.0f));
@@ -1428,11 +1509,19 @@ namespace mgpu::psimple
 }
 #else
 
-    // No ImGui headers in this build: the panel does not exist, so neither does the simple mode.
+    // No ImGui headers in this build: keep the non-visual API linkable.
     bool cjk() { return false; }
+    bool enabled() { return false; }
+    void set_enabled(bool on)
+    {
+        (void)mgpu::gpu1::ui_ini_write_word("PanelSimple", on ? "1" : "0");
+        g_simple.store(on ? 1 : 0, std::memory_order_relaxed);
+    }
+    void toggle() { set_enabled(simple_flag() == 0); }
     void label(const char *, const char *) {}
     void help(const char *) {}
     void draw_simple_panel() {}
     void draw_editor() {}
+}
 
 #endif  // MGPU_HAVE_IMGUI

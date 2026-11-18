@@ -42,9 +42,9 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "fg_gpu1.hpp"   // R341
 #include "panel_simple.hpp"   // the simple-panel hotkey below
-#include "prism_x1.hpp"       // runtime original-NRS / PX1 A/B switch
-#include "prism_carry.hpp"    // invalidate edit history across that A/B switch
+#include "poverlay.hpp"       // Prism panel visibility for neural-window input routing
 #include "startup_trace.hpp"   // R313
 #include "worker.hpp"
 
@@ -87,10 +87,6 @@
 // The simple panel. F4 because F5/F9 are quick save/load on several titles, F6-F11 are taken by
 // the keys above, and F12 belongs to Steam.
 #define MGPU_HOTKEY_SIMPLE     0x4D51   // CTRL+ALT+F4 - full panel <-> simple panel
-#define MGPU_HOTKEY_X1_AB      0x4D52   // CTRL+ALT+F3 - original NRS <-> PX1
-#define MGPU_HOTKEY_XESS_INPUT   0x4D53   // F10 - pin XeSS proxy and enable input passthrough
-#define MGPU_HOTKEY_XESS_FOCUS   0x4D54   // F11 - activate the game only
-#define MGPU_HOTKEY_XESS_RESTORE 0x4D55   // F12 - restore an ordinary, clickable proxy window
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -111,77 +107,6 @@ namespace
     {
         static state s;
         return s;
-    }
-
-    // Match the reference two-step input flow. F10 only pins the proxy and
-    // makes it transparent to input; F11 alone activates the game. Keeping
-    // focus changes out of F10 prevents it from unexpectedly exposing the
-    // game's native output. Window creation styles stay at the visible baseline.
-    // action: 1 = F10 game mode, 2 = F11 game focus, 0 = F12 ordinary window.
-    void xess_input_window_mode(HWND hwnd, unsigned action)
-    {
-        if (hwnd == nullptr || IsWindow(hwnd) == FALSE ||
-            mgpu::gpu1::ui_ini_read("XeSSFG", 0) == 0 ||
-            !mgpu::gpu1::dcomp_overlay_mode())
-        {
-            mgpu::diag::warn("[MGPU][XESS-INPUT] F10/F11/F12 are only available for the single-screen XeSS HWND proxy.");
-            return;
-        }
-
-        if (action == 2)
-        {
-            HWND game = (HWND)mgpu::gpu1::dcomp_game_hwnd();
-            if (game == nullptr || game == hwnd || IsWindow(game) == FALSE)
-            {
-                mgpu::diag::warn("[MGPU][XESS-INPUT] F11 could not find the game window; proxy styles were not changed.");
-                return;
-            }
-            const bool focus_ok = GetForegroundWindow() == game || SetForegroundWindow(game) != FALSE;
-            char focus_line[256];
-            snprintf(focus_line, sizeof focus_line,
-                     "[MGPU][XESS-INPUT] F11 gameFocus=%s gameHwnd=%p; proxy remains TOPMOST and NOACTIVATE.",
-                     focus_ok ? "YES" : "NO", (void *)game);
-            (focus_ok ? mgpu::diag::info : mgpu::diag::warn)(focus_line);
-            return;
-        }
-
-        const LONG_PTR input_styles = (LONG_PTR)WS_EX_NOACTIVATE | (LONG_PTR)WS_EX_TRANSPARENT;
-        const LONG_PTR before = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        const LONG_PTR wanted = action == 1 ? (before | input_styles) : (before & ~input_styles);
-        SetLastError(ERROR_SUCCESS);
-        (void)SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted);
-        const DWORD style_error = GetLastError();
-        if (style_error != ERROR_SUCCESS)
-        {
-            char error_line[240];
-            snprintf(error_line, sizeof error_line,
-                     "[MGPU][XESS-INPUT] SetWindowLongPtrW failed (GetLastError=%lu); input mode unchanged.",
-                     (unsigned long)style_error);
-            mgpu::diag::error(error_line);
-            return;
-        }
-
-        const bool game_mode = action == 1;
-        SetLastError(ERROR_SUCCESS);
-        const BOOL positioned = SetWindowPos(hwnd, game_mode ? HWND_TOPMOST : HWND_NOTOPMOST,
-                                             0, 0, 0, 0,
-                                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-        const DWORD position_error = positioned == FALSE ? GetLastError() : ERROR_SUCCESS;
-        char line[400];
-        snprintf(line, sizeof line,
-                 "[MGPU][XESS-INPUT] %s exStyle=0x%llX topmost=%s position=%s. No focus change was requested.",
-                 game_mode ? "F10 input passthrough=ON (press F11 to activate game)" : "F12 ordinary proxy window restored",
-                 (unsigned long long)GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
-                 game_mode ? "ON" : "OFF",
-                 positioned != FALSE ? "OK" : "FAILED");
-        (positioned != FALSE ? mgpu::diag::info : mgpu::diag::warn)(line);
-        if (positioned == FALSE)
-        {
-            char error_line[160];
-            snprintf(error_line, sizeof error_line,
-                     "[MGPU][XESS-INPUT] SetWindowPos GetLastError=%lu.", (unsigned long)position_error);
-            mgpu::diag::warn(error_line);
-        }
     }
 
     // The thread has finished: reset the stop event and re-arm the
@@ -230,6 +155,13 @@ namespace
         (void)wParam; (void)lParam;
         switch (msg)
         {
+        case WM_NCHITTEST:
+            // WS_EX_TRANSPARENT alone does not guarantee click-through for a
+            // D3D window. While Prism is closed, explicitly pass the hit-test
+            // to the game beneath the neural picture. Menu input stays normal.
+            if (!mgpu::poverlay::panel_open() && !mgpu::gpu1::dcomp_overlay_mode())
+                return HTTRANSPARENT;
+            return DefWindowProcW(hWnd, msg, wParam, lParam);
         case WM_CLOSE:
             mgpu::diag::info("[MGPU][T4] WM_CLOSE - the bridge window was closed by the user; "
                              "signalling bridge shutdown (the game is not affected)");
@@ -242,6 +174,56 @@ namespace
             return 0;
         default:
             return DefWindowProcW(hWnd, msg, wParam, lParam);
+        }
+    }
+
+    // Independent neural window: keep the picture visible without trapping the
+    // game's mouse. Prism owns input only while visible; during normal play the
+    // window is topmost but transparent to hit-testing and the game is foreground.
+    void sync_neural_input(HWND hwnd, bool active)
+    {
+        static bool initialized = false;
+        static bool was_open = false;
+        static bool was_external = false;
+        if (!active || hwnd == nullptr)
+        {
+            initialized = false;
+            return;
+        }
+        const bool open = mgpu::poverlay::panel_open();
+        HWND game = reinterpret_cast<HWND>(mgpu::gpu1::dcomp_game_hwnd());
+        HWND root = game != nullptr ? GetAncestor(game, GA_ROOT) : nullptr;
+        HWND foreground = GetForegroundWindow();
+        const bool external = foreground != nullptr && foreground != hwnd &&
+                              (root == nullptr || foreground != root);
+        if (!initialized || open != was_open || external != was_external)
+        {
+            LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            if (open) ex &= ~WS_EX_TRANSPARENT;
+            else      ex |= WS_EX_TRANSPARENT;
+            ex |= WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+            SetWindowPos(hwnd, external ? HWND_NOTOPMOST : HWND_TOPMOST,
+                         0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            if (!external)
+            {
+                if (open)
+                {
+                    BringWindowToTop(hwnd);
+                    SetForegroundWindow(hwnd);
+                }
+                else if (root != nullptr)
+                {
+                    SetForegroundWindow(root);
+                }
+            }
+            mgpu::diag::info(open
+                ? "[MGPU][NEURAL-INPUT] Prism open: neural window owns the mouse."
+                : "[MGPU][NEURAL-INPUT] Prism closed: neural picture is topmost and clicks pass through to the game.");
+            initialized = true;
+            was_open = open;
+            was_external = external;
         }
     }
 
@@ -725,9 +707,6 @@ namespace
                 // where auto asks QueryDisplayConfig whether one display source
                 // is driving two targets.
                 DWORD ex_style = 0;
-                // Keep the XeSS single-screen proxy on the observed visible
-                // baseline. F10 adds NOACTIVATE | TRANSPARENT only after creation;
-                // NoActivate / ToolWindow creation styles moved it behind the game.
                 if (mgpu::gpu1::window_no_activate())
                 {
                     ex_style = WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
@@ -870,37 +849,6 @@ namespace
                             // hotkey here: one failing must not cost the others.
                             const bool k_s = RegisterHotKey(nullptr, MGPU_HOTKEY_SIMPLE,
                                                 MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F4) != FALSE;
-                            const bool k_ab = RegisterHotKey(nullptr, MGPU_HOTKEY_X1_AB,
-                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F3) != FALSE;
-                            if (k_ab)
-                                mgpu::diag::info("[MGPU][PX1][AB] CTRL+ALT+F3 switches between original NRS and PX1; transport, depth and resolution stay unchanged.");
-                            else
-                                mgpu::diag::warn("[MGPU][PX1][AB] CTRL+ALT+F3 FAILED to register; runtime A/B switching is unavailable this launch.");
-                            const bool xess_input_mode =
-                                mgpu::gpu1::ui_ini_read("XeSSFG", 0) != 0 &&
-                                mgpu::gpu1::dcomp_overlay_mode();
-                            const bool k_xi = xess_input_mode &&
-                                RegisterHotKey(nullptr, MGPU_HOTKEY_XESS_INPUT,
-                                               MOD_NOREPEAT, VK_F10) != FALSE;
-                            const bool k_xf = xess_input_mode &&
-                                RegisterHotKey(nullptr, MGPU_HOTKEY_XESS_FOCUS,
-                                               MOD_NOREPEAT, VK_F11) != FALSE;
-                            const bool k_xr = xess_input_mode &&
-                                RegisterHotKey(nullptr, MGPU_HOTKEY_XESS_RESTORE,
-                                               MOD_NOREPEAT, VK_F12) != FALSE;
-                            if (xess_input_mode)
-                            {
-                                if (k_xi && k_xf && k_xr)
-                                    mgpu::diag::info("[MGPU][XESS-INPUT] F10 pins the neural proxy and enables input passthrough; F11 activates the game; F12 restores an ordinary proxy window.");
-                                else
-                                {
-                                    char keys[240];
-                                    snprintf(keys, sizeof keys,
-                                             "[MGPU][XESS-INPUT] hotkey registration: F10=%s F11=%s F12=%s.",
-                                             k_xi ? "OK" : "FAILED", k_xf ? "OK" : "FAILED", k_xr ? "OK" : "FAILED");
-                                    mgpu::diag::warn(keys);
-                                }
-                            }
                             if (k_s)
                                 mgpu::diag::info("[MGPU][R330] simple panel hotkey: CTRL+ALT+F4 switches the "
                                                  "panel between the full view and the simple one. It writes "
@@ -955,7 +903,7 @@ namespace
                             snprintf(ik, sizeof ik,
                                      "[MGPU][P6.3] intensity hotkeys: CTRL+ALT+F8 cycle target "
                                      "(all/p1/p2/...) = %s | CTRL+ALT+F9 down = %s | CTRL+ALT+F11 "
-                                     "up = %s. Steps of 0.05, clamped 0.00-2.00, live from the "
+                                     "up = %s. Steps of 0.05, clamped 0.00-3.00, live from the "
                                      "next frame - NGX parameters are set per evaluate, so no "
                                      "re-arm and no relaunch. DOWN and UP repeat when held; the "
                                      "target key does not.",
@@ -1182,23 +1130,6 @@ namespace
                     // the key is not registered there.
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_PEEK)
                     { (void)mgpu::gpu1::dcomp_peek_toggle(); continue; }
-                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_XESS_INPUT)
-                    { xess_input_window_mode(hwnd, 1); continue; }
-                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_XESS_FOCUS)
-                    { xess_input_window_mode(hwnd, 2); continue; }
-                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_XESS_RESTORE)
-                    { xess_input_window_mode(hwnd, 0); continue; }
-                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_X1_AB)
-                    {
-                        if (!mgpu::prism_x1::active())
-                            mgpu::diag::warn("[MGPU][PX1][AB] PX1 is not armed; runtime A/B is unavailable.");
-                        else
-                        {
-                            (void)mgpu::prism_x1::toggle_ab();
-                            mgpu::prism_carry::reset();
-                        }
-                        continue;
-                    }
                     // The panel draws its next frame from the flag, so this is immediate and
                     // needs neither a restart nor the panel to be open. R330 (F1): toggle() only
                     // flips PanelSimple; the layout is never touched from this thread. Like
@@ -1307,6 +1238,10 @@ namespace
                         mgpu::gpu1::stream_request();
                     }
                 }
+
+                sync_neural_input(hwnd,
+                    manual_runs != 0 && !mgpu::gpu1::probes_enabled() &&
+                    !mgpu::gpu1::dcomp_overlay_mode());
 
                 // The colour must animate: a static clear cannot
                 // distinguish "presenting" from "presented once and hung."
@@ -1591,7 +1526,14 @@ namespace
                 if (!mgpu::gpu1::stream_present_gate(4))
                     continue;
 
-                if (!mgpu::gpu1::present_frame(cr, cg, cb))
+                // R341 (FrameGen=4): the pacing thread presents this frame (generated first, real half an
+                // interval later). With NR off no new fg::record() arrives, so the worker MUST
+                // present the live transported input itself; handing off here used to freeze on
+                // the last generated pair forever.
+                const bool neural_now = mgpu::gpu1::stream_neural_enabled();
+                const bool r341_paced = mgpu::fg::sync_neural(neural_now) && mgpu::fg::handoff(cr, cg, cb);
+
+                if (!r341_paced && !mgpu::gpu1::present_frame(cr, cg, cb))
                 {
                     // The first failure is already logged with its step,
                     // HRESULT and removal reason (one-shot, in
@@ -1724,10 +1666,6 @@ namespace
             if (mgpu::gpu1::dcomp_overlay_mode())
                 UnregisterHotKey(nullptr, MGPU_HOTKEY_PEEK);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SIMPLE);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_X1_AB);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_XESS_INPUT);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_XESS_FOCUS);
-            UnregisterHotKey(nullptr, MGPU_HOTKEY_XESS_RESTORE);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC);

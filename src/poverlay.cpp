@@ -4,7 +4,7 @@
 // (draw list, glyph atlas, D3D12 submit), the widget kit (barcode, segments, bar sliders, the
 // grading desk) and the input neutralisation are prism's verbatim. What changed: the data
 // source (mgpu ui_state + pfinish instead of the prism pipeline), the row set (mgpu's: no
-// tiers or target fps; PX1 limits cadence to 1 or 2), persistence (mgpu.ini keys the
+// tiers, no cadence, no target fps - the owner's decisions), persistence (mgpu.ini keys the
 // bridge already owns), and the queue/swapchain discovery (ReShade hands both to us at
 // present; no vtable scanning).
 #include "poverlay.hpp"
@@ -32,13 +32,13 @@
 #include "font_mono_regular.h"
 #include "font_mono_bold.h"
 #include "diag.hpp"
-#include "amd_of.hpp"
-#include "present_queue.hpp"
 #include "gpu1_context.hpp"
 #include "prism_finish.hpp"
 #include "prism_sync.hpp"
-#include "prism_x1.hpp"
+#include "prism_x1_multi.hpp"
+#include "skinguard.hpp"
 #include "prism_grade.h"
+#include "residual.hpp"
 #include "t119_keys.hpp"
 
 namespace mgpu::poverlay
@@ -78,7 +78,7 @@ struct PanelConfig
     float nits = 203.0f;      // OverlayNits: the panel's white on HDR back buffers
     int hdr = -1;             // OverlayHdr: -1 auto, 0 SDR, 1 scRGB, 2 HDR10
     bool motion = true;       // OverlayMotion
-    bool block = true;        // OverlayBlockInput
+    bool block = false;       // OverlayBlockInput: opt-in; never trap gameplay by default
     bool pad = true;          // OverlayPad
 } cfg;
 
@@ -158,7 +158,7 @@ void LoadPanelConfig()
     cfg.hint = get(L"OverlayHint") != L"0";
     cfg.hud = get(L"OverlayHud") == L"1";
     cfg.motion = get(L"OverlayMotion") != L"0";
-    cfg.block = get(L"OverlayBlockInput") != L"0";
+    cfg.block = get(L"OverlayBlockInput") == L"1";
     cfg.pad = get(L"OverlayPad") != L"0";
     const std::wstring hdr = get(L"OverlayHdr");
     cfg.hdr = hdr == L"0" ? 0 : hdr == L"1" ? 1 : hdr == L"2" ? 2 : -1;
@@ -193,11 +193,70 @@ SetCursorPosFn realSetCursorPos = SetCursorPos;
 ClipCursorFn realClipCursor = ClipCursor;
 RawDataFn realRawData = GetRawInputData;
 RawBufferFn realRawBuffer = GetRawInputBuffer;
+using SetWindowPosFn = BOOL (WINAPI *)(HWND, HWND, int, int, int, int, UINT);
+SetWindowPosFn realSetWindowPosSWP = SetWindowPos;
 POINT frozenCursor = {};                          // where the game's cursor was when the panel opened
 RECT gameClip = {};
 bool gameClipped = false;  // the game's cursor clip, restored on close
 
 SHORT WINAPI HkAsyncKey(int vk) { return blocking && !FromSelf(_ReturnAddress()) ? 0 : realAsyncKey(vk); }
+
+// R243c: the DPI-unaware game's activation resize can bypass even
+// WM_WINDOWPOSCHANGING (SWP_NOSENDCHANGING / DXGI ResizeTarget both do). Hook
+// SetWindowPos itself: every sizing path funnels through it, including DXGI's
+// internal call. While the DComp overlay is on, the game window must cover its
+// monitor - pin any other size to the monitor before the real call.
+//
+// A monitor-sized OUTER rectangle is not a monitor-sized CLIENT rectangle while
+// the game still has a caption / thick frame. On RE2 DX12, repinning first made
+// the engine create a transient 3816x2096 chain inside 3840x2160; its 24x64
+// black border then survived the later full-size chain. Remove the non-client
+// frame BEFORE any repin, so the engine computes the client extent correctly.
+static void r243_make_borderless(HWND h)
+{
+    if (h == nullptr) return;
+    const LONG_PTR mask = WS_CAPTION | WS_BORDER | WS_THICKFRAME |
+                          WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
+    const LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
+    if ((style & mask) == 0) return;
+    SetWindowLongPtrW(h, GWL_STYLE, (style & ~mask) | WS_POPUP);
+    static std::atomic<unsigned> r243e_n{0};
+    const unsigned n = r243e_n.fetch_add(1) + 1;
+    if (n <= 8u)
+        LOG("[MGPU][R243e] removed the game window's non-client frame BEFORE sizing: style 0x%llx -> 0x%llx (%u so far)",
+            (unsigned long long)style, (unsigned long long)((style & ~mask) | WS_POPUP), n);
+}
+static BOOL WINAPI HkSetWindowPos(HWND h, HWND after, int x, int y, int cx, int cy, UINT flags)
+{
+    if (!FromSelf(_ReturnAddress()) && !(flags & SWP_NOSIZE))
+    {
+        void *gw = mgpu::gpu1::dcomp_game_hwnd();
+        if (gw && h == (HWND)gw && mgpu::gpu1::dcomp_overlay_mode())
+        {
+            r243_make_borderless(h);
+            HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{};
+            mi.cbSize = sizeof mi;
+            if (GetMonitorInfoW(mon, &mi))
+            {
+                const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+                const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                if (cx != mw || cy != mh)
+                {
+                    static std::atomic<unsigned> r243c_n{0};
+                    const unsigned n = r243c_n.fetch_add(1) + 1;
+                    if (n <= 8u || (n % 100u) == 0u)
+                        LOG("[MGPU][R243c] SetWindowPos %dx%d -> monitor %dx%d (%u so far)", cx, cy, mw, mh, n);
+                    x = mi.rcMonitor.left;
+                    y = mi.rcMonitor.top;
+                    cx = mw;
+                    cy = mh;
+                }
+            }
+        }
+    }
+    return realSetWindowPosSWP(h, after, x, y, cx, cy, flags);
+}
 SHORT WINAPI HkKeyState(int vk) { return blocking && !FromSelf(_ReturnAddress()) ? 0 : realKeyState(vk); }
 BOOL WINAPI HkKeyboardState(PBYTE k)
 {
@@ -330,6 +389,21 @@ std::atomic<int> wheel{0};
 // once they do, they are the source of truth for the panel's Key().
 std::atomic<uint8_t> ownKey[256] = {};
 std::atomic<unsigned> ownKeySeq{0};   // bumped on every event; 0 = wndproc has seen nothing yet
+// 2026-11-14: RE2 (RE Engine) never dispatches KEYBOARD messages to its wndproc (Raw
+// Input game; proven by the keydn-hunt log: 0 keydowns while the user pressed). Mouse
+// messages do arrive, so ownKeySeq goes non-zero and the old "trust the wndproc for
+// everything once anything arrived" rule silently zeroed every keyboard read. Track a
+// per-key "the wndproc has genuinely seen this key" bitmap; Key() trusts the wndproc
+// only for keys that have actually produced a message, and the (proven alive) raw
+// GetAsyncKeyState for the rest.
+std::atomic<uint32_t> ownKeySeen[8] = {};
+// 2026-11-14: physical presses counted edge-only. Two failure modes fixed at once:
+// (a) a tap shorter than a poll interval left the level back at 0 before any PollInput ran -
+//     the press vanished entirely, so the panel "would not open";
+// (b) holding the key auto-repeated WM_KEYDOWN. Level-edge polling survived the repeats,
+// but rapid re-taps landed at arbitrary parity. Counting non-repeat KEYDOWNs of the toggle
+// key and applying the delta's parity per poll makes both a tap and a hold exactly one toggle.
+std::atomic<unsigned> ownPressSeq{0};   // bumped on every NON-REPEAT KEYDOWN of cfg.key
 
 LRESULT CALLBACK HkWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
@@ -338,8 +412,35 @@ LRESULT CALLBACK HkWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
     {
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
+        ownKeySeen[(w & 0xff) >> 5].fetch_or(1u << ((w & 0xff) & 31), std::memory_order_relaxed);
         ownKey[w & 0xff].store(1, std::memory_order_relaxed);
         ownKeySeq.fetch_add(1, std::memory_order_relaxed);
+        // 2026-11-14 physical-key hunt: the panel opens via PostMessage but not via
+        // the user's real key. Log every distinct keydown (throttled 1/s per vk) and
+        // always the toggle key, with the raw async state, so one test run shows
+        // whether the physical key reaches this wndproc and as which VK.
+        {
+            static double keyLogBase = -1;
+            static uint32_t keyLogLast[256] = {};
+            static uint8_t keyLogSeen[256] = {};
+            static uint8_t keyLogCount = 0;
+            if (keyLogBase < 0) keyLogBase = Now();
+            const uint8_t vk = w & 0xff;
+            const double t = Now() - keyLogBase;
+            if (t < 120.0 && keyLogCount < 200 &&
+                (vk == (cfg.key & 0xff) || !keyLogSeen[vk] || t - double(keyLogLast[vk]) > 1.0))
+            {
+                if (keyLogSeen[vk]) ++keyLogCount;
+                keyLogSeen[vk] = 1;
+                keyLogLast[vk] = uint32_t(t);
+                LOG("[MGPU][POV] keydn vk=0x%02x repeat=%u raw_async=%u fg=%p game=%p t=%.1f",
+                    unsigned(vk), unsigned((l & 0x40000000) != 0),
+                    unsigned((realAsyncKey(vk) & 0x8000) != 0), (void *)GetForegroundWindow(),
+                    (void *)gameWnd, t);
+            }
+        }
+        if ((w & 0xff) == (cfg.key & 0xff) && !(l & (LPARAM)0x40000000))
+            ownPressSeq.fetch_add(1, std::memory_order_relaxed);
         break;
     case WM_KEYUP:
     case WM_SYSKEYUP:
@@ -358,6 +459,43 @@ LRESULT CALLBACK HkWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         for (auto &k : ownKey) k.store(0, std::memory_order_relaxed);
         ownKeySeq.fetch_add(1, std::memory_order_relaxed);
         break;
+    case WM_WINDOWPOSCHANGING: {
+        // R243b: DPI-unaware titles (RE2 on a 150% display) resize their window to
+        // the virtualized screen size on EVERY activation / alt-tab, and the shrink
+        // does NOT ride on set_fullscreen_state - it arrives straight through
+        // SetWindowPos/MoveWindow, which both funnel WM_WINDOWPOSCHANGING here.
+        // Pin the game window to its monitor before the game sees the message, so
+        // the DComp composition never loses coverage. Size-changing messages only.
+        if (mgpu::gpu1::dcomp_overlay_mode() && h == gameWnd && l)
+        {
+            WINDOWPOS *wp = (WINDOWPOS *)l;
+            if (!(wp->flags & SWP_NOSIZE))
+            {
+                r243_make_borderless(h);
+                HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+                MONITORINFO mi{};
+                mi.cbSize = sizeof mi;
+                if (GetMonitorInfoW(mon, &mi))
+                {
+                    const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+                    const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                    if (wp->cx != mw || wp->cy != mh)
+                    {
+                        const int ox = wp->cx, oy = wp->cy;
+                        wp->x = mi.rcMonitor.left;
+                        wp->y = mi.rcMonitor.top;
+                        wp->cx = mw;
+                        wp->cy = mh;
+                        static std::atomic<unsigned> r243b_n{0};
+                        const unsigned n = r243b_n.fetch_add(1) + 1;
+                        if (n <= 8u || (n % 100u) == 0u)
+                            LOG("[MGPU][R243b] WM_WINDOWPOSCHANGING %dx%d -> monitor %dx%d (%u so far)", ox, oy, mw, mh, n);
+                    }
+                }
+            }
+        }
+        break;
+    }
     default:
         break;
     }
@@ -399,11 +537,13 @@ void HookInput()
     api(L"user32", "ClipCursor", (void *)&HkClipCursor, (void **)&realClipCursor);
     api(L"user32", "GetRawInputData", (void *)&HkRawData, (void **)&realRawData);
     api(L"user32", "GetRawInputBuffer", (void *)&HkRawBuffer, (void **)&realRawBuffer);
+    api(L"user32", "SetWindowPos", (void *)&HkSetWindowPos, (void **)&realSetWindowPosSWP);
 }
 
 void SetBlocking(bool on)
 {
     if (on == blocking) return;
+    LOG("[MGPU][POV][INPUT-GUARD] game input %s", on ? "BLOCKED (visible panel)" : "RELEASED");
     if (on)
     {
         realGetCursorPos(&frozenCursor);
@@ -975,6 +1115,8 @@ struct Chain
     ID3D12CommandQueue *queue = nullptr;
     Gpu *gpu = nullptr;
     bool unsupported = false;
+    bool said_no_window = false;   // the no-visible-window refusal is retryable; log it once
+    unsigned probes = 0;           // ... but keep a slow heartbeat so a stuck refusal is visible
 } chains[4];
 
 Chain *ChainFor(IDXGISwapChain *sc)
@@ -997,30 +1139,11 @@ Chain *ChainFor(IDXGISwapChain *sc)
 
 int ColourMode(IDXGISwapChain *sc, DXGI_FORMAT f)
 {
-    if (cfg.hdr >= 0) return cfg.hdr;
-    if (f == DXGI_FORMAT_R16G16B16A16_FLOAT) return 1;
-    if (f != DXGI_FORMAT_R10G10B10A2_UNORM) return 0;
-    // The colour space hook is not ported (ReShade owns the swapchain vtable path): a 10-bit
-    // swap chain on an HDR output is read off the output descriptor, the prism fallback.
-    static int byOutput = -1;
-    if (byOutput < 0)
-    {
-        byOutput = 0;
-        IDXGIOutput *o = nullptr;
-        if (SUCCEEDED(sc->GetContainingOutput(&o)))
-        {
-            IDXGIOutput6 *o6 = nullptr;
-            if (SUCCEEDED(o->QueryInterface(__uuidof(IDXGIOutput6), (void **)&o6)))
-            {
-                DXGI_OUTPUT_DESC1 od;
-                o6->GetDesc1(&od);
-                byOutput = od.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? 2 : 0;
-                o6->Release();
-            }
-            o->Release();
-        }
-    }
-    return byOutput;
+    // RE2 SDR-only build: do not infer HDR from a 10-bit chain or the monitor.
+    // This keeps the Prism panel in the same sRGB mode as the neural output.
+    (void)sc;
+    (void)f;
+    return 0;
 }
 
 bool Submit(Chain &c, UINT bw, UINT bh, DXGI_FORMAT fmt)
@@ -1225,10 +1348,13 @@ bool Rep(bool down, Repeat &r, double now)
 }
 bool Key(int vk)
 {
-    // Prefer the wndproc-tracked state once any input event has arrived: the
-    // GetAsyncKeyState path is hooked dead in this process (ReShade), the
-    // message path is not. VK range guard: callers pass VK_* (1..255).
-    if (vk > 0 && vk < 256 && ownKeySeq.load(std::memory_order_relaxed) != 0)
+    // Per-key source of truth (2026-11-14): trust the wndproc-tracked state ONLY for
+    // keys that have genuinely produced a window message. Raw-Input games (RE2) deliver
+    // mouse messages but no keyboard messages, so a global "wndproc is alive" latch
+    // silently zeroed every keyboard read. For keys the wndproc has never seen, use
+    // GetAsyncKeyState - proven alive in this process by the mult_raw diag lines.
+    if (vk > 0 && vk < 256 &&
+        (ownKeySeen[vk >> 5].load(std::memory_order_relaxed) >> (vk & 31)) & 1u)
         return ownKey[vk].load(std::memory_order_relaxed) != 0;
     return (realAsyncKey(vk) & 0x8000) != 0;
 }
@@ -1239,7 +1365,13 @@ bool Foreground()
     if (!f) return false;
     DWORD pid = 0;
     GetWindowThreadProcessId(f, &pid);
-    return pid == GetCurrentProcessId();
+    if (pid == GetCurrentProcessId()) return true;
+    // In the independent-window layout the game keeps foreground for normal
+    // play while the neural picture is topmost and click-through. NW.js may
+    // put its visible parent in a different process from this GPU child, so a
+    // PID-only test prevents Multiply from reopening Prism during gameplay.
+    HWND game = reinterpret_cast<HWND>(mgpu::gpu1::dcomp_game_hwnd());
+    return game != nullptr && GetAncestor(game, GA_ROOT) == GetAncestor(f, GA_ROOT);
 }
 
 void PollInput(UINT bw, UINT bh, bool open)
@@ -1256,16 +1388,57 @@ void PollInput(UINT bw, UINT bh, bool open)
     in.page = 0;
     in.wheelSteps = 0;
     const int wh = wheel.exchange(0);
+    {
+        static std::atomic<unsigned> poll_said{0};
+        if ((poll_said.fetch_add(1, std::memory_order_relaxed) % 120) == 0)
+            LOG("[MGPU][POV] poll: fg=%d ownSeq=%u gameWnd=%p fgHwnd=%p key=0x%02x t=%d mult_raw=%d",
+                (int)fg, ownKeySeq.load(std::memory_order_relaxed), (void *)gameWnd,
+                (void *)GetForegroundWindow(), cfg.key, (int)((cfg.key && Key(cfg.key)) ? 1 : 0),
+                int((realAsyncKey(VK_MULTIPLY) & 0x8000) != 0));
+    }
+    // The toggle is driven by the press counter, not the key level: a tap shorter than a
+    // poll interval still lands (the counter holds it), and a hold auto-repeat counts once.
+    static unsigned pressSeq = 0;
+    static unsigned rawPressSeqLast = 0;
+    static bool rawKeyWas = false;
+    static unsigned rawPressSeq = 0;
     if (!fg)
     {
         toggleWas = Key(cfg.key);
         lWas = false;
         in.down = false;
+        // A press while the game is not in the foreground cannot be a panel toggle
+        // (the panel would not have been visible); drop it so the toggle does not
+        // fire unexpectedly on the next refocus.
+        pressSeq = ownPressSeq.load(std::memory_order_relaxed);
+        rawKeyWas = cfg.key && (realAsyncKey(cfg.key) & 0x8000) != 0;  // no phantom edge on refocus
         return;
     }
-    const bool t = cfg.key && Key(cfg.key);
-    if (t && !toggleWas) in.toggle = true;
-    toggleWas = t;
+    const unsigned ps = ownPressSeq.load(std::memory_order_relaxed);
+    const unsigned presses = ps - pressSeq;   // physical presses since the last poll
+    pressSeq = ps;
+    // 2026-11-14 RE2 (RE Engine) never dispatches keyboard messages to its wndproc -
+    // the game reads Raw Input, so the ownPressSeq channel above sees zero keydowns
+    // while the user is pressing (proven: 0 keydn log lines during a real press test).
+    // GetAsyncKeyState IS alive (mult_raw=1 held for seconds in the same log), so
+    // count 0->1 edges of the raw state only when this key has never arrived through
+    // the hooked window procedure. Stellar Blade delivers BOTH channels for the same
+    // physical press; adding them double-counted it and made the panel toggle unstable.
+    const bool rawNow = cfg.key && (realAsyncKey(cfg.key) & 0x8000) != 0;
+    if (rawNow && !rawKeyWas)
+    {
+        ++rawPressSeq;
+        LOG("[MGPU][POV] raw key edge vk=0x%02x (press #%u)", unsigned(cfg.key & 0xff), rawPressSeq);
+    }
+    rawKeyWas = rawNow;
+    const bool ownChannel = cfg.key &&
+        (ownKeySeen[(cfg.key & 0xff) >> 5].load(std::memory_order_relaxed) &
+         (1u << ((cfg.key & 0xff) & 31))) != 0;
+    const unsigned rawPresses = rawPressSeq - rawPressSeqLast;
+    rawPressSeqLast = rawPressSeq;
+    const unsigned totalPresses = ownChannel ? presses : rawPresses;
+    if (totalPresses != 0) in.toggle = true;
+    toggleWas = totalPresses != 0;
     // The cursor, in back buffer pixels (the window's client area may be scaled to it).
     POINT p;
     if (gameWnd && realGetCursorPos(&p))
@@ -1408,16 +1581,9 @@ void PollInput(UINT bw, UINT bh, bool open)
 struct OvSet
 {
     bool enabled = false, split = false, armed = false;
-    int look = 0, passes = 1, cadence = 1, gradeSlot = 0, fpsCap = 0;
-    float intensity = 1.0f, guard = 1.0f, nrs = 0.75f, splitPos = 0.5f;
+    int look = 0, modelStyle = 0, passes = 1, cadence = 1, gradeSlot = 0, fpsCap = 0;
+    float intensity = 1.0f, guard = 1.0f, faceMask = 0.30f, nrs = 0.75f, splitPos = 0.5f;
     bool nrsOn = false;
-    bool xessRequested = false, xessActive = false, xessGenerating = false;
-    int xessMultiplier = 2;
-    unsigned xessLastFrames = 0;
-    double xessOutputFps = 0.0;
-    float temporalStrength = 0.70f;
-    bool temporalAdaptive = true, presentQueueWaitable = false;
-    int middleFrame = 1, presentQueue = 0, presentQueueApplied = -1;
     unsigned outW = 0, outH = 0, netW = 0, netH = 0;
     prism::GradeValues grade[prism::kGradeSlots];
 };
@@ -1429,8 +1595,7 @@ struct OvStats
     static constexpr int kMax = 256;
     float ms[kMax] = {};  // the last frames' times, oldest first
     int frames = 0;
-    float renderFps = 0, evalFps = 0, presentFps = 0, overrunFps = 0;
-    unsigned long long overrunTotal = 0;
+    float renderFps = 0, evalFps = 0, presentFps = 0;
     double evalMs = 0;
     bool tsOk = false;
     unsigned outW = 0, outH = 0, netW = 0, netH = 0;
@@ -1443,23 +1608,15 @@ void ReadSet(OvSet &s)
     s.armed = st.armed;
     s.enabled = st.neural;
     s.intensity = st.intensity[0];
+    s.faceMask = st.face_mask_strength;
+    s.modelStyle = std::clamp(int(st.style + 0.5f), 0, 2);
     s.passes = int(st.passes);
     s.cadence = int(st.nr_cadence);
     s.fpsCap = mgpu::t119::frame_cap();
     s.nrsOn = st.nrs_on;
-    s.nrs = st.nrs_scale;
-    s.xessRequested = st.xess_requested;
-    s.xessMultiplier = 2;
-    s.xessActive = st.xess_active;
-    s.xessGenerating = st.xess_generating;
-    s.xessLastFrames = st.xess_last_frames_presented;
-    s.xessOutputFps = st.xess_output_fps;
-    s.temporalStrength = st.temporal_strength;
-    s.temporalAdaptive = st.temporal_motion_adaptive;
-    s.middleFrame = st.middle_frame;
-    s.presentQueue = st.present_queue;
-    s.presentQueueApplied = st.present_queue_applied;
-    s.presentQueueWaitable = st.present_queue_waitable;
+    // The old global row is a master for the new per-pass scales. Mirror pass 1
+    // so an edit cannot snap back while NRScale1/2/3 override the legacy value.
+    s.nrs = st.nrs_pscale[0] > 0.05f ? st.nrs_pscale[0] : st.nrs_scale;
     s.split = st.present_mode == 2;
     s.splitPos = st.split_pos;
     s.outW = st.nrs_native_w;
@@ -1478,11 +1635,10 @@ void ReadSet(OvSet &s)
         s.intensity = mgpu::psync::intensity();
         s.guard = mgpu::psync::guard();
     }
-    else if (mgpu::prism_x1::active())
-    {
-        s.intensity = mgpu::prism_x1::intensity();
-        s.guard = mgpu::prism_x1::guard();
-    }
+    // PX1 owns character protection on the reduced per-frame chain. Finish is
+    // grade-only there, so its guard value must not overwrite the live slider.
+    if (mgpu::prism_x1m::active(0))
+        s.guard = mgpu::prism_x1m::guard(0);
 }
 
 void NoteStats()
@@ -1501,8 +1657,6 @@ void NoteStats()
     g_stats.renderFps = float(st.fps_produced);
     g_stats.evalFps = float(st.fps_evaluated);
     g_stats.presentFps = float(st.present_fps);
-    g_stats.overrunFps = float(st.fps_overrun);
-    g_stats.overrunTotal = st.overrun;
     g_stats.evalMs = st.gpu1_eval_ms;
     g_stats.tsOk = st.gpu1_ts_ok;
 }
@@ -1514,34 +1668,6 @@ void ApplySet(const OvSet &s)
     mgpu::gpu1::ui_state st;
     mgpu::gpu1::ui_read(st);
     if (st.neural != s.enabled) mgpu::gpu1::ui_set_neural(s.enabled);
-    if (st.xess_requested != s.xessRequested)
-        (void)mgpu::gpu1::ui_ini_write("XeSSFG", s.xessRequested ? 1 : 0);
-    const int xessMultiplier = 2;
-    if (mgpu::gpu1::ui_ini_read("XeSSMultiplier", 2) != xessMultiplier)
-        (void)mgpu::gpu1::ui_ini_write("XeSSMultiplier", xessMultiplier);
-    const int temporal = std::clamp(int(std::lround(s.temporalStrength * 100.0f)), 0, 95);
-    if (int(std::lround(st.temporal_strength * 100.0f)) != temporal)
-    {
-        mgpu::amd_of::set_temporal_strength(float(temporal) / 100.0f);
-        (void)mgpu::gpu1::ui_ini_write("TemporalStrength", temporal);
-    }
-    if (st.temporal_motion_adaptive != s.temporalAdaptive)
-    {
-        mgpu::amd_of::set_motion_adaptive(s.temporalAdaptive);
-        (void)mgpu::gpu1::ui_ini_write("TemporalMotionAdaptive", s.temporalAdaptive ? 1 : 0);
-    }
-    const int middle = std::clamp(s.middleFrame, 0, 2);
-    if (st.middle_frame != middle)
-    {
-        mgpu::amd_of::set_frame_source(middle);
-        (void)mgpu::gpu1::ui_ini_write("MiddleFrame", middle);
-    }
-    const int queue = middle == 2 ? 0 : std::clamp(s.presentQueue, 0, 2);
-    if (st.present_queue != queue || s.presentQueue != queue)
-    {
-        mgpu::present_queue::request(unsigned(queue));
-        (void)mgpu::gpu1::ui_ini_write("PresentQueue", queue);
-    }
     if (mgpu::psync::active())
     {
         if (std::fabs(mgpu::psync::intensity() - s.intensity) > 1e-4f)
@@ -1550,26 +1676,44 @@ void ApplySet(const OvSet &s)
             (void)mgpu::gpu1::ui_ini_write_float("PrismSyncIntensity", s.intensity);
         }
     }
-    else if (mgpu::prism_x1::active())
-    {
-        if (std::fabs(mgpu::prism_x1::intensity() - s.intensity) > 1e-4f)
-        {
-            mgpu::prism_x1::set_intensity(s.intensity);
-            (void)mgpu::gpu1::ui_ini_write_float("PrismX1Intensity", s.intensity);
-        }
-    }
     else if (std::fabs(st.intensity[0] - s.intensity) > 1e-4f)
+    {
         mgpu::gpu1::ui_set_intensity(0u, s.intensity);
-    // Pass count remains independent. Only every-frame and fixed 1.5 remain.
+        // This overlay writes its own settings directly; PanelPersist may be off.
+        (void)mgpu::gpu1::ui_ini_write_float("Intensity", s.intensity);
+        for (unsigned i = 0; i < st.max_passes; ++i)
+        {
+            char key[32];
+            snprintf(key, sizeof key, "Intensity%u", i + 1u);
+            (void)mgpu::gpu1::ui_ini_write_float(key, s.intensity);
+        }
+        (void)mgpu::gpu1::ui_ini_write_word("Preset", "manual");
+    }
+    const int modelStyle = std::clamp(s.modelStyle, 0, 2);
+    if (int(st.style + 0.5f) != modelStyle)
+        mgpu::gpu1::ui_set_tuning_value(3, float(modelStyle));
+    if (std::fabs(st.face_mask_strength - s.faceMask) > 1e-4f)
+        mgpu::gpu1::ui_set_face_mask_strength(s.faceMask);
     if (int(st.passes) != s.passes) mgpu::gpu1::ui_set_passes(unsigned(s.passes));
-    const int cadence = s.cadence == 15 ? 15 : 1;
-    if (int(st.nr_cadence) != cadence) mgpu::gpu1::ui_set_cadence(unsigned(cadence));
+    if (int(st.nr_cadence) != s.cadence) mgpu::gpu1::ui_set_cadence(unsigned(s.cadence));
     if (mgpu::t119::frame_cap() != s.fpsCap)
     {
         mgpu::t119::set_frame_cap(s.fpsCap);
         (void)mgpu::gpu1::ui_ini_write("FrameCap", s.fpsCap);
     }
-    if (s.nrsOn && std::fabs(st.nrs_scale - s.nrs) > 1e-4f) mgpu::gpu1::ui_nrs_stage(s.nrs);
+    const float oldMaster = st.nrs_pscale[0] > 0.05f ? st.nrs_pscale[0] : st.nrs_scale;
+    if (s.nrsOn && std::fabs(oldMaster - s.nrs) > 1e-4f)
+    {
+        // A real master, not the old ui_nrs_stage call hidden by per-pass overrides.
+        (void)mgpu::gpu1::ui_ini_write_float("NRScale", s.nrs);
+        for (unsigned i = 0; i < std::clamp(st.passes, 1u, 3u); ++i)
+        {
+            char key[16];
+            snprintf(key, sizeof key, "NRScale%u", i + 1u);
+            (void)mgpu::gpu1::ui_ini_write_float(key, s.nrs);
+            mgpu::gpu1::ui_set_scale(i, s.nrs);
+        }
+    }
     const int wantMode = s.split ? 2 : 0;
     if (int(st.present_mode) != wantMode) mgpu::gpu1::ui_set_present_mode(wantMode);
     if (mgpu::pfinish::active())
@@ -1580,14 +1724,37 @@ void ApplySet(const OvSet &s)
             (void)mgpu::gpu1::ui_ini_write("FinishLook", s.look);
         }
         if (mgpu::pfinish::grade_slot() != s.gradeSlot) mgpu::pfinish::set_grade_slot(s.gradeSlot);
+        bool grade_changed = false;
         for (int i = 0; i < prism::kGradeSlots; ++i)
             if (mgpu::pfinish::grade_snapshot(i) != s.grade[i])
             {
                 mgpu::pfinish::set_grade_values(i, s.grade[i]);
                 mgpu::pfinish::save_grade_slot(i);
+                grade_changed = true;
             }
+        // R375: the grade table only reaches the picture at Look 5; editing a grade
+        // under a preset look silently did nothing. Switch for the operator.
+        if (grade_changed && mgpu::pfinish::look() != 5u)
+        {
+            mgpu::pfinish::set_look(5u);
+            (void)mgpu::gpu1::ui_ini_write("FinishLook", 5);
+        }
     }
-    if (mgpu::psync::active())
+    bool px1_guard_owner = false;
+    bool px1_guard_changed = false;
+    for (unsigned i = 0; i < mgpu::prism_x1m::kMaxPasses; ++i)
+    {
+        if (!mgpu::prism_x1m::active(i)) continue;
+        px1_guard_owner = true;
+        if (std::fabs(mgpu::prism_x1m::guard(i) - s.guard) > 1e-3f)
+        {
+            mgpu::prism_x1m::set_guard(i, s.guard);
+            px1_guard_changed = true;
+        }
+    }
+    if (px1_guard_changed)
+        (void)mgpu::gpu1::ui_ini_write_float("PrismX1Guard", s.guard);
+    if (!px1_guard_owner && mgpu::psync::active())
     {
         if (std::fabs(mgpu::psync::guard() - s.guard) > 1e-3f)
         {
@@ -1595,15 +1762,10 @@ void ApplySet(const OvSet &s)
             (void)mgpu::gpu1::ui_ini_write_float("PrismSyncGuard", s.guard);
         }
     }
-    else if (mgpu::prism_x1::active())
-    {
-        if (std::fabs(mgpu::prism_x1::guard() - s.guard) > 1e-3f)
-        {
-            mgpu::prism_x1::set_guard(s.guard);
-            (void)mgpu::gpu1::ui_ini_write_float("PrismX1Guard", s.guard);
-        }
-    }
-    else if (mgpu::pfinish::active() && std::fabs(mgpu::pfinish::guard() - s.guard) > 1e-3f)
+    // PX1 protects during residual composition; Finish performs the final
+    // character-guard composition. One slider owns both, including 0%=off.
+    if (mgpu::pfinish::active() &&
+        std::fabs(mgpu::pfinish::guard() - s.guard) > 1e-3f)
     {
         mgpu::pfinish::set_guard(s.guard);
         (void)mgpu::gpu1::ui_ini_write_float("FinishGuard", s.guard);
@@ -1617,24 +1779,28 @@ enum Row
     kOn,
     kLook,
     kIntensity,
+    kModelStyle,
     kPasses,
     kCadence,
     kNetScale,
     kGuard,
+    kFaceMask,
     kFpsCap,
     kSplit,
-    kXess,
-    kTemporalStrength,
-    kTemporalAdaptive,
-    kMiddleFrame,
-    kPresentQueue,
+    kFrameGen,
+    kP1Net,
+    kP1Res,
+    kP2Net,
+    kP2Res,
+    kP3Net,
+    kP3Res,
     kRows
 };
 struct Panel
 {
-    bool open = false;
+    std::atomic<bool> open{false};
     double openedAt = 0, closedAt = -10;
-    int focus = kLook, page = 0;
+    int focus = kLook;
     int hoverOption = -1;  // the option under the cursor in the focused row, for its help
     enum Drag
     {
@@ -1665,6 +1831,12 @@ struct Panel
     float graphTop = 20.0f;  // the frame-time graph's scale (ms), eased
     float px0 = 0, py0 = 0;   // the panel's pixel origin this frame
 } panel;
+
+// Input may be blocked only after the panel has actually been submitted to a
+// presenting chain.  An open flag alone is not proof that the player can see
+// it (the chain may be covered, unbound, or have failed its draw).
+double panelDrawnAt = -10.0;
+bool inputGuardSaid = false;
 
 float EaseOutExpo(float t) { return t >= 1.0f ? 1.0f : 1.0f - std::pow(2.0f, -10.0f * t); }
 float U(float v) { return std::round(v * ui); }  // panel units to whole pixels
@@ -1794,13 +1966,17 @@ void Cursor(float x, float y)
 const wchar_t *RowLabel(int r)
 {
     static const wchar_t *labels[kRows] = {
-        L"神经渲染", L"色彩", L"强度", L"遍数", L"节奏", L"网络分辨率", L"角色守护", L"FPS 对齐", L"分屏对比",
-        L"XeSS FG", L"时域累积", L"运动自适应", L"双卡中间帧", L"目标帧队列"};
+        L"神经渲染", L"色彩", L"强度", L"模型风格", L"遍数", L"节奏", L"网络分辨率", L"角色守护", L"人脸遮罩", L"FPS 对齐", L"分屏对比", L"帧生成",
+        L"P1 网络", L"P1 分辨率", L"P2 网络", L"P2 分辨率", L"P3 网络", L"P3 分辨率"};
     return labels[r];
 }
 
 std::wstring RowHelp(int r, const OvSet &s, int option)
 {
+    if (r == kP1Net || r == kP2Net || r == kP3Net)
+        return L"这一遍跑哪个网络：Light-FP8 小而快，Full-FP8 大而精细。改动实时重建该遍，并写入 ini 下次启动沿用。";
+    if (r == kP1Res || r == kP2Res || r == kP3Res)
+        return L"这一遍网络的工作分辨率，30% 到 100% 独立可调，100% 是原生全分辨率直跑。每遍可以不同：比如第一遍 55% 出结构、第二遍 80% 补细节。改动实时生效并写入 ini。";
     switch (r)
     {
     case kOn:
@@ -1816,52 +1992,25 @@ std::wstring RowHelp(int r, const OvSet &s, int option)
         return looks[std::clamp(option >= 0 ? option : s.look, 0, 5)];
     }
     case kIntensity:
-        return L"网络改动的放大倍数，100% 是网络原样输出。250% 以上是游乐场，画面容易过度。";
+        return L"网络改动的放大倍数，100% 是网络原样输出，200% 是 MGPU 原生上限，300% 是 Prism 扩展强度。只放大网络自身的改动，不放大原生画面的像素噪声。";
+    case kModelStyle:
+        return L"原版 MGPU 的 A／B／C 模型风格，分别对应 DLSSNR.Style 0／1／2。选择后实时生效，并保留到下次启动。";
     case kPasses:
-        return L"网络在自己的结果上再跑几遍，效果更强，开销按遍数成倍增加。双卡车道上副卡的帧预算最多装下 2 遍。";
+        return L"网络在自己的结果上再跑几遍，效果更强，开销随遍数增加。三遍各自使用独立的网络、工作分辨率和融合历史。";
     case kCadence:
-        return L"每帧都求值，或按求值、保持、求值的三帧循环运行，求值间隔交替为两帧和一帧，平均 1.5 帧。固定模式不会因运动或复杂场景自动补回每帧，优先减少求值开销。与遍数独立。";
+        return L"固定每帧运行网络，不持帧、不做异步 WARP。每一遍都消费当前帧输入，避免隔帧合成引入运动拖影和周期闪烁。";
     case kNetScale:
-        return L"网络工作的分辨率比例。剑星同步管线在 100% 保留原生全分辨率路径，低于 100% 才进入降分辨率分支；停下约 350 毫秒后生效。";
+        return L"全局网络分辨率主控，30% 到 100%。调整后同步到当前所有遍；需要不同尺寸时，再使用下方的 P1／P2／P3 独立分辨率。";
     case kGuard:
-        return L"压住网络在肤色和高饱和颜色上的色度改动，人物肤色更自然。0% 等于不干预。";
+        return L"角色守护强度，0% 关闭，100% 完整启用。沿用原有多遍之间的角色区域保护，不是 DLSSNR.ControlMask；拖动、滚轮或方向键可实时调节并保存。";
+    case kFaceMask:
+        return L"人脸遮罩默认 30%，独立调节 NVIDIA 自动人脸／皮肤区域的结构处理，与角色守护无关。遮罩内仍有神经画面，0% 也不关闭神经渲染；每一遍都实时生效并保存。";
     case kFpsCap:
         return L"限制主卡游戏生产帧率，给副卡留出处理时间，减少未读帧被覆盖。0 为关闭；这是主卡整体限帧，不是单独拖慢副卡。";
     case kSplit:
         return L"左边原画，右边神经画面。面板打开时可以拖动画面上的分割线。";
-    case kXess: {
-        wchar_t b[320];
-        if (s.xessActive)
-            std::swprintf(b, 320, L"关／X2 实时切换，不重建交换链。当前请求：%s；实际 framesPresented=%u（2 为 X2）。",
-                          !s.xessRequested ? L"关闭，代理直通原帧" : L"X2",
-                          s.xessLastFrames);
-        else
-            std::swprintf(b, 320, L"本次启动未创建 XeSS 代理；从完全未开启的状态启用时需要重启。当前未创建，framesPresented=%u。",
-                          s.xessLastFrames);
-        return b;
-    }
-    case kTemporalStrength:
-        return L"同尺寸历史画面的权重，0–95%。越高越抗闪，但拖影风险也越高；不做超分，实时生效。";
-    case kTemporalAdaptive:
-        return L"颜色突变时自动降低历史权重，减少运动拖影。关闭后使用固定时域强度，邻域限制仍保留。";
-    case kMiddleFrame: {
-        static const wchar_t *help[3] = {
-            L"上一帧：使用前一已完成颜色及其对应光流插帧，多一帧延迟。",
-            L"Present：使用最新颜色及其对应光流进行正常 XeSS 插帧。",
-            L"当前帧（最低延迟）：只递交最新颜色，不生成未来帧；XeSS 显示原生递交，目标队列强制为 0。"};
-        return help[std::clamp(option >= 0 ? option : s.middleFrame, 0, 2)];
-    }
-    case kPresentQueue: {
-        if (s.middleFrame == 2) return L"当前帧最低延迟模式强制为 0；额外排队帧不包含正在递交的这一帧。";
-        wchar_t b[320];
-        if (s.presentQueueApplied >= 0)
-            std::swprintf(b, 320, L"请求额外排队 %d 帧；DXGI 实际读回 %d 帧，等待对象：%s。不是交换链 BufferCount。",
-                          s.presentQueue, s.presentQueueApplied, s.presentQueueWaitable ? L"有效" : L"无效");
-        else
-            std::swprintf(b, 320, L"请求额外排队 %d 帧；尚未成功应用或当前 DirectComposition 不支持。不会虚报限深。",
-                          s.presentQueue);
-        return b;
-    }
+    case kFrameGen:
+        return L"在最终神经画面之后运行副卡 DLSS 帧生成，使用游戏 DLSS 的运动向量和深度。2x 生成一张中间帧，4x 生成三张独立中间帧；驱动拒绝 4x 时明确降到 2x。切换后重启游戏生效。";
     }
     return L"";
 }
@@ -1911,16 +2060,18 @@ void DrawPanel(UINT bw, UINT bh, float dt)
     OvSet s;
     ReadSet(s);
 
-    static const int mainRows[] = {kOn, kLook, kIntensity, kPasses, kCadence, kNetScale, kGuard, kFpsCap, kSplit};
-    static const int outputRows[] = {kXess, kTemporalStrength, kTemporalAdaptive, kMiddleFrame, kPresentQueue};
-    panel.page = std::clamp(panel.page, 0, 1);
-    const int *rows = panel.page == 0 ? mainRows : outputRows;
-    const int rowCount = panel.page == 0 ? int(sizeof(mainRows) / sizeof(mainRows[0]))
-                                         : int(sizeof(outputRows) / sizeof(outputRows[0]));
-    const float W = U(460), pad = U(20), rowH = U(38), labelW = U(108);
-    // Height: header, page tabs, telemetry, rows, help, footer.
-    const float headH = U(52), tabsH = U(38), telH = U(190), helpH = U(64), footH = U(40);
-    const float H = headH + tabsH + telH + rowH * float(rowCount) + U(12) + helpH + footH;
+    const float W = U(700), pad = U(20), rowH = U(38), labelW = U(80);
+    // Height: header, telemetry, rows, help, footer. The per-pass rows follow the pass count.
+    // 2026-11-14: the row count outgrew one column and the tail rows were buried at the
+    // bottom of a screen-tall panel. Two columns: everything is visible at a glance.
+    const float headH = U(52), telH = U(170), helpH = U(64), footH = U(40);
+    // Twelve base rows (including DLSS FG) plus network/resolution per pass.
+    // Character guard and NVIDIA face mask are separate strength sliders.
+    const int visRows = 12 + 2 * std::clamp(s.passes, 1, 3);
+    if (panel.focus >= visRows) panel.focus = visRows - 1;
+    const int rowsLeft = (visRows + 1) / 2;   // rows in the first column; the rest go right
+    const float colW = (W - pad * 2.0f) / 2.0f;
+    const float H = headH + telH + rowH * float(rowsLeft) + U(12) + helpH + footH;
     panel.pw = W;
     panel.ph = H;
     float x0 = std::round(cfg.x * ui), y0 = std::round(cfg.y * ui);
@@ -1974,24 +2125,8 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         }
     }
 
-    // Main/output pages. Grading keeps its own independent Tab/shoulder paging.
-    float y = y0 + headH;
-    {
-        int tabHover = -1;
-        const float sh = U(26), sy = y + std::round((tabsH - sh) * 0.5f);
-        const int want = Segments(kRows + 6, x0 + pad, sy, x1 - pad, sh,
-                                  {L"神经渲染", L"画面输出"}, panel.page, 3, 0, &tabHover, dt);
-        if (want >= 0 && want != panel.page)
-        {
-            panel.page = want;
-            panel.focus = want == 0 ? kLook : kXess;
-            panel.side = 0;
-        }
-        y += tabsH;
-        Fill(x0, y - t, x1, y, kHair);
-    }
-
     // Telemetry.
+    float y = y0 + headH;
     {
         const float gx0 = x0 + pad, gx1 = x1 - pad;
         const float graphY0 = y + U(28), graphY1 = y + U(70);
@@ -2003,9 +2138,8 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         // The primary readout is compositor delivery; game production is separate below.
         const float colW = (gx1 - gx0) / 4.0f, ly = graphY1 + U(12), vy = ly + LineHeight(kLabel);
         const float p99 = Percentile(g_stats, 0.99f), med = Percentile(g_stats, 0.5f);
-        const std::wstring labels[4] = {s.xessActive && s.xessRequested ? L"XeSS 输出 FPS" : L"递交 FPS", L"传输帧时间", L"传输低帧", L"MGPU GPU"};
-        const double primaryFps = s.xessActive ? s.xessOutputFps : double(g_stats.presentFps);
-        const std::wstring values[4] = {primaryFps > 0 ? Fmt(L"%.1f", primaryFps) : L"—",
+        const std::wstring labels[4] = {L"画面 FPS", L"传输帧时间", L"传输低帧", L"MGPU GPU"};
+        const std::wstring values[4] = {g_stats.presentFps > 0 ? Fmt(L"%.1f", g_stats.presentFps) : L"—",
                                         med > 0 ? Fmt(L"%.1f ms", med) : L"—", p99 > 0 ? Fmt(L"%.0f", 1000.0 / p99) : L"—",
                                         g_stats.tsOk && g_stats.evalMs > 0 ? Fmt(L"%.1f ms", g_stats.evalMs) : L"—"};
         for (int i = 0; i < 4; ++i)
@@ -2032,27 +2166,23 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         }
         const float sizeY = vy + LineHeight(kValue) + U(6);
         Text(gx0, sizeY, sizes, kLabel, kQuiet);
-        wchar_t rateText[96];
-        std::swprintf(rateText, 96, L"游戏生产 %.1f fps　神经更新 %.1f fps",
-                      (double)g_stats.renderFps, (double)g_stats.evalFps);
+        wchar_t rateText[128];
+        std::swprintf(rateText, 128, L"神经计算 %.1f fps　·　游戏生产 %.1f fps",
+                      (double)g_stats.evalFps, (double)g_stats.renderFps);
         Text(gx0, sizeY + LineHeight(kLabel) + U(2), rateText, kLabel, kQuiet);
-        wchar_t overrunText[96];
-        std::swprintf(overrunText, 96, L"溢出丢帧 %.1f/s　累计 %llu",
-                      (double)g_stats.overrunFps, g_stats.overrunTotal);
-        Text(gx0, sizeY + LineHeight(kLabel) * 2 + U(4), overrunText, kLabel,
-             g_stats.overrunTotal ? kCaution : kQuiet);
         y += telH;
         Fill(x0, y - t, x1, y, kHair);
     }
 
-    // Rows.
-    const float cx0 = x0 + pad + labelW, cx1 = x1 - pad;
+    // Rows, two columns.
     y += U(6);
     int hoverRow = -1;
-    for (int i = 0; i < rowCount; ++i)
+    for (int r = 0; r < visRows; ++r)
     {
-        const float ry = y + i * rowH;
-        if (in.mx >= x0 && in.mx < x1 && in.my >= ry && in.my < ry + rowH && !in.pad) hoverRow = rows[i];
+        const int c = r < rowsLeft ? 0 : 1, i = c ? r - rowsLeft : r;
+        const float colX0 = x0 + pad + float(c) * colW, colX1 = colX0 + colW;
+        const float ry = y + float(i) * rowH;
+        if (in.mx >= colX0 && in.mx < colX1 && in.my >= ry && in.my < ry + rowH && !in.pad) hoverRow = r;
     }
     if (hoverRow >= 0 && in.mouseMoved && panel.drag == Panel::kNone)
     {
@@ -2062,30 +2192,24 @@ void DrawPanel(UINT bw, UINT bh, float dt)
     if (in.side) panel.side = s.look == 5 ? 1 - panel.side : 0;
     if (s.look != 5) panel.side = 0;
     const bool keysHere = panel.side == 0;
-    if (keysHere && in.page)
-    {
-        panel.page = (panel.page + in.page + 2) % 2;
-        panel.focus = panel.page == 0 ? kLook : kXess;
-    }
-    int focusIndex = 0;
-    for (int i = 0; i < rowCount; ++i) if (rows[i] == panel.focus) { focusIndex = i; break; }
     // Keyboard and gamepad: up and down move the focus, left and right change the value.
-    if (keysHere && in.up) focusIndex = (focusIndex + rowCount - 1) % rowCount;
-    if (keysHere && in.dn) focusIndex = (focusIndex + 1) % rowCount;
-    if (keysHere && (in.up || in.dn)) panel.focus = rows[focusIndex];
+    if (keysHere && in.up) panel.focus = (panel.focus + visRows - 1) % visRows;
+    if (keysHere && in.dn) panel.focus = (panel.focus + 1) % visRows;
     const int step = !keysHere ? 0 : in.right ? 1 : in.left ? -1 : 0;
     panel.hoverOption = -1;
     OvSet n = s;
     bool changed = false;
-    for (int i = 0; i < rowCount; ++i)
+    for (int r = 0; r < visRows; ++r)
     {
-        const int r = rows[i];
-        const float ry = y + i * rowH;
+        const int c = r < rowsLeft ? 0 : 1, i = c ? r - rowsLeft : r;
+        const float colX0 = x0 + pad + float(c) * colW, colX1 = colX0 + colW;
+        const float cx0 = colX0 + labelW, cx1 = colX1 - pad;
+        const float ry = y + float(i) * rowH;
         const bool focused = panel.focus == r && keysHere;
         const bool rowEnabled = true;
         const float ty = ry + std::round((rowH - LineHeight(kBody)) * 0.5f);
-        if (focused) Fill(x0 + U(8), ry + U(10), x0 + U(8) + std::max(2.0f, U(2)), ry + rowH - U(10), kWhite);
-        Text(x0 + pad, ty, RowLabel(r), kBody, !rowEnabled ? kQuiet : focused ? kWhite : kReadout);
+        if (focused) Fill(colX0 + U(2), ry + U(10), colX0 + U(2) + std::max(2.0f, U(2)), ry + rowH - U(10), kWhite);
+        Text(colX0 + U(10), ty, RowLabel(r), kBody, !rowEnabled ? kQuiet : focused ? kWhite : kReadout);
         const float sh = U(26), sy = ry + std::round((rowH - sh) * 0.5f);
         int hover = -1, clicked = -1;
         const bool keyStep = focused && step != 0;
@@ -2114,35 +2238,6 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             }
             break;
         }
-        case kXess: {
-            const int v = n.xessRequested ? 1 : 0;
-            clicked = Segments(r, cx1 - U(100), sy, cx1, sh, {L"关", L"X2"}, v, 2, 0, &hover, dt, true);
-            int nv = v;
-            if (clicked >= 0) nv = clicked;
-            if (keyStep) nv = std::clamp(v + step, 0, 1);
-            if (focused && in.enter) nv = (v + 1) % 2;
-            if (nv != v)
-            {
-                n.xessRequested = nv > 0;
-                if (nv > 0) n.xessMultiplier = 2;
-                changed = true;
-            }
-            break;
-        }
-        case kTemporalAdaptive: {
-            const bool v = n.temporalAdaptive;
-            clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"关", L"开"}, v ? 1 : 0, 3, 0, &hover, dt, true);
-            bool nv = v;
-            if (clicked >= 0) nv = clicked == 1;
-            if (keyStep) nv = step > 0;
-            if (focused && in.enter) nv = !v;
-            if (nv != v)
-            {
-                n.temporalAdaptive = nv;
-                changed = true;
-            }
-            break;
-        }
         case kLook: {
             clicked = Segments(r, cx0, sy, cx1, sh, {L"默认", L"高还原", L"高饱和", L"低饱和", L"浓烈", L"自定义"},
                                std::clamp(n.look, 0, 5), 63, 0, &hover, dt);
@@ -2159,13 +2254,13 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         }
         case kIntensity:
         case kGuard:
-        case kTemporalStrength: {
-            const bool isI = r == kIntensity, isTemporal = r == kTemporalStrength;
-            const float max = isI ? 300.0f : isTemporal ? 95.0f : 100.0f;
-            const float val = (isI ? n.intensity : isTemporal ? n.temporalStrength : n.guard) * 100.0f;
-            const float vw = U(52), keyStepSize = isTemporal ? 5.0f : 10.0f;
-            const Bars b = BarSlider(cx0, sy + U(5), cx1 - vw - U(8), sh - U(14), val, max,
-                                     isTemporal ? 70.0f : 100.0f, isI ? 250.0f : 0.0f, true, focused);
+        case kFaceMask: {
+            const bool isI = r == kIntensity;
+            float *const value = isI ? &n.intensity : (r == kGuard ? &n.guard : &n.faceMask);
+            const float max = isI ? 300.0f : 100.0f, val = *value * 100.0f;
+            const float vw = U(52);
+            const Bars b = BarSlider(cx0, sy + U(5), cx1 - vw - U(8), sh - U(14), val, max, 100.0f, isI ? 150.0f : 0.0f,
+                                     true, focused);
             TextRight(cx1, ty, Fmt(L"%.0f%%", val), kValue, focused ? kWhite : kReadout);
             float nv = val;
             const bool over = in.mx >= b.x0 - U(4) && in.mx < b.x1 + U(4) && in.my >= ry && in.my < ry + rowH && !in.pad;
@@ -2177,21 +2272,33 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             if (panel.drag == Panel::kSlide && panel.dragRow == r && in.down)
                 nv = std::round(std::clamp((in.mx - b.x0) / (b.x1 - b.x0), 0.0f, 1.0f) * max / 5.0f) * 5.0f;
             if (over && in.wheelSteps) nv = std::clamp(nv + in.wheelSteps * 5.0f, 0.0f, max);
-            if (keyStep) nv = std::clamp(std::round((nv + step * keyStepSize) / keyStepSize) * keyStepSize, 0.0f, max);
+            if (keyStep) nv = std::clamp(std::round((nv + step * 10.0f) / 10.0f) * 10.0f, 0.0f, max);
             if (std::fabs(nv - val) > 0.01f)
             {
-                if (isTemporal) n.temporalStrength = nv / 100.0f;
-                else (isI ? n.intensity : n.guard) = nv / 100.0f;
+                *value = nv / 100.0f;
                 changed = true;
             }
             break;
         }
-        case kPasses: {
-            const int cur = std::clamp(n.passes - 1, 0, 1);
-            clicked = Segments(r, cx0, sy, cx1, sh, {L"1", L"2"}, cur, 3, 0, &hover, dt);
+        case kModelStyle: {
+            const int cur = std::clamp(n.modelStyle, 0, 2);
+            clicked = Segments(r, cx1 - U(180), sy, cx1, sh, {L"A", L"B", L"C"}, cur, 7, 0, &hover, dt);
             int want = clicked;
-            if (keyStep) want = std::clamp(cur + step, 0, 1);
-            // Pass count stays independent of PX1/PX2 cadence.
+            if (keyStep) want = std::clamp(cur + step, 0, 2);
+            if (focused && in.enter) want = (cur + 1) % 3;
+            if (want >= 0 && want != cur)
+            {
+                n.modelStyle = want;
+                changed = true;
+            }
+            if (focused) panel.hoverOption = hover;
+            break;
+        }
+        case kPasses: {
+            const int cur = std::clamp(n.passes - 1, 0, 2);
+            clicked = Segments(r, cx0, sy, cx1, sh, {L"1", L"2", L"3"}, cur, 7, 0, &hover, dt);
+            int want = clicked;
+            if (keyStep) want = std::clamp(cur + step, 0, 2);
             if (want >= 0 && want != cur)
             {
                 n.passes = want + 1;
@@ -2199,63 +2306,104 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             }
             break;
         }
-        case kCadence: {
-            if (n.cadence != 1 && n.cadence != 15)
-            {
-                n.cadence = 1;
-                changed = true;
-            }
-            const int cur = n.cadence == 15 ? 1 : 0;
-            clicked = Segments(r, cx0, sy, cx1, sh, {L"每帧", L"1.5 帧"}, cur, 7, 0, &hover, dt);
+        case kP1Net:
+        case kP2Net:
+        case kP3Net: {
+            // 0.5.1 per-pass network: Light-FP8 (small, FPS+) vs Full-FP8 (big). Live rebuild
+            // through ui_set_network, ini mirror for the next launch (pass 1 at x2+ -> NRPreset1x2).
+            const unsigned pi = unsigned(r - kP1Net) / 2u;
+            static const char *const nrKey[3] = {"NRPreset1", "NRPreset2", "NRPreset3"};
+            mgpu::gpu1::ui_state stn;
+            mgpu::gpu1::ui_read(stn);
+            const bool live = stn.armed && stn.nr_ok;
+            const char *key_now = (pi == 0u && stn.passes >= 2u) ? "NRPreset1x2" : nrKey[pi];
+            const int cur = live ? (stn.nr_preset_pass[pi] == 1 ? 1 : 0)
+                                 : (mgpu::gpu1::ui_ini_read(nrKey[pi], mgpu::gpu1::ui_ini_read("NRPreset", 0)) == 1 ? 1 : 0);
+            clicked = Segments(r, cx0, sy, cx1, sh, {L"Light", L"Full"}, cur, 3, 0, &hover, dt);
             int want = clicked;
-            if (keyStep) want = std::clamp(cur + step, 0, 1);
+            if (focused && (in.enter || keyStep)) want = 1 - cur;
             if (want >= 0 && want != cur)
             {
-                n.cadence = want == 1 ? 15 : 1;
-                changed = true;
-            }
-            break;
-        }
-        case kMiddleFrame: {
-            const int cur = std::clamp(n.middleFrame, 0, 2);
-            clicked = Segments(r, cx0, sy, cx1, sh, {L"上一帧", L"Present", L"当前帧"}, cur, 7, 0, &hover, dt);
-            int want = clicked;
-            if (keyStep) want = std::clamp(cur + step, 0, 2);
-            if (want >= 0 && want != cur)
-            {
-                n.middleFrame = want;
-                if (want == 2) n.presentQueue = 0;
-                changed = true;
+                (void)mgpu::gpu1::ui_ini_write(key_now, want);
+                if (live) mgpu::gpu1::ui_set_network(pi, want);
             }
             if (focused) panel.hoverOption = hover;
             break;
         }
-        case kPresentQueue: {
-            const int cur = n.middleFrame == 2 ? 0 : std::clamp(n.presentQueue, 0, 2);
-            clicked = Segments(r, cx1 - U(180), sy, cx1, sh, {L"0", L"1", L"2"}, cur, 7, 0, &hover, dt);
-            int want = clicked;
-            if (keyStep) want = std::clamp(cur + step, 0, 2);
-            if (n.middleFrame == 2) want = 0;
-            if (want >= 0 && want != n.presentQueue)
+        case kP1Res:
+        case kP2Res:
+        case kP3Res: {
+            // R370: per-pass resolution slider, 30..100% (100% = a native full pass on
+            // this pass). Writes NRScale1/2/3 to the ini and applies live through
+            // ui_set_scale - no recreate, a mask flip + Reset on that pass's next evaluate.
+            const unsigned pi = unsigned(r - kP1Res) / 2u;
+            mgpu::gpu1::ui_state stn;
+            mgpu::gpu1::ui_read(stn);
+            const bool live = stn.armed && stn.nr_ok;
+            float cur;
+            if (live)
+                cur = stn.nrs_pscale[pi] > 0.05f ? stn.nrs_pscale[pi] : stn.nrs_scale;
+            else
             {
-                n.presentQueue = want;
-                changed = true;
+                char pk[16];
+                snprintf(pk, sizeof pk, "NRScale%u", pi + 1u);
+                cur = mgpu::gpu1::ui_ini_read_float(pk, -1.0f);
+                if (cur < 0.05f)
+                    cur = (pi == 0u) ? mgpu::gpu1::ui_ini_read_float("NRScale", 1.0f) : 1.0f;
+                cur = std::clamp(cur, 0.30f, 1.00f);
+            }
+            // A drag only previews here. Apply and persist once on release: applying
+            // during the drag resets DLSS-NR history repeatedly and leaves old/new
+            // viewpoints blended together. Wheel and keyboard edits apply at once.
+            static float pendingScale[3] = {-1.0f, -1.0f, -1.0f};
+            const float shown = pendingScale[pi] > 0.0f ? pendingScale[pi] : cur;
+            const float max = 100.0f;
+            const float val = (shown - 0.30f) / 0.70f * max;
+            const float vw = U(52);
+            const Bars b =
+                BarSlider(cx0, sy + U(5), cx1 - vw - U(8), sh - U(14), val, max, 0.0f, 0.0f, true, focused);
+            TextRight(cx1, ty, shown >= 0.999f ? L"原生" : Fmt(L"%.0f%%", shown * 100.0), kValue,
+                      focused ? kWhite : kReadout);
+            float nv = val;
+            const bool over = in.mx >= b.x0 - U(4) && in.mx < b.x1 + U(4) && in.my >= ry && in.my < ry + rowH && !in.pad;
+            if (over && in.pressed)
+            {
+                panel.drag = Panel::kSlide;
+                panel.dragRow = r;
+            }
+            if (panel.drag == Panel::kSlide && panel.dragRow == r && in.down)
+                nv = std::round(std::clamp((in.mx - b.x0) / (b.x1 - b.x0), 0.0f, 1.0f) * max / 5.0f) * 5.0f;
+            if (over && in.wheelSteps) nv = std::clamp(nv + in.wheelSteps * 5.0f, 0.0f, max);
+            if (keyStep) nv = std::clamp(std::round((nv + step * 5.0f) / 5.0f) * 5.0f, 0.0f, max);
+            const float scale = 0.30f + nv / max * 0.70f;
+            if (std::fabs(scale - shown) > 1e-4f) pendingScale[pi] = scale;
+            const bool dragging = panel.drag == Panel::kSlide && panel.dragRow == r && in.down;
+            if (!dragging && pendingScale[pi] > 0.0f)
+            {
+                const float apply = pendingScale[pi];
+                pendingScale[pi] = -1.0f;
+                char pk[16];
+                snprintf(pk, sizeof pk, "NRScale%u", pi + 1u);
+                (void)mgpu::gpu1::ui_ini_write_float(pk, apply);
+                // Native-DLSS/B1 can own NGX in its private producer state while the
+                // consumer's legacy nr_ok flag is false. That is not a reason to save-only:
+                // staging is safe before the next arm, and the running producer flushes it.
+                mgpu::gpu1::ui_set_scale(pi, apply);
             }
             break;
         }
         case kNetScale: {
-            // mgpu's NRS is a continuous 0.30..1.00 scale: the bar run spans that range, the
-            // reference tick sits at 75% (the deploy default).
             const float max = 100.0f;
             const float val = n.nrsOn ? (n.nrs - 0.30f) / 0.70f * max : 0.0f;
             const float ref = (0.75f - 0.30f) / 0.70f * max;
             const float vw = U(52);
-            const Bars b =
-                BarSlider(cx0, sy + U(5), cx1 - vw - U(8), sh - U(14), n.nrsOn ? val : 0.0f, max, ref, 0.0f, n.nrsOn, focused);
-            TextRight(cx1, ty, n.nrsOn ? Fmt(L"%.0f%%", n.nrs * 100.0) : L"—", kValue,
-                      focused ? kWhite : n.nrsOn ? kReadout : kQuiet);
+            const Bars b = BarSlider(cx0, sy + U(5), cx1 - vw - U(8), sh - U(14),
+                                     n.nrsOn ? val : 0.0f, max, ref, 0.0f, n.nrsOn, focused);
+            TextRight(cx1, ty, n.nrsOn ? (n.nrs >= 0.999f ? L"原生" : Fmt(L"%.0f%%", n.nrs * 100.0)) : L"—",
+                      kValue, focused ? kWhite : n.nrsOn ? kReadout : kQuiet);
             float nv = val;
-            const bool over = n.nrsOn && in.mx >= b.x0 - U(4) && in.mx < b.x1 + U(4) && in.my >= ry && in.my < ry + rowH && !in.pad;
+            const bool over = n.nrsOn && in.mx >= b.x0 - U(4) && in.mx < b.x1 + U(4) &&
+                              in.my >= ry && in.my < ry + rowH && !in.pad;
             if (over && in.pressed)
             {
                 panel.drag = Panel::kSlide;
@@ -2265,10 +2413,10 @@ void DrawPanel(UINT bw, UINT bh, float dt)
                 nv = std::round(std::clamp((in.mx - b.x0) / (b.x1 - b.x0), 0.0f, 1.0f) * max / 5.0f) * 5.0f;
             if (over && in.wheelSteps) nv = std::clamp(nv + in.wheelSteps * 5.0f, 0.0f, max);
             if (keyStep && n.nrsOn) nv = std::clamp(std::round((nv + step * 5.0f) / 5.0f) * 5.0f, 0.0f, max);
-            const float nrs = 0.30f + nv / max * 0.70f;
-            if (n.nrsOn && std::fabs(nrs - n.nrs) > 1e-4f)
+            const float scale = 0.30f + nv / max * 0.70f;
+            if (n.nrsOn && std::fabs(scale - n.nrs) > 1e-4f)
             {
-                n.nrs = nrs;
+                n.nrs = scale;
                 changed = true;
             }
             break;
@@ -2299,8 +2447,50 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             }
             break;
         }
+        case kFrameGen: {
+            const bool enabled = mgpu::gpu1::ui_ini_read("FrameGen", 0) == 4;
+            const int cur = !enabled ? 0 : (mgpu::gpu1::ui_ini_read("FGMulti", 2) == 4 ? 2 : 1);
+            clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"关", L"2x", L"4x"}, cur, 3, 0, &hover, dt, true);
+            int want = clicked;
+            if (keyStep) want = std::clamp(cur + step, 0, 2);
+            if (focused && in.enter) want = cur >= 2 ? 0 : cur + 1;
+            if (want >= 0 && want != cur)
+            {
+                if (want > 0)
+                {
+                    // Official 0.6.0 DLSS-FG defaults. Dynamic stays as the user
+                    // configured it; this switch never enables it implicitly.
+                    (void)mgpu::gpu1::ui_ini_write("FGMulti", want == 2 ? 4 : 2);
+                    (void)mgpu::gpu1::ui_ini_write("FGPhase", want == 2 ? 0 : 75);
+                    (void)mgpu::gpu1::ui_ini_write("FGMvScaleNow", 1);
+                    (void)mgpu::gpu1::ui_ini_write("FGMvUnit", 1);
+                    (void)mgpu::gpu1::ui_ini_write("FGSkipCarry", 1);
+                    (void)mgpu::gpu1::ui_ini_write("FGPace", 1);
+                    (void)mgpu::gpu1::ui_ini_write("FGSkipJump", 0);
+                    (void)mgpu::gpu1::ui_ini_write("FrameGen", 4);
+                    Toast(want == 2 ? L"帧生成 4x 已保存，重启游戏后生效" : L"帧生成 2x 已保存，重启游戏后生效", kCaution, 3.0);
+                }
+                else
+                {
+                    (void)mgpu::gpu1::ui_ini_write("FrameGen", 0);
+                    Toast(L"帧生成已关闭，重启游戏后生效", kCaution, 3.0);
+                }
+            }
+            if (focused) panel.hoverOption = hover;
+            break;
         }
-        if (i + 1 < rowCount) Fill(x0 + pad, ry + rowH - t, x1 - pad, ry + rowH, kHairFaint);
+        case kCadence: {
+            if (n.cadence != 1)
+            {
+                n.cadence = 1;
+                changed = true;
+            }
+            clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"每帧"}, 0, 1, 0, &hover, dt);
+            break;
+        }
+        }
+        const int rowsInCol = c ? visRows - rowsLeft : rowsLeft;
+        if (i + 1 < rowsInCol) Fill(colX0 + U(10), ry + rowH - t, colX1 - pad, ry + rowH, kHairFaint);
     }
     if (panel.drag == Panel::kSlide && !in.down) panel.drag = Panel::kNone;
     if (changed)
@@ -2308,7 +2498,7 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         ApplySet(n);
         panel.changedAt = now;
     }
-    y += rowH * float(rowCount) + U(6);
+    y += rowH * float(rowsLeft) + U(6);
     Fill(x0, y - t, x1, y, kHair);
 
     // Help for the focused row.
@@ -2328,12 +2518,11 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         const float fy = y + std::round((footH - LineHeight(kLabel)) * 0.5f);
         std::wstring keys;
         if (in.pad)
-            keys = n.look == 5 ? L"View + Y 收起　肩键翻页　十字键调整　Y 调色台　B 收起"
-                               : L"View + Y 收起　肩键翻页　十字键调整　A 切换　B 收起";
+            keys = n.look == 5 ? L"View + Y 收起　十字键 选择和调整　Y 调色台　B 收起"
+                               : L"View + Y 收起　十字键 选择和调整　A 切换　B 收起";
         else
             keys = std::wstring(KeyName(cfg.key)) +
-                   (n.look == 5 ? L" 收起　↑↓ 选择　←→ 调整　Tab 翻页　Enter 调色台"
-                                : L" 收起　↑↓ 选择　←→ 调整　Tab 翻页　拖动标题栏移动");
+                   (n.look == 5 ? L" 收起　↑↓ 选择　←→ 调整　Tab 调色台" : L" 收起　↑↓ 选择　←→ 调整　拖动标题栏移动");
         Text(x0 + pad, fy, keys, kLabel, kQuiet);
         const float since = float(now - panel_savedAt);
         if (since < 2.0f) TextRight(x1 - pad, fy, L"已保存", kLabel, Fade(kReadout, since < 1.4f ? 1.0f : (2.0f - since) / 0.6f));
@@ -2953,7 +3142,20 @@ Chain *Bind(IDXGISwapChain *sc, ID3D12CommandQueue *q)
 {
     Chain *c = ChainFor(sc);
     if (c->unsupported && !c->queue) return nullptr;
-    if (c->queue && c->gpu) return c;
+    if (c->queue && c->gpu)
+    {
+        // Late input hook: on a D3D11 title the panel can bind pre-arm, when the
+        // bridge has not recorded the game's window yet (dcomp_game_hwnd null).
+        // Hook it as soon as it exists - Bind's body never runs again for this chain.
+        if (gameWnd == nullptr &&
+            mgpu::gpu1::dcomp_overlay_mode() && mgpu::gpu1::present_chain_native() == (void *)sc &&
+            mgpu::gpu1::dcomp_game_hwnd() != nullptr)
+        {
+            gameWnd = (HWND)mgpu::gpu1::dcomp_game_hwnd();
+            gameProc = (WNDPROC)SetWindowLongPtrW(gameWnd, GWLP_WNDPROC, (LONG_PTR)&HkWndProc);
+        }
+        return c;
+    }
     ID3D12Device *d = nullptr;
     if (FAILED(sc->GetDevice(__uuidof(ID3D12Device), (void **)&d)) || !d)
     {  // D3D11 or another API: not ours
@@ -2962,13 +3164,38 @@ Chain *Bind(IDXGISwapChain *sc, ID3D12CommandQueue *q)
         return nullptr;
     }
     DXGI_SWAP_CHAIN_DESC desc;
-    if (FAILED(sc->GetDesc(&desc)) || !desc.OutputWindow || !IsWindowVisible(desc.OutputWindow))
-    {  // The probe/ghost/DComp chains present without a visible window; drawing
-        // there puts a second, compositor-jittered copy of the panel on screen.
-        d->Release();
-        c->unsupported = true;
-        LOG("[MGPU][POV] panel: chain %p has no visible window: not drawing on it", (void *)sc);
-        return nullptr;
+    const bool have_desc = SUCCEEDED(sc->GetDesc(&desc)) && desc.OutputWindow != nullptr;
+    bool dcomp_host = false;
+    if (!have_desc || !IsWindowVisible(desc.OutputWindow))
+    {
+        // DComp mode on a D3D11 title: the bridge's own present chain has no
+        // visible window - DirectComposition shows it inside the game's window.
+        // It is the only D3D12 chain that reaches the display there, so the
+        // panel draws into it and appears composed, one copy. Probe and ghost
+        // chains stay refused: drawing there puts a second, compositor-jittered
+        // copy of the panel on screen.
+        dcomp_host = mgpu::gpu1::dcomp_overlay_mode() &&
+                     mgpu::gpu1::present_chain_native() == (void *)sc;
+        if (!dcomp_host)
+        {
+            d->Release();
+            // NOT permanent: on a D3D11 title the composition chain presents long
+            // before the bridge arms, and present_chain_native() is only nominated
+            // at arm time. A pre-arm refusal must be retried on a later present,
+            // otherwise the panel never binds on the one chain that reaches the
+            // display. Log once per chain; the probe costs one GetDevice per present.
+            if (!c->said_no_window)
+            {
+                c->said_no_window = true;
+                LOG("[MGPU][POV] panel: chain %p has no visible window: not drawing on it (retryable - "
+                    "re-probed on every present until the bridge arms)", (void *)sc);
+            }
+            if ((++c->probes % 300) == 0)
+                LOG("[MGPU][POV] panel: chain %p still unbound after %u probes | dcomp=%d native=%p",
+                    (void *)sc, c->probes, (int)mgpu::gpu1::dcomp_overlay_mode(),
+                    mgpu::gpu1::present_chain_native());
+            return nullptr;
+        }
     }
     Gpu *g = GpuFor(d);
     d->Release();
@@ -2980,11 +3207,17 @@ Chain *Bind(IDXGISwapChain *sc, ID3D12CommandQueue *q)
     q->AddRef();
     c->queue = q;
     c->gpu = g;
-    LOG("[MGPU][POV] panel: chain %p %ux%u fmt %d buffers %u -> device %p queue %p", (void *)sc,
-        desc.BufferDesc.Width, desc.BufferDesc.Height, int(desc.BufferDesc.Format), desc.BufferCount, (void *)d, (void *)q);
-    if (desc.OutputWindow != gameWnd)
+    LOG("[MGPU][POV] panel: chain %p %ux%u fmt %d buffers %u -> device %p queue %p%s", (void *)sc,
+        desc.BufferDesc.Width, desc.BufferDesc.Height, int(desc.BufferDesc.Format), desc.BufferCount, (void *)d, (void *)q,
+        dcomp_host ? " (DComp host: composed into the game's window)" : "");
+    // Input hooks the window the player actually touches: on a DComp host that
+    // is the GAME's window (the chain's own window is hidden), elsewhere the
+    // chain's own output window.
+    HWND input_wnd = dcomp_host ? (HWND)mgpu::gpu1::dcomp_game_hwnd()
+                                : (have_desc ? desc.OutputWindow : nullptr);
+    if (input_wnd != nullptr && input_wnd != gameWnd)
     {
-        gameWnd = desc.OutputWindow;
+        gameWnd = input_wnd;
         gameProc = (WNDPROC)SetWindowLongPtrW(gameWnd, GWLP_WNDPROC, (LONG_PTR)&HkWndProc);
     }
     return c;
@@ -2999,11 +3232,30 @@ bool running()
     return false;
 }
 
+bool panel_open()
+{
+    return panel.open.load(std::memory_order_relaxed);
+}
+
 void on_present(void *queue_native, void *sc_native)
 {
     static std::mutex presentMutex;
     std::lock_guard<std::mutex> presentLock(presentMutex);
     if (g_dead) return;
+    // Last-resort input watchdog, placed before every chain-binding early
+    // return.  A panel that has not produced a successful draw for 500 ms is
+    // not allowed to keep Raw Input, cursor or keyboard captured.
+    const double guardNow = Now();
+    if (panel.open && guardNow - panel.openedAt > 0.5 && guardNow - panelDrawnAt > 0.5)
+    {
+        panel.open = false;
+        SetBlocking(false);
+        if (!inputGuardSaid)
+        {
+            inputGuardSaid = true;
+            LOG("[MGPU][POV][INPUT-GUARD] no successful visible panel draw for 500 ms; panel closed and game input released");
+        }
+    }
     IDXGISwapChain *sc = static_cast<IDXGISwapChain *>(sc_native);
     ID3D12CommandQueue *queue = static_cast<ID3D12CommandQueue *>(queue_native);
     if (sc == nullptr || queue == nullptr) return;
@@ -3052,7 +3304,50 @@ void on_present(void *queue_native, void *sc_native)
     const UINT bw = d.BufferDesc.Width, bh = d.BufferDesc.Height;
     ui = std::clamp(std::round(float(bh) / 1080.0f * 4.0f) / 4.0f, 1.0f, 3.0f) * cfg.scale;
 
+    // While the panel is visible, only the chain that actually displays it may
+    // advance the shared input edge state. A background game chain polling first
+    // otherwise consumes lWas/pressSeq and the visible chain never sees the click.
+    if (panel.open)
+    {
+        void *displayChain = mgpu::gpu1::present_chain_native();
+        if (displayChain != nullptr && displayChain != (void *)sc) return;
+    }
     PollInput(bw, bh, panel.open);
+
+    // R243d: periodic patrol - the DPI-unaware game's activation resize has at
+    // least one path that bypasses R243/R243b/R243c (suspect SetWindowPlacement).
+    // Nothing escapes time: every ~2.3 s, if the DComp overlay is on and the game
+    // window no longer covers its monitor, pin it back with SetWindowPos.
+    if ((presents % 48u) == 0u && mgpu::gpu1::dcomp_overlay_mode())
+    {
+        HWND gw = (HWND)mgpu::gpu1::dcomp_game_hwnd();
+        if (gw)
+        {
+            r243_make_borderless(gw);
+            HMONITOR mon = MonitorFromWindow(gw, MONITOR_DEFAULTTONEAREST);
+            MONITORINFO mi{};
+            mi.cbSize = sizeof mi;
+            RECT wr{};
+            if (GetMonitorInfoW(mon, &mi) && GetWindowRect(gw, &wr))
+            {
+                const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+                const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                if ((wr.right - wr.left) != mw || (wr.bottom - wr.top) != mh ||
+                    wr.left != mi.rcMonitor.left || wr.top != mi.rcMonitor.top)
+                {
+                    static std::atomic<unsigned> r243d_n{0};
+                    const unsigned n = r243d_n.fetch_add(1) + 1;
+                    if (n <= 8u || (n % 100u) == 0u)
+                        LOG("[MGPU][R243d] re-pin %dx%d @ %d,%d -> monitor %dx%d @ %d,%d (%u so far)",
+                            wr.right - wr.left, wr.bottom - wr.top, wr.left, wr.top,
+                            mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, n);
+                    SetWindowPos(gw, nullptr, mi.rcMonitor.left, mi.rcMonitor.top, mw, mh,
+                                 SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
+                }
+            }
+        }
+    }
+
     if (in.toggle || (panel.open && in.back))
     {
         panel.open = in.toggle ? !panel.open : false;
@@ -3067,13 +3362,23 @@ void on_present(void *queue_native, void *sc_native)
     // (otherwise it sees Esc, Home or B go down and opens its own menu).
     const bool closingKeysDown = Key(VK_ESCAPE) || (cfg.key && Key(cfg.key)) || Key(VK_RETURN) || Key(VK_LBUTTON) ||
                                  (in.padHeld & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_Y | XINPUT_GAMEPAD_BACK));
-    SetBlocking(cfg.block && (panel.open || (blocking.load() && closingKeysDown)));
+    const bool panelDrawFresh = panel.open && now - panelDrawnAt <= 0.5;
+    SetBlocking(cfg.block && (panelDrawFresh || (!panel.open && blocking.load() && closingKeysDown)));
     if (!panel.hinted && cfg.hint && now - panel.startedAt > 1.0)
     {
         panel.hinted = true;
         Toast(in.padConnected ? std::wstring(L"按 ") + KeyName(cfg.key) + L"，或在手柄上按住 View 再按 Y，打开 MGPU 面板"
                               : std::wstring(L"按 ") + KeyName(cfg.key) + L" 打开 MGPU 面板",
               kInfo, 6.0);
+    }
+
+    // An armed dual-GPU session must draw the panel on the visible neural chain only.
+    // Previously the same panel was submitted to the game chain and two bridge chains;
+    // their independent present cadences made it flash and starved the draw watchdog.
+    if (panel.open)
+    {
+        void *displayChain = mgpu::gpu1::present_chain_native();
+        if (displayChain != nullptr && displayChain != (void *)sc) return;
     }
 
     NoteStats();
@@ -3095,8 +3400,27 @@ void on_present(void *queue_native, void *sc_native)
     {
         DrawToast(now);
     }
-    if (verts.empty()) return;
-    Submit(*c, bw, bh, d.BufferDesc.Format);
+    if (verts.empty())
+    {
+        if (panel.open) SetBlocking(false);
+        return;
+    }
+    const bool submitted = Submit(*c, bw, bh, d.BufferDesc.Format);
+    if (panel.open)
+    {
+        if (submitted)
+        {
+            panelDrawnAt = Now();
+            inputGuardSaid = false;
+            static unsigned visibleDraws = 0;
+            if (++visibleDraws <= 3)
+                LOG("[MGPU][POV][INPUT-GUARD] visible panel submit #%u succeeded on chain %p", visibleDraws, (void *)sc);
+        }
+        else
+        {
+            SetBlocking(false);
+        }
+    }
 }
 
 }  // namespace mgpu::poverlay

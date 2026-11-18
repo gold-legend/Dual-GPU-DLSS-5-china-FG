@@ -1,6 +1,6 @@
-# 第三方授权说明
+# MGPU Prism FG 2.0 第三方授权说明
 
-本项目是多个许可组件的组合。项目主体与新增代码沿用 MIT，不表示第三方 SDK、字体、运行库或商标都被重新授权为 MIT。发布者保留原有版权、许可和免责声明，不代表任何原作者或厂商为本分支背书。
+本项目是多个许可组件的组合。项目主体与新增代码沿用 MIT，不表示第三方 SDK、字体、运行库或商标都被重新授权为 MIT。保留原有版权、许可和免责声明，不代表任何原作者或厂商为本分支背书。
 
 ## 项目主体
 
@@ -12,11 +12,11 @@
 
 Copyright（c）2026 ChefZC，MIT。
 
-本项目移植了 Prism NR 1.5.1 的独立面板、调色和部分处理思路，Carry 的 Follow／Carry／Sample／Fill 机制适配自 1.9.1。并非官方 Prism NR 的完整搬运或官方双卡版本。
+本项目使用 Prism NR 的独立面板、调色、PX1 编辑量拟合与角色守护等思路，并在 MGPU 的多遍副卡链上重新适配。它不是 Prism NR 官方双卡版本。
 
 - 来源：[prism-nr](https://github.com/ChefDavid0815/prism-nr)。
 - 许可原文：[licenses/Prism-NR-MIT.txt](licenses/Prism-NR-MIT.txt)。
-- 相关代码：`src/prism_x1.cpp`、`src/prism_carry.cpp`、`src/prism_finish.cpp`、`src/prism_grade.h`、`src/prism_look_hlsl.h`、`src/poverlay.cpp`。
+- 相关代码：`src/prism_x1.cpp`、`src/prism_x1_multi.cpp`、`src/prism_finish.cpp`、`src/prism_grade.h`、`src/prism_look_hlsl.h`、`src/poverlay.cpp`。
 
 ## ReShade
 
@@ -46,29 +46,14 @@ Copyright（c）2026 xen，MIT。
 Copyright（C）2009—2017 Tsuda Kageyu；Hacker Disassembler Engine 部分 Copyright（c）2008—2009 Vyacheslav Patkov。
 
 - 许可与附加版权原文：[licenses/MinHook.txt](licenses/MinHook.txt)。
-
-## AMD FidelityFX SDK
-
-本项目编译 AMD 官方 FidelityFX SDK 的 API、D3D12 后端和 Optical Flow 相关文件。发布副本只包含 `Kits/FidelityFX/docs/license.md` 明确列入 MIT 条款白名单、且本构建需要的文件，未把整个 SDK 当作可自由再分发内容打包。
-
-- 许可总文件：[third_party/amd_fidelityfx/Kits/FidelityFX/docs/license.md](third_party/amd_fidelityfx/Kits/FidelityFX/docs/license.md)。
-- 对应 MIT 条款副本：[licenses/AMD-FidelityFX-MIT.txt](licenses/AMD-FidelityFX-MIT.txt)。
-- 生成光流排列头文件的 AMD HLSL 也位于上述许可白名单；生成脚本保留在 `tools/generate_optical_flow.py`。
-
-## Intel XeSS FG／XeLL
-
-运行包内的 `libxess_fg.dll`、`libxell.dll` 保持原样，并附 Intel Simplified Software License（2022 年 10 月版）。
-
-- 许可原文：[licenses/Intel-XeSS.txt](licenses/Intel-XeSS.txt)。
-- 构建者需从自己的 Intel XeSS FG SDK 取得 `xess_fg` 和 `xell` 头文件，放入 `third_party/intel_xess` 下对应目录；源码包不直接再分发 Intel 源码头文件。
-- 不允许反编译、修改运行库或把 Intel 名称用于暗示官方背书。
+- 源码头文件与实现位于 `third_party/minhook`。
 
 ## NVIDIA DLSS／NGX
 
-- 源码包与运行包均**不包含** `_nvngx.dll`、`nvngx_dlssnr.dll`、DLSS 模型或其他 NVIDIA 二进制。
+- 源码包与运行包均**不包含** `_nvngx.dll`、`nvngx_dlssnr.dll`、`nvngx_dlssg.dll`、DLSS 模型或其他 NVIDIA 二进制。
 - 源码包不直接再分发 NVIDIA 源码头文件。`tools/fetch_ngx_headers.ps1` 从官方固定提交获取构建所需公开头文件，使用者需先阅读并接受官方 SDK 许可。
-- 用户自备的 `nvngx_dlssnr.dll` 放在游戏目录的 `mgpu` 子目录，不随本项目分发。
-- NVIDIA 的 SDK、商标、商业发布通知等义务不因本项目使用 MIT 而消失；发布者应单独审阅[官方许可](https://github.com/NVIDIA/DLSS/blob/a291cc7d2cc642a51566f3dfd5376f635cd1b284/LICENSE.txt)。
+- 用户自备的 NVIDIA 模块放在游戏目录的 `mgpu` 子目录，不随本项目分发。
+- NVIDIA 的 SDK、商标、商业发布通知等义务不因本项目使用 MIT 而消失；发布者与使用者应单独审阅[官方许可](https://github.com/NVIDIA/DLSS/blob/a291cc7d2cc642a51566f3dfd5376f635cd1b284/LICENSE.txt)。
 
 ## JetBrains Mono
 
@@ -77,6 +62,10 @@ Copyright（C）2009—2017 Tsuda Kageyu；Hacker Disassembler Engine 部分 Cop
 - 版权与许可原文：[licenses/JetBrainsMono-OFL.txt](licenses/JetBrainsMono-OFL.txt)。
 - 对应文件：`src/font_mono_regular.h`、`src/font_mono_bold.h`。
 
-## 截图与游戏名称
+## 1.0 历史组件
 
-文档中的《剑星》截图仅用于说明本机运行状态，游戏画面和名称的权利属于原权利人。截图中的 FPS 是特定环境的单次截面，不构成厂商认可的性能宣传。
+1.0 曾使用 AMD FidelityFX Optical Flow、Intel XeSS FG／XeLL；2.0 主路径不再编译或分发这些运行组件。对应源码、二进制和说明只保留在 `v1.0.0` 历史标签中，不应把 1.0 的许可或实测描述当成 2.0 的当前依赖与结论。
+
+## 游戏名称与运行记录
+
+文档中的《剑星》仅用于说明本机运行状态，游戏画面和名称的权利属于原权利人。2.0 发布文档不附带新的游戏截图，也不把单次日志截面作为厂商认可的性能宣传。

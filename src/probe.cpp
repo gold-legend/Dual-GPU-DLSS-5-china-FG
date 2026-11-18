@@ -430,6 +430,7 @@ const unsigned long long SAMPLE_EVERY = 30;
 const unsigned long long READ_AFTER   = 10;
 
 std::atomic<int> g_dc_mode;                 // 0 off, 1 A only, 2 A and B
+std::atomic<bool> g_depth_requested{false};  // transport Depth key: off means no tap lookup or technique scan
 std::atomic<void *> g_game_d12;             // ID3D12Device*, the game's
 ID3D12Resource *g_dc_rb[3] = {};            // readback A, B, C (C = R55, arm C)
 std::atomic<bool> g_dc_ready;
@@ -1978,6 +1979,13 @@ reshade::api::effect_texture_variable g_tap_var = {};
 std::atomic<unsigned long long> g_tap_res;
 unsigned long long g_tap_tick = 0;
 
+// LUMENITE-MOTION experiment. The game and neural swapchains both load the
+// effect, so a variable handle belongs only to the runtime that created it.
+// Keep the last VALID game texture instead of letting the other runtime's
+// typeless/full-size output replace it. Low-res transport expands on GPU 1.
+std::atomic<unsigned long long> g_motion_tap_res;
+std::atomic<void *> g_motion_tap_owner{nullptr};
+
 int      g_dcc_state  = 0;    // 0 idle, 1 copy recorded and ripening
 unsigned long long g_dcc_at = 0;
 unsigned long long g_dcc_copies = 0, g_dcc_reads = 0;
@@ -2075,6 +2083,8 @@ tech_row g_tech[TECH_MAX] = {};
 unsigned g_tech_n = 0;
 unsigned g_tech_seen = 0;
 unsigned long long g_tap_enables = 0;   // times we had to switch it on
+bool               g_tap_self_enable = true;   // R334: false = report only, never set_technique_state
+unsigned long long g_tap_enables_skipped = 0;  // R334: times the enable was wanted and withheld
 int      g_tap_state = -1;              // -1 absent, 0 present-off, 1 present-on
 // R147. CONSECUTIVE SCANS THAT DID NOT END WITH THE TAP ON.
 //
@@ -2127,10 +2137,35 @@ void tech_scan()
             rt->find_technique(g_tech[i].effect, g_tech[i].name);
         if (t.handle != 0)
         {
+            // R334: when the Effect Runtime Sync guard is on, the enable is
+            // withheld (see set_tap_self_enable); the state stays what the
+            // preset or the user made it, and the periodic line says so.
+            if (!g_tap_self_enable)
+            {
+                ++g_tap_enables_skipped;
+                if (g_tap_enables_skipped == 1u)
+                    mgpu::diag::warn("[MGPU][R334] the depth tap is OFF on this runtime and the add-on is NOT "
+                                     "switching it on (Effect Runtime Sync guard). Enable the MGPU_DepthTap "
+                                     "technique in the ReShade overlay, or add [ADDON] SyncEffectRuntimes=0 to "
+                                     "ReShade.ini and relaunch.");
+                continue;
+            }
             rt->set_technique_state(t, true);
             g_tech[i].on = true;
             g_tap_state = 1;
             ++g_tap_enables;
+            // R334 instrument: WHICH runtime the enable acted on and what it
+            // reads back. One line per enable (a scan every 300 frames, and
+            // only when the tap read OFF), so it is cheap and it settles the
+            // open question from the SoD2 case: which runtime tech_scan sees
+            // on a D3D11 title.
+            {
+                char l[200];
+                snprintf(l, sizeof l, "[MGPU][R334] tech_scan enabled %s on runtime %p: read-back %s (enable #%llu)",
+                         g_tech[i].name, (void *)rt, rt->get_technique_state(t) ? "ON" : "still OFF",
+                         g_tap_enables);
+                mgpu::diag::info(l);
+            }
         }
     }
 
@@ -2360,7 +2395,7 @@ void dump()
                 g_mvec_pick_said = pick;
                 char pl[520]; int o = snprintf(pl, sizeof pl, "[MGPU][R277d] transport candidate 0x%llx (MVecCandidate=%u) of %u eligible:", pick, pn, en);
                 for (unsigned a = 0; a < en && o > 0 && o < (int)sizeof pl - 60; ++a)
-                    o += snprintf(pl + o, sizeof pl - o, " [%u] 0x%llx %ux%u barriers=%llu", a, el[a].h, el[a].w, el[a].hh, el[a].e);
+                    o += snprintf(pl + o, sizeof pl - o, " [%u] 0x%llx %ux%u fmt=%u barriers=%llu", a, el[a].h, el[a].w, el[a].hh, el[a].fmt, el[a].e);   // R342b (C3): the format, a new field
                 mgpu::diag::info(pl);
             }
             // R280: while mvec_extract is still manufacturing its target, the dump
@@ -3141,6 +3176,8 @@ mode mode_from_ini()
         int dv = 0;
         if (dk != nullptr) dv = atoi(dk);
         g_dc_mode.store((dv < 0 || dv > 3) ? 0 : dv, std::memory_order_relaxed);  // R55: 3 = arm C alone
+        const char *depth = mgpu::config::find(buf, strlen(buf), "Depth");
+        g_depth_requested.store(depth != nullptr && atoi(depth) != 0, std::memory_order_relaxed);
     }
     {
         // R101. Calib= drives the NGX parameter tap. Absent means 2, not 0:
@@ -3360,7 +3397,15 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr)
     //
     // Depth=1 and Depth=2 must not silently require MetaProbe=depth. The
     // transport's source and the tap that keeps it alive are both needed
-    // whether or not anyone is watching the probe's tables.
+    // whether or not anyone is watching the probe's tables. Depth=0 is a hard
+    // stop: do not resolve the effect texture and, critically, do not let
+    // tech_scan re-enable MGPU_DepthTap behind the user's back.
+    if (!g_depth_requested.load(std::memory_order_relaxed))
+    {
+        g_tap_res.store(0, std::memory_order_relaxed);
+        g_tap_var = reshade::api::effect_texture_variable{};
+    }
+    else
     {
         reshade::api::effect_runtime *rt2 =
             static_cast<reshade::api::effect_runtime *>(effect_runtime_ptr);
@@ -3389,6 +3434,52 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr)
             if (g_mode.load(std::memory_order_relaxed) == 0 &&
                 (g_tap_tick++ % 300ull) == 0ull)
                 tech_scan();
+        }
+    }
+
+    // LUMENITE-MOTION: resolve independently of Depth and MetaProbe. Effect
+    // variable handles are runtime-local; never reuse one on the other chain.
+    // The neural chain can expose a same-named TYPELESS full-size texture. It
+    // is not the game's RG16F Lumenite result and must not replace a valid tap.
+    {
+        reshade::api::effect_runtime *rt2 =
+            static_cast<reshade::api::effect_runtime *>(effect_runtime_ptr);
+        unsigned long long h = 0;
+        bool valid = false;
+        if (rt2 != nullptr)
+        {
+            const reshade::api::effect_texture_variable var =
+                rt2->find_texture_variable(nullptr, "MGPU_MotionOutTex");
+            if (var.handle != 0)
+            {
+                reshade::api::resource_view srv = {}, srgb = {};
+                rt2->get_texture_binding(var, &srv, &srgb);
+                if (srv.handle != 0)
+                {
+                    if (reshade::api::device *dv = rt2->get_device())
+                    {
+                        const reshade::api::resource res = dv->get_resource_from_view(srv);
+                        if (res.handle != 0 &&
+                            dv->get_resource_desc(res).texture.format == reshade::api::format::r16g16_float)
+                        {
+                            h = res.handle;
+                            valid = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (valid)
+        {
+            g_motion_tap_owner.store(rt2, std::memory_order_relaxed);
+            g_motion_tap_res.store(h, std::memory_order_release);
+        }
+        else if (rt2 != nullptr && rt2 == g_motion_tap_owner.load(std::memory_order_relaxed))
+        {
+            // Only the owner may revoke its texture (menu/reload/resolution
+            // change). An unrelated runtime with no valid tap changes nothing.
+            g_motion_tap_res.store(0, std::memory_order_release);
+            g_motion_tap_owner.store(nullptr, std::memory_order_relaxed);
         }
     }
 
@@ -3437,6 +3528,11 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr)
 // than "a scan found nothing" - and that distinction is the whole point of the
 // -2. Reporting g_tap_state's -1 initialiser before any scan would put ERROR
 // 204 on screen during normal startup.
+void set_tap_self_enable(bool allowed)   // R334
+{
+    g_tap_self_enable = allowed;
+}
+
 int tap_state()
 {
     if (g_tech_seen == 0)        return -2;   // no scan has completed
@@ -3448,6 +3544,11 @@ int tap_state()
 unsigned long long depth_source()
 {
     return g_tap_res.load(std::memory_order_relaxed);
+}
+
+unsigned long long motion_source()
+{
+    return g_motion_tap_res.load(std::memory_order_relaxed);
 }
 
 // R78. THE IDENTIFIED VELOCITY BUFFER, or 0 while it is not yet known.

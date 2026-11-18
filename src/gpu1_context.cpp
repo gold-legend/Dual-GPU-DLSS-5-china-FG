@@ -31,6 +31,7 @@
                      // transitively by windows.h on MSVC, made explicit because a
                      // load path that fails to compile is not a fix.
 #include <mutex>
+#include <thread>
 #include <atomic>
 #include <vector>   // R258: the calibration profiles    // R78: one counter, written from the game's render thread
                      // without this file's mutex - it counts the times that
@@ -44,9 +45,11 @@
 #include "Downsample_Shader.h"
 #include "Resolve_Shader.h"
 #include "gpu1_context.hpp"
+#include "chain_colour_space.hpp"   // R345 (Knowmind, H1): ChainColorSpace, absent = no call
 #include "calibrator.hpp"   // R104: jitter compensation
 #include "mgpu_ini_parser.hpp"
 #include "screen.hpp"   // R108: the idle screen. Compiled since R108, called since V26.
+#include "poverlay.hpp" // POVERLAY: the standalone panel draws onto THIS chain, the one that reaches the display
 #include "sl_probe.hpp"   // SL1: is our own device an SL proxy
 #include "t119_keys.hpp"         // R300 (T1.19): Dom's keys, every one absent = off
 #include "startup_trace.hpp" // R313: trace points + DcompSafeMode
@@ -56,16 +59,19 @@
 #include "producer_diag.hpp"     // R300g1 (Dom, T1.16)
 #include "producer_gpu_timers.hpp"   // R300h (Dom, T1.16)
 #include "nr16.hpp"       // R208: experimental FP16 input path. Off unless NRInput16=4
+#include "mvec_expand.hpp" // Lossless low-resolution Lumenite motion transport, expanded on GPU 1
 #include "residual.hpp"   // R316: the residual pass module (own keys, ResidualPass=1|2). Off unless set
+#include "skinguard.hpp"  // Yihuan character guard: keep pass 1 on skin, final pass elsewhere
 #include "prism_finish.hpp" // PRISM-FINISH: prism-core 1.5.1 grade+guard on the last pass (own keys, Finish=1). Off unless set
 #include "prism_sync.hpp"  // PSYNC: synchronous same-frame reconstruction on GPU 1 (own keys, PrismSync=1)
-#include "prism_x1.hpp"    // PX1: reduced-network guided reconstruction (own key, PrismX1=1)
-#include "prism_carry.hpp" // CARRY: current-frame edit alignment on cadence holds (PrismCarry=1)
-#include "xess_fg.hpp"    // XESS-FG: optional output-side frame generation on GPU 1 (XeSSFG=1)
-#include "xess_depth.hpp" // XESS-FG: current-frame depth on the required MV grid
-#include "amd_of.hpp"     // same-size temporal colour + AMD colour-only flow for XeSS-FG
-#include "present_queue.hpp" // real DXGI queue depth, excluding the current frame
+#include "prism_warp.hpp"   // PWARP: late neural edit on current game colour (own key, PrismWarp=1)
+#include "prism_x1_multi.hpp" // PX1: independent current-frame reconstruction/history for each NR pass
+#include "prism_ensemble.hpp" // Three same-original NR passes + current-frame robust composite
+#include "gpu0_stage.hpp" // R333: StageCopy, GPU 0 async staging (Dave's OPT5 design). Off unless StageCopy=1
+#include "fg_gpu1.hpp"    // R341: DLSS Frame Generation on the neural card (Dave's DLSSG1 design). Off unless FrameGen=4
+#include "fg_instr.hpp"   // R371/R403: read-only verification after the bridge chain presents
 #include "fg_map.hpp"     // D2.0 NR step one: read-only frame-gen vector map. Off unless NRFrameFilter=1 (one load per site)
+#include "b1_contract.hpp" // B1: strict same-frame + same-generation NR acceptance
 
 // R111. DXGI_STATUS_OCCLUDED comes from dxgi.h by way of <dxgi1_4.h> above.
 // Guarded because it is a SUCCESS code and a build where it went missing
@@ -124,7 +130,10 @@ namespace
         ID3D12CommandQueue *queue = nullptr;
         IDXGISwapChain3 *swapchain = nullptr;
         ID3D12DescriptorHeap *rtv_heap = nullptr;
-        ID3D12Resource *backbuffer[2] = {};
+        // BB1: PresentBuffers decides how many of these exist (create_present_chain).
+        static const unsigned MAX_BACKBUFFERS = 6;
+        ID3D12Resource *backbuffer[MAX_BACKBUFFERS] = {};
+        unsigned present_buffers = 2;
         // ---- D6: an allocator RING, not a single allocator ----
         //
         // This used to be one allocator and one list, and the thing that made
@@ -395,7 +404,112 @@ static void *g_dcomp_scale = nullptr;   // IDCompositionScaleTransform, R271
 // launch, at the site that already resizes and commits the chain
 // (present_resize): no file write, no new lock use, no next-launch marker.
 static int   g_dcomp_fit = 0;           // DcompFit: 0 off, 1 on, 2 auto; read once when the chain is created
-namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); int ini_read_depth_transport(); }   // unnamed-namespace readers, defined below (R312 added)
+namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); int ini_read_depth_transport(); int ini_read_skinguard_mode(); }   // unnamed-namespace readers, defined below (R312 added)
+namespace { int ini_read_sr_int(const char *key, int dflt, int lo, int hi); }   // R335: the Factory4 key, read in create_present_chain
+// R337: the DLL identity line on a CreateFeature refusal reuses R210's version / SHA-256 readers (defined later in this file).
+namespace
+{
+    void r210_file_version(const wchar_t *path, HMODULE ver_dll, char *out, size_t out_n);
+    void r210_file_sha256(const wchar_t *path, HMODULE bc, char *out, size_t out_n, unsigned long long &size_out);
+    // R351: the DLSS-NR snippet's file version, said once at arm. The small network (preset 2, the
+    // 310.9.16 shipping default) exists only from file version 310.9.16.0; an older DLL carries the big
+    // network alone and answers any preset hint with it ("preset N is not available in this DLL build;
+    // falling back", seen 2026-11-08 on 310.8.0 with NRPreset1=2: it created and ran, no clamp needed).
+    // File-version metadata, not a hash, so a patched DLL of a supported version stays eligible. The
+    // GPU / driver still decide whether the requested model can be created. Text only, no key.
+    char g_r351_version[24] = "-";   // R352: the panel's copy (written once at arm, read by ui_read)
+    void r351_snippet_version_line(HMODULE snippet)
+    {
+        if (snippet == nullptr) return;
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleFileNameW(snippet, path, MAX_PATH) == 0) return;
+        HMODULE ver_dll = LoadLibraryW(L"version.dll");
+        char ver[48] = "-";
+        r210_file_version(path, ver_dll, ver, sizeof ver);
+        if (ver_dll != nullptr) FreeLibrary(ver_dll);
+        snprintf(g_r351_version, sizeof g_r351_version, "%s", ver);
+        unsigned a = 0, b = 0, c = 0, d = 0;
+        const bool parsed = (sscanf_s(ver, "%u.%u.%u.%u", &a, &b, &c, &d) == 4);
+        const bool small_ok = parsed && (a > 310u || (a == 310u && (b > 9u || (b == 9u && c >= 16u))));
+        char l[700];
+        if (!parsed)
+            snprintf(l, sizeof l, "[MGPU][R351] nvngx_dlssnr.dll file version: not readable (%s). Whether this DLL "
+                     "carries the small network is unknown here; NGXLog=1 and the nvngx_dlssnr log say which "
+                     "network each pass got.", ver);
+        else if (small_ok)
+            snprintf(l, sizeof l, "[MGPU][R351] nvngx_dlssnr.dll file version %s: carries the small network (preset 2, "
+                     "its default) and the big one (preset 1).", ver);
+        else
+            snprintf(l, sizeof l, "[MGPU][R351] nvngx_dlssnr.dll file version %s: this DLL carries ONE network, the big "
+                     "one. The small network needs 310.9.16 or newer. Every pass runs the big network on this DLL "
+                     "whatever NRPreset asks (the DLL falls back by itself), so x2 costs more here than on a newer "
+                     "DLL.", ver);
+        if (parsed && !small_ok) mgpu::diag::warn(l); else mgpu::diag::info(l);
+    }
+    // One line naming the two NGX modules that decided the refusal: path, version, size, SHA-256 - the
+    // same three fields nrcheck prints in its header, so a game log and an nrcheck report compare file for
+    // file. Said once per arm, on the error path only; the shipped path prints nothing new.
+    void r337_identity_line(unsigned result)
+    {
+        HMODULE ver_dll = LoadLibraryW(L"version.dll");
+        HMODULE bc_dll  = LoadLibraryW(L"bcrypt.dll");
+        char l[1100];
+        int w = snprintf(l, sizeof l, "[MGPU][R337] DLL identity for this CreateFeature refusal (0x%08X):", result);
+        const wchar_t *names[2] = { L"nvngx_dlssnr.dll", L"_nvngx.dll" };
+        for (int i = 0; i < 2 && w > 0 && (size_t)w < sizeof l - 200; ++i)
+        {
+            HMODULE m = GetModuleHandleW(names[i]);
+            wchar_t path[MAX_PATH] = {};
+            if (m == nullptr || GetModuleFileNameW(m, path, MAX_PATH) == 0)
+            { w += snprintf(l + w, sizeof l - (size_t)w, " | %ls: not loaded", names[i]); continue; }
+            char ver[48], sha[72]; unsigned long long sz = 0ull;
+            r210_file_version(path, ver_dll, ver, sizeof ver);
+            r210_file_sha256(path, bc_dll, sha, sizeof sha, sz);
+            w += snprintf(l + w, sizeof l - (size_t)w, " | %ls: %ls version %s %llu bytes sha256 %s", names[i], path, ver, sz, sha);
+        }
+        if ((size_t)w < sizeof l - 120)
+            snprintf(l + w, sizeof l - (size_t)w, " | compare with nrcheck --trace on this PC and on a working one (tools/nrcheck).");
+        mgpu::diag::warn(l);
+        if (ver_dll != nullptr) FreeLibrary(ver_dll);
+        if (bc_dll != nullptr) FreeLibrary(bc_dll);
+    }
+    // R339 (A): the adapter line for the UE trap. On ERROR 207 (the game renders on the bridge's card) and on a
+    // 0xBAD00001 CreateFeature refusal: name the card the game renders on by OUR DXGI index and the other
+    // hardware card's index as the Steam launch option Unreal reads. The index equality (DXGI order = UE's
+    // -graphicsadapter number) is the run U1 question; until it is settled the line also names the cards.
+    void r339_adapter_hint(const LUID &game_luid, const char *why)
+    {
+        IDXGIFactory4 *f = nullptr;
+        if (FAILED(CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void **)&f)) || f == nullptr) return;
+        char l[900];
+        int w = snprintf(l, sizeof l, "[MGPU][R339] %s. Adapters as this process enumerates them:", why);
+        int game_i = -1, other_i = -1; char game_d[128] = "?", other_d[128] = "?";
+        for (UINT i = 0;; ++i)
+        {
+            IDXGIAdapter1 *a = nullptr;
+            if (FAILED(f->EnumAdapters1(i, &a)) || a == nullptr) break;
+            DXGI_ADAPTER_DESC1 d{}; a->GetDesc1(&d); a->Release();
+            char desc[128]; snprintf(desc, sizeof desc, "%ls", d.Description);
+            const bool sw = (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0u;
+            const bool is_game = d.AdapterLuid.LowPart == game_luid.LowPart && d.AdapterLuid.HighPart == game_luid.HighPart;
+            if (is_game) { game_i = (int)i; snprintf(game_d, sizeof game_d, "%s", desc); }
+            else if (!sw && other_i < 0 && d.DedicatedVideoMemory >= (1024ull * 1024ull * 1024ull)) { other_i = (int)i; snprintf(other_d, sizeof other_d, "%s", desc); }
+            if (w > 0 && (size_t)w < sizeof l - 200)
+                w += snprintf(l + w, sizeof l - (size_t)w, " [%u] %s%s%s", i, desc, sw ? " (software)" : "", is_game ? " <- the game renders here" : "");
+        }
+        f->Release();
+        if (w > 0 && (size_t)w < sizeof l - 300)
+        {
+            if (other_i >= 0)
+                snprintf(l + w, sizeof l - (size_t)w, ". To move an Unreal game to [%d] %s: Steam launch option -graphicsadapter=%d "
+                         "(the number is this table's index; if the game's own log names another number for that card, use that one).", other_i, other_d, other_i);
+            else
+                snprintf(l + w, sizeof l - (size_t)w, ". No other hardware adapter with 1 GB or more is visible to this process.");
+        }
+        mgpu::diag::warn(l);
+        (void)game_i; (void)game_d;
+    }
+}
 // R278: how many velocity candidates the census found eligible (probe.cpp), handed
 // over by dllmain each frame - this file names no probe type.
 std::atomic<unsigned> g_mvec_elig_n{0};
@@ -725,43 +839,7 @@ static bool r313_quiet_enough()
 }
 void dcomp_root_on_first_neural_frame()
 {
-    // Visibility A/B for the XeSS HWND proxy. DcompOverlay=1 normally keeps
-    // the bridge HWND hidden forever in worker.cpp. Bypassing DComp without
-    // showing that HWND makes a live neural stream invisible behind the game.
-    // Do not call this DComp output: this experiment shows the actual proxy.
-    if (g_dcomp_device == nullptr && dcomp_overlay_mode() &&
-        ui_ini_read("XeSSFG", 0) != 0 && g_game_hwnd != nullptr)
-    {
-        auto &S = st();
-        std::lock_guard<std::mutex> lk(S.cs);
-        if (S.hwnd != nullptr)
-        {
-            RECT game_rect{};
-            if (GetClientRect(g_game_hwnd, &game_rect) != FALSE)
-            {
-                POINT origin{ game_rect.left, game_rect.top };
-                if (ClientToScreen(g_game_hwnd, &origin) != FALSE)
-                {
-                    // FG uses a separate HWND proxy rather than the validated Dcomp
-                    // visual. Keep only this proxy above the game's non-topmost window;
-                    // never activate it or change the ordinary Dcomp z-order path.
-                    SetWindowPos(S.hwnd, HWND_TOPMOST, origin.x, origin.y,
-                                 game_rect.right - game_rect.left, game_rect.bottom - game_rect.top,
-                                 SWP_NOACTIVATE | SWP_FRAMECHANGED);
-                }
-            }
-            ShowWindow(S.hwnd, SW_SHOWNOACTIVATE);
-            char line[420];
-            snprintf(line, sizeof line,
-                     "[MGPU][XESS-VISIBILITY] proxy HWND=0x%p game HWND=0x%p visible=%d "
-                     "chain=%ux%u. Explicit HWND visibility A/B, NOT DirectComposition.",
-                     (void *)S.hwnd, (void *)g_game_hwnd, IsWindowVisible(S.hwnd) ? 1 : 0,
-                     S.chain_w, S.chain_h);
-            mgpu::diag::info(line);
-        }
-        return;
-    }
-    if (g_dcomp_device != nullptr && mgpu::strace::safe_mode() == 3 && !r313_quiet_enough())
+    if (mgpu::strace::safe_mode() == 3 && !r313_quiet_enough())
     {
         g_r313_root_deferred.store(1, std::memory_order_relaxed);
         char l[300];
@@ -913,8 +991,8 @@ bool create_present_chain(HWND hwnd)
     IDXGISwapChain1 *sc1 = nullptr;
     IDXGISwapChain3 *sc3 = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *back0 = nullptr;
-    ID3D12Resource *back1 = nullptr;
+    ID3D12Resource *back[state::MAX_BACKBUFFERS] = {};   // BB1
+    UINT bb_count = 2u;
     // D6: one per ring slot. Created together, released together, published
     // together - so a partial failure cannot leave the state holding two of
     // three and nothing saying so.
@@ -936,13 +1014,11 @@ bool create_present_chain(HWND hwnd)
             if (cl[i] != nullptr)        { cl[i]->Release();        cl[i] = nullptr; }
             if (allocator[i] != nullptr) { allocator[i]->Release(); allocator[i] = nullptr; }
         }
-        if (back1 != nullptr)     { back1->Release(); back1 = nullptr; }
-        if (back0 != nullptr)     { back0->Release(); back0 = nullptr; }
+        for (unsigned i = state::MAX_BACKBUFFERS; i-- > 0u; )   // BB1
+            if (back[i] != nullptr) { back[i]->Release(); back[i] = nullptr; }
         if (heap != nullptr)      { heap->Release(); heap = nullptr; }
         if (sc3 != nullptr)       { sc3->Release(); sc3 = nullptr; }
         if (sc1 != nullptr)       { sc1->Release(); sc1 = nullptr; }
-        // The proxy chain and its back buffers must be gone before XeSS-FG is destroyed.
-        mgpu::xessfg::shutdown();
         if (factory != nullptr)   { factory->Release(); factory = nullptr; }
         if (queue != nullptr)     { queue->Release(); queue = nullptr; }
         // V51: the composition objects too, in reverse creation order. Without
@@ -1023,8 +1099,35 @@ bool create_present_chain(HWND hwnd)
             "INSIDE CreateDXGIFactory2 - which on a Streamline title means the interposer, not "
             "DXGI. Nothing is bypassed here; this build only measures.");
 
-        const HRESULT fhr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2),
-                                               reinterpret_cast<void **>(&factory));
+        // ---- R335 (Factory4=1): ASK DXGI FOR IDXGIFactory4, NOT IDXGIFactory2 ----
+        //
+        // 3DMigoto (d3d11.dll + d3dx.ini beside the exe) hooks CreateDXGIFactory2
+        // in-process and, built against the pre-platform-update SDK, answers a
+        // request for IDXGIFactory2 with E_NOINTERFACE by design (its own
+        // strings: "returns E_NOINTERFACE as error for IDXGIFactory2.").
+        // Seed of the Dead 2, six logs: our T5 call fails here with 0x80004002
+        // while T2's CreateDXGIFactory2(IDXGIFactory4) in adapter.cpp passes in
+        // the same run, as do the game's own IDXGIFactory1 / 4 calls.
+        // IDXGIFactory4 derives from IDXGIFactory2, so everything below
+        // (CreateSwapChainForHwnd / ForComposition, the QueryInterface to
+        // IDXGIFactory4 for EnumAdapterByLuid) is unchanged on the pointer.
+        // Key absent: the IDXGIFactory2 request exactly as shipped. The riid is
+        // the only difference, and it is logged either way.
+        const bool r335_f4 = ini_read_sr_int("Factory4", 0, 0, 1) != 0;
+        HRESULT fhr;
+        if (r335_f4)
+        {
+            IDXGIFactory4 *f4 = nullptr;
+            fhr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), reinterpret_cast<void **>(&f4));
+            factory = f4;   // IDXGIFactory4 is-an IDXGIFactory2
+            char rl[200];
+            snprintf(rl, sizeof rl, "[MGPU][R335] Factory4=1: the bridge's factory was requested as IDXGIFactory4 "
+                                    "(3DMigoto refuses IDXGIFactory2): hr=0x%08X", (unsigned)fhr);
+            mgpu::diag::info(rl);
+        }
+        else
+            fhr = CreateDXGIFactory2(0, __uuidof(IDXGIFactory2),
+                                     reinterpret_cast<void **>(&factory));
         if (FAILED(fhr))
             return fail("CreateDXGIFactory2", fhr);
 
@@ -1035,7 +1138,7 @@ bool create_present_chain(HWND hwnd)
         // Windowed member - the HWND is a parameter of
         // CreateSwapChainForHwnd and pFullscreenDesc == nullptr is what
         // makes it windowed. Flip model (gotcha 3): FLIP_DISCARD,
-        // BufferCount 2, SampleDesc.Count 1, R8G8B8A8_UNORM (no SRGB, no
+        // BufferCount PresentBuffers (BB1), SampleDesc.Count 1, R8G8B8A8_UNORM (no SRGB, no
         // MSAA - the older DISCARD/SEQUENTIAL effects fail outright).
         DXGI_SWAP_CHAIN_DESC1 scd{};
         scd.Width = width;
@@ -1053,14 +1156,27 @@ bool create_present_chain(HWND hwnd)
         scd.SampleDesc.Count = 1;
         scd.SampleDesc.Quality = 0;
         scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-        scd.BufferCount = 2;
+        // ---- BB1: HOW MANY BUFFERS THE PICTURE ROTATES THROUGH ----
+        //
+        // present_frame writes the current back buffer step by step: the copy,
+        // then ReShade's overlay inside Present. With two buffers the buffer being
+        // written is the one the previous flip has just replaced. In Independent
+        // Flip with immediate flips (what a focused game's window gets, measured:
+        // PresentMon "Hardware: Independent Flip", AllowsTearing 1, flips under
+        // 4 ms apart) the screen was caught reading that buffer mid-write, as a
+        // horizontal band of whichever stage had been reached. More buffers put
+        // more flips between "last on screen" and "being written". Measured with
+        // PresentRaceProbe=1 at 4K, on davidm71's fork: 2 buffers bands at 2X; 3
+        // and 4 clean or nearly clean at 2X, a few at 4X; 6 clean at both. Absent
+        // or 2: unchanged. Read when the chain is made: changing it needs a restart.
+        bb_count = (UINT)ui_ini_read("PresentBuffers", 2);
+        if (bb_count < 2u) bb_count = 2u;
+        if (bb_count > state::MAX_BACKBUFFERS) bb_count = state::MAX_BACKBUFFERS;
+        scd.BufferCount = bb_count;
         scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
         scd.Scaling = DXGI_SCALING_STRETCH;
         scd.AlphaMode = DXGI_ALPHA_MODE_UNSPECIFIED;
         scd.Flags = 0;
-        // HWND chains get a real wait object. This flag is not a queue limit:
-        // present_queue::arm applies and reads back the actual 0/1/2 selection.
-        mgpu::present_queue::prepare_desc(scd, ui_ini_read("XeSSFG", 0) == 0 && dcomp_overlay_mode());
 
         // Gotcha 1: the first parameter is the COMMAND QUEUE, not the
         // device. It is named pDevice and typed IUnknown *, so passing
@@ -1089,11 +1205,7 @@ bool create_present_chain(HWND hwnd)
         // this one. Wait for it rather than sampling it once. Bounded, short,
         // and only when the mode is actually on; the fallback below is still
         // there for the case where the HWND genuinely never arrives.
-        // XeSS-FG owns an HWND proxy swap chain. It cannot be combined with the
-        // DirectComposition output path, so this option deliberately bypasses
-        // every DComp wait/fallback/creation branch for this process run.
-        const bool want_xess = ui_ini_read("XeSSFG", 0) != 0;
-        if (!want_xess && dcomp_overlay_mode())
+        if (dcomp_overlay_mode())
         {
             const double r313_w0 = mgpu::strace::now_ms();
             unsigned r313_i = 0;
@@ -1107,19 +1219,19 @@ bool create_present_chain(HWND hwnd)
             }
         }
 
-        bool want_dcomp = !want_xess && dcomp_overlay_mode() && g_game_hwnd != nullptr;
+        bool want_dcomp = dcomp_overlay_mode() && g_game_hwnd != nullptr;
         // T1.19 R300k (DcompNoFallback=1 only). Dom: in composition mode the fall-back bridge window is
         // never shown (V49), so the fall-back displays nothing AND goes through CreateSwapChainForHwnd,
         // the call BetterConsole aborts in (his dumps 2026-10-05/08/09). Stop the chain instead.
         // Key absent: the V49 fall-back below runs exactly as on live.
-        if (!want_xess && mgpu::t119::dcomp_no_fallback() && dcomp_overlay_mode() && g_game_hwnd == nullptr)
+        if (mgpu::t119::dcomp_no_fallback() && dcomp_overlay_mode() && g_game_hwnd == nullptr)
         {
             mgpu::diag::error("[MGPU][R300k] DcompOverlay is on but the game's HWND was never seen - "
                               "NO present chain this run (DcompNoFallback=1: no fall-back to a bridge "
                               "window). The game is unaffected.");
             return fail("V49 game hwnd never seen", E_FAIL);
         }
-        if (!want_xess && dcomp_overlay_mode() && g_game_hwnd == nullptr)
+        if (dcomp_overlay_mode() && g_game_hwnd == nullptr)
             mgpu::diag::error("[MGPU][V49] DcompOverlay=1 but the game's HWND was never seen, so "
                               "there is nothing to compose into. Falling back to the bridge's own "
                               "window. If this appears, the swapchain-init push in dllmain did "
@@ -1349,23 +1461,6 @@ bool create_present_chain(HWND hwnd)
 
         if (!want_dcomp)
         {
-        // Also covers a DComp-to-HWND fallback after the initial descriptor was
-        // prepared: every native/proxy HWND chain gets the waitable-object flag.
-        mgpu::present_queue::prepare_desc(scd, false);
-        bool proxy_created = false;
-        if (want_xess)
-        {
-            proxy_created = mgpu::xessfg::create_swapchain(
-                dev, queue, factory, hwnd, scd,
-                ui_ini_read("DepthInverted", 1) != 0,
-                1u, &sc3);
-            if (proxy_created)
-                swapchain_hr = S_OK;
-            else
-                mgpu::diag::warn("[MGPU][XESS-FG] proxy creation failed; using the original native HWND chain with frame generation OFF");
-        }
-        if (!proxy_created)
-        {
         // T1.18 R300j (BetterConsoleGuard=1 only). Say it before it happens: if this is the last line of a
         // log and BetterConsole is resident, the abort is the known one.
         if (mgpu::t119::better_console_guard() && GetModuleHandleW(L"BetterConsole.dll") != nullptr)
@@ -1378,12 +1473,11 @@ bool create_present_chain(HWND hwnd)
         if (FAILED(swapchain_hr))
             return fail("CreateSwapChainForHwnd", swapchain_hr);
         }
-        }
 
         // SL4. The object a possibly-wrapped factory just handed us. A factory
         // hands out the objects it makes, so if the factory is a proxy this
         // one is too - and the swapchain is what DLSS Frame Generation wraps.
-        if (sc1 != nullptr) mgpu::slprobe::report_object("bridge swapchain", sc1);
+        mgpu::slprobe::report_object("bridge swapchain", sc1);
 
         // Gotcha 5: without this, DXGI installs its own message hook on
         // our window and Alt+Enter toggles it to fullscreen - on the
@@ -1408,31 +1502,26 @@ bool create_present_chain(HWND hwnd)
         // Gotcha 6: CreateSwapChainForHwnd yields IDXGISwapChain1;
         // GetCurrentBackBufferIndex() is on IDXGISwapChain3. Without it
         // the index would be tracked by hand and drift.
-        if (sc3 == nullptr)
-        {
-            const HRESULT qhr = sc1->QueryInterface(__uuidof(IDXGISwapChain3),
-                                                    reinterpret_cast<void **>(&sc3));
-            if (FAILED(qhr))
-                return fail("QueryInterface(IDXGISwapChain3)", qhr);
-        }
-        if (sc1 != nullptr)
-        {
-            sc1->Release();
-            sc1 = nullptr;
-        }
-        // The chain is final now (including an HWND fallback from DComp). Apply
-        // the requested 0/1/2 extra frames and read back DXGI's actual answer.
-        (void)mgpu::present_queue::arm(
-            sc3, want_dcomp,
-            unsigned(std::clamp(ui_ini_read("PresentQueue", 0), 0, 2)));
+        const HRESULT qhr = sc1->QueryInterface(__uuidof(IDXGISwapChain3),
+                                                reinterpret_cast<void **>(&sc3));
+        if (FAILED(qhr))
+            return fail("QueryInterface(IDXGISwapChain3)", qhr);
+        sc1->Release();
+        sc1 = nullptr;
     }
+    // R345 (Knowmind, H1): state the chain's colour space before anything is presented into it. This
+    // point is reached by BOTH routes (CreateSwapChainForComposition with DcompOverlay=1, and
+    // CreateSwapChainForHwnd) - his patch sat after the HWND route's query only. Key-gated
+    // ("ChainColorSpace" in mgpu.ini); absent -> no DXGI call at all, the chain keeps its default.
+    // It tells the COMPOSITOR how to read the bridge's frame; the neural pass itself is unchanged.
+    mgpu::chain::apply_colour_space(sc3);
 
     // 3. RTV heap: one descriptor per backbuffer - the frame picks the
     // current backbuffer by index.
     {
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-        hd.NumDescriptors = 2;
+        hd.NumDescriptors = state::MAX_BACKBUFFERS;   // BB1
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
         const HRESULT hr = dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&heap));
         if (FAILED(hr))
@@ -1446,21 +1535,18 @@ bool create_present_chain(HWND hwnd)
     {
         const UINT rtv_size =
             dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        const HRESULT hr0 = sc3->GetBuffer(0, __uuidof(ID3D12Resource),
-                                           reinterpret_cast<void **>(&back0));
-        if (FAILED(hr0))
-            return fail("GetBuffer(0)", hr0);
-        // CreateRenderTargetView returns void - there is no HRESULT to
-        // check. A bad argument surfaces on the debug layer, not here.
-        dev->CreateRenderTargetView(
-            back0, nullptr, heap->GetCPUDescriptorHandleForHeapStart());
-        const HRESULT hr1 = sc3->GetBuffer(1, __uuidof(ID3D12Resource),
-                                           reinterpret_cast<void **>(&back1));
-        if (FAILED(hr1))
-            return fail("GetBuffer(1)", hr1);
-        D3D12_CPU_DESCRIPTOR_HANDLE h1{};
-        h1.ptr = heap->GetCPUDescriptorHandleForHeapStart().ptr + rtv_size;
-        dev->CreateRenderTargetView(back1, nullptr, h1);
+        D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart();
+        for (UINT i = 0; i < bb_count; ++i)   // BB1
+        {
+            const HRESULT hr = sc3->GetBuffer(i, __uuidof(ID3D12Resource),
+                                              reinterpret_cast<void **>(&back[i]));
+            if (FAILED(hr))
+                return fail("GetBuffer", hr);
+            // CreateRenderTargetView returns void - there is no HRESULT to
+            // check. A bad argument surfaces on the debug layer, not here.
+            dev->CreateRenderTargetView(back[i], nullptr, h);
+            h.ptr += rtv_size;
+        }
     }
 
     // 4. Command allocators + command lists, PRESENT_SLOTS of each (D6).
@@ -1514,8 +1600,9 @@ bool create_present_chain(HWND hwnd)
         S.chain_fmt = DXGI_FORMAT_R10G10B10A2_UNORM;   // must match scd.Format above
         S.swapchain = sc3;
         S.rtv_heap = heap;
-        S.backbuffer[0] = back0;
-        S.backbuffer[1] = back1;
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            S.backbuffer[i] = back[i];
+        S.present_buffers = bb_count;
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         {
             S.allocator[i] = allocator[i];
@@ -1538,8 +1625,8 @@ bool create_present_chain(HWND hwnd)
         queue = nullptr;
         sc3 = nullptr;
         heap = nullptr;
-        back0 = nullptr;
-        back1 = nullptr;
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            back[i] = nullptr;
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         { allocator[i] = nullptr; cl[i] = nullptr; }
         fence = nullptr;
@@ -1553,10 +1640,10 @@ bool create_present_chain(HWND hwnd)
              // created R10G10B10A2 - the string was never updated when P5.0
              // changed scd.Format. A log line that contradicts the code is worse
              // than no log line: it is evidence pointing the wrong way.
-             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=2 "
+             "[MGPU][T5] present chain created: format=DXGI_FORMAT_R10G10B10A2_UNORM buffers=%u "
              "swapeffect=FLIP_DISCARD queue=DIRECT client=%ux%u CreateSwapChainForHwnd "
              "hr=0x%08X hwnd=0x%p (vsync present, non-resizable window - no ResizeBuffers at P0)",
-             width, height, (unsigned)swapchain_hr, (void *)hwnd);
+             bb_count, width, height, (unsigned)swapchain_hr, (void *)hwnd);
     mgpu::diag::info(line);
     if (mgpu::strace::on()) mgpu::strace::ev(mgpu::strace::R_BT, "create-present-chain-exit", "published", (unsigned)swapchain_hr);
     return true;
@@ -1619,8 +1706,6 @@ namespace
     // round, and the two orders together would be a cycle.
     ID3D12Resource *stream_present_source(UINT &w, UINT &h, DXGI_FORMAT &fmt,
                                           D3D12_RESOURCE_STATES &rest);
-    mgpu::xessfg::frame_inputs stream_xess_inputs(ID3D12Resource *color);
-    void stream_xess_present_signalled(ID3D12Fence *fence, UINT64 value);
 
     // P7.4. Same arrangement, for the LEFT half of a split present: the frame
     // as it arrived from the game, before the model. Returns nullptr unless
@@ -1655,9 +1740,26 @@ static unsigned      g_pr_n = 0u, g_pr_i = 0u;
 static LARGE_INTEGER g_pr_last{};
 static std::atomic<int> g_pr_on{1};   // Presentation cadence is sampled independently of NRS.
 
+// R341: the pacing thread's source override and fence read-back (thread-local: the bridge thread's
+// own presents never see them set).
+static thread_local ID3D12Resource *t_fg_src = nullptr;
+static thread_local D3D12_RESOURCE_STATES t_fg_rest = D3D12_RESOURCE_STATE_COMMON;
+static thread_local unsigned long long t_present_fv = 0ull;
+void present_override(ID3D12Resource *src, D3D12_RESOURCE_STATES rest) { t_fg_src = src; t_fg_rest = rest; }
+unsigned long long present_last_fence_value() { return t_present_fv; }
+ID3D12Fence *present_fence_addref()
+{
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    if (S.fence == nullptr) return nullptr;
+    S.fence->AddRef();
+    return S.fence;
+}
+
 bool present_frame(float r, float g, float b)
 {
     auto &S = st();
+    t_present_fv = 0ull;   // R341: set after the Signal below
 
     // ---- [OURS] 2026-10-12: THE DISPLAYED FRAME RATE ---------------------------
     // This function is where a frame is actually handed to the compositor, so the gap
@@ -1687,7 +1789,8 @@ bool present_frame(float r, float g, float b)
     ID3D12CommandQueue *queue = nullptr;
     IDXGISwapChain3 *sc = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *backbuffer[2] = {};
+    ID3D12Resource *backbuffer[state::MAX_BACKBUFFERS] = {};   // BB1
+    UINT bb_count = 2u;
     // D6: the slot this call will use, and the fence value that slot last
     // carried. slot is derived from fence_value, so it advances with the
     // submissions rather than with a counter that could drift from them.
@@ -1707,8 +1810,9 @@ bool present_frame(float r, float g, float b)
         queue = S.queue;
         sc = S.swapchain;
         heap = S.rtv_heap;
-        backbuffer[0] = S.backbuffer[0];
-        backbuffer[1] = S.backbuffer[1];
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            backbuffer[i] = S.backbuffer[i];
+        bb_count = S.present_buffers;
         fence = S.fence;
         event = S.fence_event;
         fence_value = S.fence_value;
@@ -1717,6 +1821,12 @@ bool present_frame(float r, float g, float b)
         cl = S.command_list[slot];
         slot_prev = S.slot_value[slot];
     }
+
+    // R369: ChainColorSpace=auto follows the game when it states HDR (or SDR) after this chain was
+    // created. Here, with S.cs released and nothing of this frame recorded yet: on a change ReShade's
+    // SetColorSpace1 hook raises destroy/init_swapchain(resize) for OUR chain on this thread, as our
+    // own ResizeBuffers at arm does. Any other key value, or no change: relaxed loads only.
+    mgpu::chain::follow_game_colour_space(sc);
 
     char line[800];   // P5.3 widened: the Present=in banner is longer than 320 and a
                       // truncated banner is a wrong label on a whole run
@@ -1754,18 +1864,13 @@ bool present_frame(float r, float g, float b)
         return false;
     };
 
-    // Wait on DXGI's real frame-latency object before choosing a back buffer.
-    // Unsupported chains report that fact in the panel and continue normally.
-    if (!mgpu::present_queue::wait(sc))
-        return fail("frame-latency wait (stalled)", E_FAIL);
-
     // The current backbuffer by index (gotcha 6) - no hand tracking.
     // GetCurrentBackBufferIndex takes NO parameters and returns UINT
     // directly; it is not an HRESULT call.
     const UINT index = sc->GetCurrentBackBufferIndex();
-    if (index >= 2)
+    if (index >= bb_count)
     {
-        // Cannot happen with BufferCount 2. Guarded because the index
+        // Cannot happen: the chain was made with bb_count. Guarded because the index
         // feeds both a descriptor offset and backbuffer[], and a wrong
         // one would be a silent out-of-bounds read.
         return fail("GetCurrentBackBufferIndex (index out of range)", index);
@@ -1928,7 +2033,6 @@ bool present_frame(float r, float g, float b)
     hr = cl->Reset(allocator, nullptr);
     if (FAILED(hr))
         return fail("CommandList::Reset", static_cast<unsigned>(hr));
-    mgpu::xessfg::begin_frame();
 
     // Gotcha 7: barriers are mandatory. PRESENT -> RENDER_TARGET before
     // the clear, RENDER_TARGET -> PRESENT after it. Omitting them is a
@@ -2004,9 +2108,9 @@ bool present_frame(float r, float g, float b)
         const UINT top  = (nh - ch) / 2u;
 
         // The backbuffer went PRESENT -> RENDER_TARGET above for the clear.
-        // Take it on to COPY_DEST. The clear still happens first, so a crop
-        // smaller than the backbuffer leaves the cycling colour as a border
-        // rather than undefined pixels.
+        // Take it on to COPY_DEST. A crop smaller than the backbuffer is still
+        // cleared first, so it leaves a colour as a border rather than
+        // undefined pixels (BB1: only then).
         barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
         barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
         // R108 / V26. The border behind a crop smaller than the backbuffer.
@@ -2014,7 +2118,24 @@ bool present_frame(float r, float g, float b)
         // saturated hue that changed every frame and read as a fault. Same
         // dark neutral the idle screen uses, so the two never disagree.
         const float color_pre[4] = { 0.030f, 0.032f, 0.035f, 1.0f };
-        cl->ClearRenderTargetView(rtv, color_pre, 0, nullptr);
+        // ---- BB1: CLEAR ONLY WHAT THE PICTURE WILL NOT COVER ----
+        //
+        // This ran on every frame, so every frame's back buffer spent a moment
+        // holding this colour. A full-size copy overwrites all of it, and on a
+        // screen caught reading a buffer mid-write (see BufferCount) that moment
+        // was a dark horizontal band with frame generation on.
+        //
+        // PresentRaceProbe=1 is the instrument that showed it, kept because it
+        // needs no special build: magenta instead of the colour above, every
+        // frame, so any such read shows as a magenta band. Diagnostic only.
+        static const bool race_probe = ui_ini_read("PresentRaceProbe", 0) == 1;
+        if (race_probe)
+        {
+            const float color_probe[4] = { 1.0f, 0.0f, 1.0f, 1.0f };
+            cl->ClearRenderTargetView(rtv, color_probe, 0, nullptr);
+        }
+        else if (cw != bw || ch != bh)
+            cl->ClearRenderTargetView(rtv, color_pre, 0, nullptr);
         cl->ResourceBarrier(1, &barrier);
 
         D3D12_RESOURCE_BARRIER nb{};
@@ -2023,7 +2144,12 @@ bool present_frame(float r, float g, float b)
         nb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
         nb.Transition.StateBefore = nrest;
         nb.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-        cl->ResourceBarrier(1, &nb);
+        // R346 (Knowmind, 2026-11-03, "defect 1"): a source that already rests in COPY_SOURCE must not get a
+        // COPY_SOURCE -> COPY_SOURCE transition - D3D12 rejects it at Close() (E_INVALIDARG, device fine) and the
+        // present loop stopped, reading like a hang. No present source of this tree rests there today (UAV,
+        // tex_in_rest, R341's UAV / NPSR), so this guard changes no shipped frame; it stops the next source that does.
+        if (nrest != D3D12_RESOURCE_STATE_COPY_SOURCE)
+            cl->ResourceBarrier(1, &nb);
 
         // P7.4. SPLIT. The left half is the INPUT, the right half is the
         // OUTPUT, and they are the SAME FRAME - not two captures aligned after
@@ -2063,7 +2189,8 @@ bool present_frame(float r, float g, float b)
 
         nb.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
         nb.Transition.StateAfter = nrest;
-        cl->ResourceBarrier(1, &nb);
+        if (nrest != D3D12_RESOURCE_STATE_COPY_SOURCE)   // R346: the matching guard on the way back
+            cl->ResourceBarrier(1, &nb);
 
         if (lsrc != nullptr)
         {
@@ -2228,11 +2355,6 @@ bool present_frame(float r, float g, float b)
         cl->ResourceBarrier(1, &barrier);
     }
 
-    // Tag only the depth/MV captured with this exact nsrc. With no valid
-    // snapshot the proxy still presents the real frame, with generation off.
-    const bool xess_on = mgpu::xessfg::active();
-    const mgpu::xessfg::frame_inputs xess_inputs = stream_xess_inputs(nsrc);
-    (void)mgpu::xessfg::tag_frame(cl, xess_inputs);
     hr = cl->Close();
     if (FAILED(hr))
         return fail("Close", static_cast<unsigned>(hr));
@@ -2240,16 +2362,14 @@ bool present_frame(float r, float g, float b)
     ID3D12CommandList *const lists[1] = { cl };
     queue->ExecuteCommandLists(1, lists);
 
-    // Native path stays exactly as before. With XeSS, Signal must instead come
-    // after proxy Present, whose interpolation work is submitted on this queue.
-    if (!xess_on)
-    {
-        fence_value++;
-        hr = queue->Signal(fence, fence_value);
-        if (FAILED(hr))
-            return fail("Signal", static_cast<unsigned>(hr));
-        stream_xess_present_signalled(fence, fence_value);
-    }
+    // Signal the fence for this frame, present with vsync - Present(1, 0),
+    // never Present(0, 0): an uncapped loop would spin GPU 1 at full rate
+    // for a clear - and only then wait for the GPU to finish this frame.
+    fence_value++;
+    hr = queue->Signal(fence, fence_value);
+    if (FAILED(hr))
+        return fail("Signal", static_cast<unsigned>(hr));
+    t_present_fv = fence_value;   // R341: what the pacing thread's set retires against
 
     // ---- L5: THE PRESENT INTERVAL IS A LATENCY DECISION, NOT A STYLE ONE ----
     //
@@ -2267,20 +2387,31 @@ bool present_frame(float r, float g, float b)
     //
     // PresentVsync=0 asks for the immediate present. Expect tearing - that is
     // the trade, and it is the user's to make, not ours to make silently.
+    // POVERLAY on the REAL present chain: this composition chain is created natively,
+    // so ReShade's present event never fires for it and the panel's Bind only ever saw
+    // the ghost chain (refused). Here the back buffer is already in PRESENT state and
+    // the bridge's own draw is recorded - Submit's PRESENT->RT barrier and its queue
+    // execution land the panel on top of the neural frame, right before Present.
+    {
+        static std::atomic<int> pov_said{0};
+        if (pov_said.exchange(1, std::memory_order_relaxed) == 0)
+        {
+            char pov_l[200];
+            snprintf(pov_l, sizeof pov_l,
+                     "[MGPU][POV] present_frame hook reached on the real chain %p (queue %p)",
+                     (void *)sc, (void *)queue);
+            mgpu::diag::info(pov_l);
+        }
+    }
+    mgpu::poverlay::on_present((void *)queue, (void *)sc);
+
     const UINT pi_interval = (g_present_vsync.load(std::memory_order_relaxed) != 0u) ? 1u : 0u;
     const double r313_p0 = mgpu::strace::now_ms();   // R313: 0.0 when off
     hr = sc->Present(pi_interval, 0);
-    mgpu::xessfg::end_frame(hr);
-    if (xess_on)
-    {
-        fence_value++;
-        const HRESULT signal_hr = queue->Signal(fence, fence_value);
-        if (FAILED(signal_hr)) return fail("XeSS proxy Present queue Signal", (unsigned)signal_hr);
-        stream_xess_present_signalled(fence, fence_value);
-    }
     if (mgpu::strace::on()) mgpu::strace::note_bridge_present((unsigned)hr, mgpu::strace::now_ms() - r313_p0);   // R313
     if (FAILED(hr))
         return fail("Present", static_cast<unsigned>(hr));
+    mgpu::fginstr::after_present(sc);
 
     // ---- R111: THE SUCCESS CODES PRESENT RETURNS, WHICH WERE INVISIBLE ----
     //
@@ -2353,6 +2484,17 @@ bool has_present_chain()
     return S.swapchain != nullptr;
 }
 
+// The present chain's native pointer, for identity comparisons from other
+// modules (the POV panel's DComp-host binding). The caller must not hold or
+// dereference it beyond the comparison: the chain is created and destroyed on
+// the bridge thread.
+void *present_chain_native()
+{
+    auto &S = st();
+    std::lock_guard<std::mutex> lk(S.cs);
+    return (void *)S.swapchain;
+}
+
 // T5 extends shutdown(), it does not replace it: the present chain is
 // released first - after the GPU has been drained - and then the device
 // exactly as T3 did it. The chain goes first because the swapchain holds
@@ -2371,7 +2513,7 @@ void shutdown()
     ID3D12CommandQueue *queue = nullptr;
     IDXGISwapChain3 *sc = nullptr;
     ID3D12DescriptorHeap *heap = nullptr;
-    ID3D12Resource *backbuffer[2] = {};
+    ID3D12Resource *backbuffer[state::MAX_BACKBUFFERS] = {};   // BB1
     ID3D12CommandAllocator *allocator[state::PRESENT_SLOTS] = {};   // D6
     ID3D12GraphicsCommandList *cl[state::PRESENT_SLOTS] = {};
     ID3D12Fence *fence = nullptr;
@@ -2382,8 +2524,8 @@ void shutdown()
         queue = S.queue;
         sc = S.swapchain;
         heap = S.rtv_heap;
-        backbuffer[0] = S.backbuffer[0];
-        backbuffer[1] = S.backbuffer[1];
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            backbuffer[i] = S.backbuffer[i];
         for (unsigned i = 0; i < state::PRESENT_SLOTS; ++i)
         {
             allocator[i] = S.allocator[i];
@@ -2398,8 +2540,8 @@ void shutdown()
         S.queue = nullptr;
         S.swapchain = nullptr;
         S.rtv_heap = nullptr;
-        S.backbuffer[0] = nullptr;
-        S.backbuffer[1] = nullptr;
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
+            S.backbuffer[i] = nullptr;
         S.fence = nullptr;
         S.fence_event = nullptr;
         S.fence_value = 0;
@@ -2448,14 +2590,11 @@ void shutdown()
             if (cl[i] != nullptr)        cl[i]->Release();
             if (allocator[i] != nullptr) allocator[i]->Release();
         }
-        if (backbuffer[1] != nullptr)
-            backbuffer[1]->Release();
-        if (backbuffer[0] != nullptr)
-            backbuffer[0]->Release();
+        for (unsigned i = state::MAX_BACKBUFFERS; i-- > 0u; )   // BB1
+            if (backbuffer[i] != nullptr)
+                backbuffer[i]->Release();
         heap->Release();
         sc->Release();
-        mgpu::xessfg::shutdown();
-        mgpu::xess_depth::release(); // present and stream work are drained now
         queue->Release();
         mgpu::diag::info("[MGPU][T5] present chain released (GPU drained, reverse creation order)");
     }
@@ -2694,6 +2833,31 @@ namespace
         __try
         {
             return fn(cl, feat, params, out);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (seh_code_out != nullptr) *seh_code_out = (unsigned long)GetExceptionCode();
+            return (NVSDK_NGX_Result)NGX_RESULT_MGPU_SEH_FAULT;
+        }
+    }
+
+    // Keep vendor Evaluate behind the same exception boundary as CreateFeature.
+    // The caller discards the affected command list after a fault.
+    typedef NVSDK_NGX_Result (NVSDK_CONV *ngx_pf_evaluate_seh_fn)(
+        ID3D12GraphicsCommandList *InCmdList,
+        const NVSDK_NGX_Handle *InFeatureHandle,
+        const NVSDK_NGX_Parameter *InParameters,
+        void *InCallback);
+
+    NVSDK_NGX_Result ngx_eval_guarded(ngx_pf_evaluate_seh_fn fn,
+                                      ID3D12GraphicsCommandList *cl,
+                                      const NVSDK_NGX_Handle *handle,
+                                      const NVSDK_NGX_Parameter *params,
+                                      unsigned long *seh_code_out)
+    {
+        __try
+        {
+            return fn(cl, handle, params, nullptr);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -8864,11 +9028,23 @@ namespace
         unsigned int  mvec_valid;
         unsigned int  mvec_mode;          // 0 off, 1 synthetic, 2 estimated, 3 real
         unsigned int  reserved3[6];
+
+        // SEAL v4: GPU0's same-frame reduced NR answer in the shared slot.
+        unsigned long long local_nr_offset;
+        unsigned long long local_nr_bytes;
+        unsigned int local_nr_width, local_nr_height, local_nr_format;
+        unsigned int local_nr_pitch, local_nr_valid, local_nr_pass;
+
+        // SEAL v5: the answer's identity travels with THIS frame.  The old
+        // process-memory slot tags could be overwritten by a later producer
+        // frame before GPU1 consumed this one, yielding a false future tag.
+        unsigned long long local_nr_frame;
+        unsigned long long local_nr_generation;
     };
-    static_assert(sizeof(MgpuSeal) == 192, "seal v3 layout changed");
+    static_assert(sizeof(MgpuSeal) == 248, "seal v5 layout changed");
 
     const unsigned int SEAL_MAGIC   = 0x5550474Du;   // 'MGPU' little-endian
-    const unsigned int SEAL_VERSION = 3u;   // R78: 128 -> 192, MVec described
+    const unsigned int SEAL_VERSION = 5u;   // v5: per-seal local NR identity
 
     // 512, not 64: D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT. The payload in each
     // slot must start on that boundary, so the seal lives in space that would
@@ -8918,7 +9094,10 @@ namespace
         //
         // Resolved at arm because s.fault cannot change after arm. The strings
         // stay the interface; only the per-frame comparison goes.
-        enum fault_kind { FK_NONE = 0, FK_DROP, FK_STALE, FK_PITCH, FK_ALIAS, FK_MAGIC };
+        enum fault_kind {
+            FK_NONE = 0, FK_DROP, FK_STALE, FK_PITCH, FK_ALIAS, FK_MAGIC,
+            FK_NR_FIRST, FK_NR_EVAL, FK_NR_TAG, FK_NR_STALE, FK_NR_GENERATION
+        };
         int fault_id = FK_NONE;
 
         // ---- D2: a fault storm must not cost the bridge thread its frame ----
@@ -9306,6 +9485,21 @@ namespace
         ID3D12Fence *nf = nullptr;
         HANDLE nev = nullptr;
         UINT64 nf_value = 0;
+        // B1 GPU0 private producer: the game queue publishes ninput, the
+        // private queue publishes the shared produced fence after NR + copy.
+        ID3D12Fence *ninput = nullptr;
+        ID3D12Resource *nrs_native = nullptr;
+        unsigned long long nr_submitted = 0;
+        // B1 optional GPU0 stage timestamps. These measure GPU execution, not
+        // the CPU submission duration of EvaluateFeature. Marks cover native
+        // transfer-in, each low-resolution NR pass and final answer transfer.
+        ID3D12QueryHeap *b1_ts_heap = nullptr;
+        ID3D12Resource *b1_ts_read = nullptr;
+        UINT64 b1_ts_freq = 0;
+        unsigned b1_ts_marks = 0;
+        bool b1_ts_pending = false;
+        double b1_ts_sum[5] = {}, b1_ts_min[5] = {}, b1_ts_max[5] = {};
+        unsigned long long b1_ts_n[5] = {};
 
         // ---- R26: a dedicated COPY queue on GPU 1 ----
         //
@@ -9396,6 +9590,45 @@ namespace
         UINT width = 0, height = 0;
         DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 
+        bool local_nr = false;
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT local_nr_fp{};
+        UINT64 local_nr_off = 0, local_nr_bytes = 0;
+        unsigned local_nr_width = 0, local_nr_height = 0, local_nr_format = 0;
+        // Storage and RowPitch use this maximum; each seal carries the actual
+        // final-pass extent and pass index so live edits cannot rescale old data.
+        unsigned local_nr_max_width = 0, local_nr_max_height = 0;
+        unsigned local_nr_answer_pass = 0;
+        // Scale edits cross the producer/consumer boundary as atomics. NGX and
+        // PX1 histories are reset only by the thread that owns each instance.
+        std::atomic<unsigned> local_nr_ngx_reset_mask{0};
+        std::atomic<unsigned> local_nr_px1_reset_mask{0};
+        std::atomic<unsigned long long> local_nr_slot_frame[RING] = {};
+        std::atomic<unsigned long long> local_nr_slot_generation[RING] = {};
+        unsigned long long local_nr_generation = 1;
+        unsigned long long local_nr_evals = 0, local_nr_failures = 0;
+        unsigned long long local_nr_unpacks = 0, local_nr_fallbacks = 0;
+
+        // B1 ring ownership. GPU1 signals this shared fence only after all of
+        // a frame's cross-adapter reads have finished. Before GPU0 reuses that
+        // slot RING frames later, its game queue waits for the retired frame.
+        // This is GPU-side backpressure: no stream mutex is held across a wait.
+        ID3D12CommandQueue *game_queue = nullptr; // borrowed, game side
+        ID3D12Fence *local_nr_consumed_g = nullptr;
+        ID3D12Fence *local_nr_consumed_n = nullptr;
+        HANDLE local_nr_consumed_share = nullptr;
+        std::atomic<unsigned long long> local_nr_wait_target{0};
+        unsigned long long local_nr_gated_through = 0;
+        unsigned long long local_nr_backpressure_waits = 0;
+        unsigned long long local_nr_backpressure_failures = 0;
+        // The GPU wait orders command execution, but cannot stop the CPU from
+        // recording ahead and replacing gup_cpu. This second gate applies the
+        // same F-RING contract before either producer entry point takes its lock.
+        HANDLE local_nr_cpu_event = nullptr;
+        std::atomic<bool> local_nr_cpu_stop{false};
+        unsigned long long local_nr_cpu_gated_through = 0;
+        unsigned long long local_nr_cpu_waits = 0;
+        unsigned long long local_nr_cpu_failures = 0;
+
         unsigned signal_at = 0;            // ini SignalAt: 0 effects, 1 present
         unsigned present_vsync = 1;        // ini PresentVsync: 1 = Present(1,0)
         unsigned sr_snippet = 1;           // ini SRSnippet: 1 driver, 0 game's
@@ -9473,8 +9706,8 @@ namespace
         // gate is what keeps the number readable - the overlay is drawn on both
         // runtimes, so ui_read can be called more than once per frame.
         LARGE_INTEGER      ui_tlast{};
-        unsigned long long ui_plast = 0, ui_clast = 0, ui_elast = 0, ui_olast = 0;
-        double             ui_fps_prod = 0.0, ui_fps_cons = 0.0, ui_fps_eval = 0.0, ui_fps_over = 0.0;
+        unsigned long long ui_plast = 0, ui_clast = 0, ui_elast = 0;
+        double             ui_fps_prod = 0.0, ui_fps_cons = 0.0, ui_fps_eval = 0.0;
         // ---- R270b: the launch record (LaunchRecord=1, OFF by default) ----
         //
         // The record the launcher reads (mgpu\last_launch.ini) is written at
@@ -9496,6 +9729,11 @@ namespace
         // full bound on a normal exit. drain_on: DrainGpu0 in mgpu.ini, absent
         // = 1; the add-on writes it to 0 itself if the drain ever hits its bound.
         unsigned long long gsignaled = 0;
+        // SignalAt=2 doors never take s.cs. Teardown closes the gate and waits
+        // for an already-entered door before draining and releasing gfence.
+        std::atomic<ID3D12Fence *> sig_fence{nullptr};
+        std::atomic<unsigned> sig_inflight{0};
+        std::atomic<unsigned long long> sig_gsignaled{0};
         bool drain_on = true;
         // R267b: the two agreed record writes (arm, summary) no longer happen
         // where they were decided - the arm is the GAME thread under s.cs
@@ -9791,16 +10029,43 @@ namespace
     // of this - it was never run, because no ghosting scene was ever captured.
     // If it is run later, raise this constant in a local build. It does not
     // ship raised.
-    static const unsigned MAX_PASSES = 2;
+    //
+    // R350 (0.5.0, Experimental): the constant is now the CAPACITY (4). What the
+    // arm BUILDS is nr_built = max(2, Passes from the ini at request) - so a file
+    // with no Passes line, Passes=1 or Passes=2 builds the same two features it
+    // always did, and only Passes=3 / 4 builds more. The residual module's sets
+    // follow nr_built the same way (residual.cpp MAX_SETS = 4, allocated per
+    // carrying pass only).
+    static const unsigned MAX_PASSES = 4;
         unsigned passes = 1;
-        // [OURS] Cadence 1 or fixed 13 (three evaluates per four frames).
-        // A scheduled hold never falls back to x1 because of motion or scene load.
+        // [OURS] Independent neural cadence: 1, 2 or 4 consumed frames per evaluation.
+        // Held frames keep nr_final on screen; they do not run another pass or rebuild NGX.
         unsigned nr_cadence = 1;
         unsigned nr_cadence_wait = 0;
         bool nr_cadence_hold_said = false;
         // Completed neural-work frames only. Unlike consumed, this excludes held cadence frames.
         unsigned long long nr_evaluated = 0;
+        unsigned nr_built = 2;   // R350: features created at arm (2..MAX_PASSES); the panel's live range
         NVSDK_NGX_Handle *nr_handle[MAX_PASSES] = {};
+        // R349 (N01950's R419): the DLSS-NR model preset hint, per pass, CREATE-TIME ONLY. 0 = the snippet's
+        // default (and "no key" = the hint is never written), 1 / 2 = the two values his PR names. Whether the
+        // snippet HONOURS the hint, and what 1 / 2 cost, is what the first launch with NGXLog=1 says - his
+        // evidence only shows the value we wrote. A different preset needs a new feature; never rebuilt live.
+        int  nr_preset_pass[MAX_PASSES] = {};
+        bool nr_preset_any = false;
+        // R361 (Marcelo 2026-11-09 02:27): pass 1's network while TWO OR MORE passes run. -1 = key absent =
+        // pass 1 keeps NRPreset1 at any pass count (today). With the key, a live x1 <-> x2 switch that
+        // changes pass 1's effective hint recreates pass 1's feature on the bridge thread (one CreateFeature,
+        // ~100-200 ms, Reset on its first evaluate) - the same path N01950's NRScale live recreate takes.
+        int  nr_preset1_x2 = -1;
+        int  nr_preset_built[MAX_PASSES] = {};   // the hint each live handle was CREATED with (Running now)
+        bool nr_p1_recreate_req = false;         // ui_set_passes -> bridge thread (pass 1, the x1 <-> x2 rule)
+        bool nr_p1_reset_next = false;           // the recreated pass 1's first evaluate: Reset=1
+        unsigned nr_recreate_mask = 0u;          // R363: ui_set_network -> bridge thread, one bit per pass
+        unsigned nr_reset_mask = 0u;             // R363: Reset=1 on the first evaluate of each recreated pass
+        unsigned nr_res_req_mask = 0u;           // R364: ui_set_resolution -> bridge thread, one bit per pass
+        unsigned nr_res_want_mask = 0u;          // R364: the wanted state per pass (bit set = Residual)
+        void *nr_cre_v = nullptr;                // CreateFeature entry, stashed at arm for R361
         // R212: the foveated pass 2, read at arm. p2r_on false = the 0.2.5
         // chain, untouched. The region is in output pixels, multiples of 8.
         bool p2r_on = false;
@@ -9885,6 +10150,16 @@ namespace
         // Absent or >= 1.0 = every published run unchanged.
         bool  nrs_on = false;
         bool  nrs_ready = false;
+        // R354 (N01950's #71 / R421 design, our code): NRSPass=2 - every pass the frame runs takes the
+        // NRScale path at the same global scale (each pass's feature built at the work extent, each
+        // evaluate anchored on ITS input: pass 1 on the native frame, pass N on pass N-1's output).
+        // Absent / 1 = pass 1 only, as published.
+        bool  nrs_all = false;
+        // R367 (Marcelo 11:10): on N01950's path the panel's Residual / Native works per pass, live, like ours.
+        // One bit per pass: set = that pass runs the NRScale path. Arm: bit 0 from NRScale, every built bit with
+        // NRSPass=2. A flip needs no recreate - his features are built at the native cap and sized per evaluate -
+        // only Reset on the pass's next evaluate (its history was the other size).
+        unsigned nrs_pass_mask = 0u;
         float nrs_scale = 1.0f;
         float nrs_gain = 1.0f;
         unsigned nrs_mode = 1u;      // resolve mode: 1 = residual composite (default), 0 = the model output directly
@@ -9894,14 +10169,34 @@ namespace
         // without depth (has_depth=0) while NGX keeps it. Absent or 1 = unchanged.
         bool  nrs_res_depth = true;
         unsigned nrs_w = 0u, nrs_h = 0u;
+        // R370: per-pass work extents (nrs_pw[i]==0 -> pass i follows nrs_w/h). nrs_sw/sh
+        // size the scratch pair: the LARGEST extent any NRS pass uses, so one allocation
+        // serves every pass at its own resolution.
+        unsigned nrs_pw[MAX_PASSES] = {};
+        unsigned nrs_ph[MAX_PASSES] = {};
+        float    nrs_pscale[MAX_PASSES] = {};
+        // R375: the panel's per-pass scale slider, debounced. ui_set_scale only STAGES
+        // here; the bridge thread applies after 250 ms of stillness (same idea as the
+        // 350 ms nrs_stage_scale debounce). Without this, one drag across the range was
+        // 30+ live applies, each a mask flip + Reset=1 on the pass's next evaluate -
+        // the picture tore for the whole drag and read as "第3遍分辨率拉下去画面异常".
+        float    nrs_stage_pscale[MAX_PASSES] = {};
+        unsigned nrs_stage_pmask = 0u;
+        LARGE_INTEGER nrs_stage_pt = {};
+        unsigned nrs_sw = 0u, nrs_sh = 0u;
         UINT  nrs_inc = 0u;
         ID3D12RootSignature *nrs_rs_down = nullptr;
         ID3D12RootSignature *nrs_rs_res = nullptr;
         ID3D12PipelineState *nrs_pso_down = nullptr;
         ID3D12PipelineState *nrs_pso_res = nullptr;
+        ID3D12PipelineState *nrs_pso_opaque = nullptr;   // R372: alpha=1 fixup, runtime-compiled
         ID3D12DescriptorHeap *nrs_heap = nullptr;
         ID3D12Resource *nrs_color = nullptr;
         ID3D12Resource *nrs_out = nullptr;
+        // B1 producer only: exact-extent textures prevent one pass from reading
+        // stale pixels outside another pass's logical subrect on a native canvas.
+        ID3D12Resource *b1_color[MAX_PASSES] = {};
+        ID3D12Resource *b1_out[MAX_PASSES] = {};
         // TRACKED states, not guesses. The proxy keeps slot->colorSmallState /
         // outputSmallState and passes them into every TransitionBarrier; assuming
         // a state is how a write ends up invisible to the next reader.
@@ -9941,6 +10236,16 @@ namespace
         // point stashed at arm (kept as void* so this struct needs no NGX typedef).
         bool  nrs_live = false;
         bool  nrs_reset_next = false;   // the evaluate after a rebuild must Reset once
+        // R332 (E12): Pass2Reset=1 - one DLSSNR.Reset=1 on pass 2's first evaluate after a live
+        // x1 -> x2 switch (its feature holds history from before the switch). Absent: as today.
+        unsigned pass2_reset_on = 0u;
+        bool     r332_p2_reset = false;
+        // R332 (E16): WeakGpuWarn (default 1) - one line when x1 full NR cannot keep up with the game.
+        unsigned weak_warn_on = 1u;
+        LARGE_INTEGER      e16_t0{};
+        unsigned long long e16_ev0 = 0ull, e16_prod0 = 0ull;
+        unsigned           e16_slow_windows = 0u;
+        bool               e16_said = false;
         void *nrs_cre_v = nullptr;
         // The panel/hotkey staging slot. -1 = nothing staged. Written by the UI thread
         // under the stream lock, consumed by the evaluate path (the live-knob block).
@@ -9962,7 +10267,7 @@ namespace
         // free once the NR fence has passed the value it was parked at.
         struct nrs_parked_t
         {
-            NVSDK_NGX_Handle *h;
+            NVSDK_NGX_Handle *h[MAX_PASSES];   // R342e (E5): every pass's handle, not pass 1's alone
             ID3D12Resource   *c;
             ID3D12Resource   *o;
             UINT64            fence;
@@ -9974,8 +10279,8 @@ namespace
         UINT cv_inc = 0;
         unsigned long long cv_built = 0, cv_fb_far = 0, cv_fb_old = 0, cv_fb_slot = 0;
         unsigned long long cv_late = 0;           // frames more than one game frame late
-        static const UINT EV_MAX = 12;            // room for PX1/NRS stage marks around a pass
-        static const unsigned EV_ROLES = 24;      // 19 original roles + five PX1/NRS A/B stages
+        static const UINT EV_MAX = 6;             // R217: + shrink, chain, stretch around 2 passes
+        static const unsigned EV_ROLES = 19;      // R216: + shrink, stretch, crop, cut, SR; R217: chain
         ID3D12QueryHeap *evheap = nullptr;
         ID3D12Resource *evread = nullptr;
         bool ev_ok = false;
@@ -10027,13 +10332,6 @@ namespace
                        *psync_out = nullptr,   // separate destination when both ping-pong textures are live
                        *nr_final = nullptr, *nr_read = nullptr;
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT nr_fp{};   // the 64x4 liveness sample
-        // Dynamic 1.5: four 32x32 motion-vector tiles share nr_read's tail.
-        // They are read after the frame's existing fence, never with a new wait.
-        D3D12_PLACED_SUBRESOURCE_FOOTPRINT dyn15_fp{};
-        unsigned long long dyn15_sample_frame = ~0ull;
-        unsigned long long dyn15_samples = 0, dyn15_forced_motion = 0, dyn15_forced_guard = 0;
-        float dyn15_mean = 0.0f, dyn15_p90 = 0.0f;
-        bool dyn15_valid = false, dyn15_risky = false;
         unsigned char nr_prev[1024] = {};
         bool nr_have_prev = false;
         unsigned long long nr_evals = 0, nr_fails = 0, nr_same = 0;
@@ -10059,7 +10357,7 @@ namespace
         // One initialiser per pass. This list is sized by MAX_PASSES and an
         // over-long list is a compile error, which is the intended behaviour:
         // it forces this line to be revisited whenever the bound moves.
-        float intensity[MAX_PASSES] = { 0.84f, 0.84f };
+        float intensity[MAX_PASSES] = { 0.84f, 0.84f, 0.84f, 0.84f };
 
         // ---- P8.0: DLSSNR.MVec - the half of the model's contract that has
         // never been fed ----
@@ -10138,6 +10436,64 @@ namespace
         // Made atomic, they need no lock at all, and the small mutex below is
         // left with exactly one job.
         std::atomic<unsigned char> mvec_slot_valid[RING] = {};
+        // ---- R331 (MVecSealValid=1): VALIDITY DECIDED WITH THE SEAL, NOT READ LIVE ----
+        //
+        // After davidm71's FIX5 / OPT4 (his fork, 2026-10). The live flags above
+        // are armed at zero for the NEXT frame one game frame before the slot is
+        // rewritten, so a consumer that is behind can read "no vectors" for a
+        // slot whose seal said they were there (he measured 4% of evaluates in
+        // one run; [R78] flag disagreements counts it here). The tag below is
+        // written at the SAME instant as seal.mvec_valid / seal.depth_valid,
+        // from the same read, and only changes when the slot is sealed for a
+        // new frame - so "tag == f" means exactly "frame f's lane is in this
+        // slot". With the copy queue the unpack is decided one poll before the
+        // bind, so cq_*_ok records what was ACTUALLY copied for each parity and
+        // the bind and both barriers read that one decision (OPT4).
+        // Key absent: seal_valid_on == 0 and every reader below takes the live
+        // flag exactly as before; the two stores on the seal are the only new
+        // instructions, and nothing reads them.
+        unsigned seal_valid_on = 0;                                   // ini MVecSealValid
+        // R331b (suite runs L1s / L2, 2026-11-07): the tag ring is TWICE the data ring and indexed by FRAME, not by
+        // slot. With StageCopy=1 the slot's bytes land when GPU 0's copy queue finishes the DMA, up to RING-2 frames
+        // behind the CPU in a menu (the back-pressure bound), while the CPU keeps sealing - so a RING-deep tag indexed
+        // by slot was overwritten by f+RING before the consumer bound f, and 465 frames whose depth WAS frame f's
+        // (the seal checker saw no lapped slot) were refused. Whether the DATA was lapped stays with the seal checker.
+        static const unsigned TAG_RING = 2u * RING;
+        std::atomic<unsigned long long> mvec_slot_frame[TAG_RING] = {};  // frame whose vectors the slot held when sealed, by (f-1) % TAG_RING; 0 = none
+        std::atomic<unsigned long long> depth_slot_frame[TAG_RING] = {}; // same for depth
+        unsigned char cq_mvec_ok[2] = {}, cq_depth_ok[2] = {};        // what stream_cq_submit copied into parity ii
+        // R331a (fix phase 1b): the lane decision of the frame the consumer EVALUATES, sampled where the bind
+        // is decided, so seal_consume compares the seal against what was bound - not against a tag read up to
+        // one evaluate later (at 385 game fps the slot has been re-tagged by then; the old compare over-counted
+        // under lag and compared skipped frames too). `retag` counts a seal that said valid while the slot's tag
+        // had already moved on to a later frame when the bind was decided: the ring-edge case.
+        unsigned char r331_bind_depth[2] = {}, r331_bind_mvec[2] = {};
+        unsigned long long r331_cmp = 0ull, r331_depth_dis = 0ull, r331_mvec_dis = 0ull;
+        unsigned long long r331_depth_retag = 0ull, r331_mvec_retag = 0ull, r331_report_at = 0ull;
+        // ---- R343 (0.5.0 fix phase 1b): LateLatch - Dave's OPT2 (davidm71, MIT fork, permission 2026-10-21),
+        // our code from his design. Key `LateLatch=1` (absent = today, byte-identical), `LateLatchAge` 0-4.
+        // The newest-only rule means the frame evaluated next is whichever arrived last, which the f+1 prefetch
+        // cannot know. Near the END of the current evaluate (estimated from the last frame's GPU timestamps)
+        // the newest ARRIVED frame is copied on the copy queue into the tex_in half this evaluate is not
+        // reading, so its unpack overlaps the evaluate's tail; the next poll evaluates THAT frame if it is at
+        // most ll_age frames older than the newest arrival. Halves are assigned explicitly (his FIX6): a copy
+        // goes into the half the current evaluate is NOT reading, whatever the frame's parity - the parity
+        // scheme could only latch 1 or 3 frames ahead (a 1,3,1,3 cadence). Key absent: ii == f & 1 everywhere,
+        // the walk from cq_issued+1 as today; half_frame / eval_half are written and never read.
+        unsigned ll_on = 0u, ll_age = 2u;
+        unsigned long long ll_pending = 0ull;                // frame latched for the next poll (0 = none)
+        double ll_list_ms = 0.0, ll_copy_ms = 0.0;          // last direct-list GPU ms (all marks); last copy-queue unpack ms
+        unsigned long long ll_issued = 0ull, ll_hits = 0ull, ll_stale = 0ull, ll_early = 0ull, ll_refused = 0ull;
+        unsigned long long half_frame[2] = {0ull, 0ull};     // which frame each tex_in half holds (FIX6)
+        unsigned eval_half = 0u;                             // the half the current evaluate reads (FIX6)
+        unsigned long long ll_report_at = 0ull;
+        // ---- R344 (0.5.0 fix phase 1b): RingEdgeProbe=1 - the instrument that sizes the ring-edge case ----
+        // At the evaluated frame's copy decision: how many frames the PRODUCER (CPU seal count, produced_a) is
+        // past the frame being copied. RING is 6: at 5+ the slot's tag has moved on and at 6+ its bytes are being
+        // rewritten. Histogram 0..7+ and, per bucket, the frames that then went without depth / vectors.
+        // Decides the fix (a deeper ring, or copy timing = LateLatch) from numbers; changes nothing itself.
+        unsigned re_on = 0u;
+        unsigned long long re_hist[8] = {}, re_nodepth[8] = {}, re_nomvec[8] = {}, re_report_at = 0ull;
 
         std::atomic<unsigned long long> mvec_copies{0}, mvec_missing{0};
         std::atomic<unsigned long long> mvec_copies_tap{0};   // R280o: the subset of mvec_copies made by the R277 tap
@@ -10204,6 +10560,43 @@ namespace
         bool swapguard_said = false;
         unsigned long long mvec_arm_waits = 0;
         unsigned long long mvec_hold = 1800ull;   // R234: MVecHold - frames the arm holds for vectors on a path that has none yet
+        // ---- R336 (0.5.0 discovery): the D3D12 vector hold gets a bound, and a late-DLSS probe ----
+        //
+        // On D3D12 the R78 hold has no bound (the [R236] line says so): a title that runs
+        // DLSS without creating its feature until a menu toggle (Nymphomaniac: held 22,800
+        // frames, run 1; the SR toggle armed it with the game's vectors, run 2;
+        // MVecStepAside=1 armed it on the zero field, run 3) shows ARMING forever.
+        // MVecHoldD3D12=N: after N held frames with no handle and no NGX contract seen,
+        // arm on the zero field exactly as MVecStepAside=1 does, say why, and run NR.
+        // MVecLateProbe=1: after that arm, when the game does create DLSS later, log what
+        // it declares (handle, buffers, extents) - a probe, no switch; what these titles
+        // declare is the discovery. Both absent: the hold as shipped, byte-identical.
+        unsigned long long mvec_hold_d3d12 = 0ull;   // frames; 0 = no bound (today)
+        unsigned late_probe_on = 0u;                 // MVecLateProbe
+        // R338: MVecLatchOffset=k - the consumer binds the vectors of frame f-k to frame f's colour (0 = today,
+        // byte-identical). latch_k is the LIVE value (the StrobeCalib stepper moves it); latch_k_ini the key.
+        unsigned latch_k = 0u, latch_k_ini = 0u;
+        unsigned long long latch_applied = 0ull, latch_overruns = 0ull;   // overrun: slot f-k already rewritten -> bound f
+        // R338a (review F5): the latched (slot, frame) the vectors of parity ii were taken from, decided ONCE
+        // (stream_cq_submit on the copy-queue path, stream_poll otherwise) and read by every gate of that
+        // frame - the forward barrier, the bind and the barrier back - so no gate can disagree with the copy.
+        unsigned r338_slot_ii[2] = {}; unsigned long long r338_f_ii[2] = {};
+        // R338: StrobeCalib=1 - the stepper over the live flicker levers and the output/input strip readback.
+        unsigned sc_on = 0u, sc_hold_s = 8u;
+        ID3D12Resource *sc_read = nullptr;          // READBACK: two 64x64 boxes (output, input)
+        D3D12_PLACED_SUBRESOURCE_FOOTPRINT sc_fp_out{}, sc_fp_in{};
+        unsigned sc_pitch = 0u, sc_bytes = 0u;       // one box: pitch x 64 rows
+        unsigned char *sc_prev = nullptr;            // last frame's two boxes (heap, 2 x sc_bytes)
+        bool sc_have_prev = false, sc_done = false, sc_said = false;
+        unsigned sc_step = 0u, sc_n = 0u, sc_rest_n = 0u;
+        LARGE_INTEGER sc_t0{};
+        double sc_out_sum = 0.0, sc_in_sum = 0.0, sc_rest_out_sum = 0.0;
+        int sc_pr0 = 0, sc_ff0 = 0;                  // the launch values, restored at the end
+        struct sc_result { unsigned k; int pr, ff; double out_mean, in_mean, rest_out; unsigned n, rest_n; };
+        sc_result sc_res[12] = {};
+        unsigned sc_res_n = 0u;
+        bool r336_fired = false;                     // the bound armed this session on the zero field
+        bool r336_probe_said = false;                // the late-DLSS line printed once
         unsigned long long mvec_hold_said = 0;    // R236: the hold reports every 600 held frames
         bool   mvec_arm_logged = false;
         // ---- R99: the arm waits for the probe to STOP CHANGING ITS MIND ----
@@ -10248,6 +10641,11 @@ namespace
         // ELIMINATED and the remaining answer is units or sign. If it is not
         // flat, there is a desync no counter has shown us.
         unsigned long long nr_last_eval_fi = 0;
+        // Last SUCCESSFUL FINAL neural output for native-input history. Unlike
+        // nr_last_eval_fi, a failed evaluate never advances this anchor.
+        unsigned long long native_last_output = 0;
+        // Advances only when capture was requested for THIS exact colour seal.
+        unsigned long long native_last_bound = 0;
         unsigned long long mvec_elapsed_hist[8] = {};   // [0]=1 frame .. [7]=8+
         unsigned long long mvec_elapsed_max = 0;
 
@@ -10357,15 +10755,6 @@ namespace
         // conditionally like tex_in, because 5.76 MB on a 16 GB card is not
         // worth a mode-dependent allocation path that can only ever be wrong.
         ID3D12Resource *tex_depth[2] = {};
-
-        // A logical, same-source-frame snapshot for the optional output-side FG.
-        // Each present fence protects the AMD colour/MV parity selected for that
-        // present; game depth/MV are NR-only and are not consumed by XeSS-FG.
-        mgpu::xessfg::frame_inputs xess_inputs{};
-        LARGE_INTEGER xess_snapshot_qpc{};
-        unsigned long long xess_capture_last = 0;
-        int xess_pending_slot = -1;
-        UINT64 xess_present_value[2] = {};
 
         // Producer to consumer, same process, under the same mutex. The SEAL
         // remains the authority - it is what crosses the adapter - and the
@@ -10523,6 +10912,9 @@ namespace
         float skin_strength      = 1.0f;
         float style              = 0.0f;
         bool  auto_mask          = false;
+        // FaceMaskStrength is a separate product control from SkinStrength.
+        // UseAutoMask stays on for every pass, even at zero face strength.
+        float face_mask_strength = 0.30f;
         bool intensity_set[MAX_PASSES] = {};   // was it named per pass in the ini?
         // P6.3: 0 = every pass, 1..MAX_PASSES = that pass alone. Bridge thread
         // only - the hotkey is delivered to the bridge thread's message queue
@@ -10594,6 +10986,18 @@ namespace
         // against the chain, and the chain is now resized to the same twin.
         w = s.width; h = s.height; fmt = nr_linear_format(s.format);
 
+        // FG's caller owns a final-colour copy or an interpolated output. Never
+        // substitute an intermediate NR texture while that override is active.
+        if (t_fg_src != nullptr)
+        {
+            const D3D12_RESOURCE_DESC actual = t_fg_src->GetDesc();
+            if (actual.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+                actual.Width == 0 || actual.Height == 0) return nullptr;
+            w = (UINT)actual.Width; h = actual.Height; fmt = actual.Format;
+            rest = t_fg_rest;
+            return t_fg_src;
+        }
+
         // P5.3, the discriminator. Present=in shows the frame we HANDED to
         // DLSS-NR instead of the frame it produced - same adapter, same
         // texture format, same crop, same present path, one resource
@@ -10626,175 +11030,7 @@ namespace
         // Passes=1 nr_final is tex_out and this is the P5 behaviour exactly.
         if (s.nr_final == nullptr) return nullptr;
         rest = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-        // The selected colour, its AMD motion and its source-frame number are
-        // one snapshot. In particular, "previous" must not use the latest MV.
-        mgpu::amd_of::capture_result selected{};
-        if (mgpu::amd_of::present(selected) && selected.color != nullptr)
-        {
-            rest = selected.color_state;
-            return selected.color;
-        }
         return s.nr_final;
-    }
-
-    // The colour and AMD motion resource must describe one consumed frame.
-    // frameRenderTime is the interval between complete source presentations,
-    // never the interval between two NR evaluations on a cadence-hold path.
-    mgpu::xessfg::frame_inputs stream_xess_inputs(ID3D12Resource *color)
-    {
-        static unsigned long long matched = 0, mismatched = 0;
-        stream_state &s = str();
-        std::lock_guard<std::mutex> lk(s.cs);
-        s.xess_pending_slot = -1;
-        mgpu::amd_of::capture_result selected{};
-        const bool have_selected = mgpu::amd_of::present(selected);
-        // Native presents still copy an AMD colour. Track that slot even when
-        // FG is off or deliberately bypassed, or its next reuse can race the copy.
-        if (have_selected && color == selected.color && selected.input_slot < 2u)
-            s.xess_pending_slot = (int)selected.input_slot;
-        if (!mgpu::xessfg::active()) return {};
-        if (have_selected && color == selected.color && !selected.flow_valid)
-            return {}; // Deliberate native presentation, not a handoff mismatch.
-        if (color == nullptr || s.xess_inputs.color != color)
-        {
-            s.xess_snapshot_qpc = {};
-            ++mismatched;
-            if (mismatched <= 3u || mismatched % 120ull == 0ull)
-            {
-                char line[400];
-                snprintf(line, sizeof line,
-                         "[MGPU][XESS-HANDOFF] mismatch presented=%p snapshot=%p source=%llu mv=%p; total=%llu",
-                         (void *)color, (void *)s.xess_inputs.color, s.xess_inputs.source_frame,
-                         (void *)s.xess_inputs.motion, mismatched);
-                mgpu::diag::warn(line);
-            }
-            return {};
-        }
-        mgpu::xessfg::frame_inputs out = s.xess_inputs;
-        // The INI mirror is thread-safe and reflects the panel immediately.
-        // The proxy stays alive when OFF; xess_fg presents one native frame.
-        out.generation_requested = ui_ini_read("XeSSFG", 0) != 0;
-        out.interpolated_frames = 1u;
-        LARGE_INTEGER now{}, freq{};
-        QueryPerformanceCounter(&now);
-        QueryPerformanceFrequency(&freq);
-        out.render_ms = 16.6667f;
-        if (s.xess_snapshot_qpc.QuadPart != 0 && freq.QuadPart != 0)
-        {
-            const double ms = double(now.QuadPart - s.xess_snapshot_qpc.QuadPart) *
-                              1000.0 / double(freq.QuadPart);
-            if (ms > 0.0 && ms < 1000.0) out.render_ms = float(ms);
-        }
-        s.xess_snapshot_qpc = now;
-        if (out.input_slot < 2u) s.xess_pending_slot = (int)out.input_slot;
-        ++matched;
-        if (matched <= 3u || matched % 300ull == 0ull)
-        {
-            char line[240];
-            snprintf(line, sizeof line,
-                     "[MGPU][XESS-HANDOFF] matched source=%llu slot=%u render_ms=%.3f; total=%llu",
-                     out.source_frame, out.input_slot, (double)out.render_ms, matched);
-            mgpu::diag::info(line);
-        }
-        return out;
-    }
-
-    // Called after the proxy Present and the queue Signal. This fence covers
-    // both resource tagging/copies and XeSS work submitted inside Present.
-    void stream_xess_present_signalled(ID3D12Fence *, UINT64 value)
-    {
-        stream_state &s = str();
-        std::lock_guard<std::mutex> lk(s.cs);
-        if (s.xess_pending_slot >= 0 && s.xess_pending_slot < 2)
-        {
-            s.xess_present_value[s.xess_pending_slot] = value;
-            s.xess_pending_slot = -1;
-        }
-    }
-
-    // GPU-side gate only, no CPU sleep. It is required even for native presents:
-    // their backbuffer copy can still be reading the AMD colour in this slot.
-    bool stream_xess_gate_reuse(stream_state &s, unsigned input_slot,
-                                ID3D12CommandQueue *queue)
-    {
-        if (queue == nullptr || input_slot >= 2u) return true;
-        const UINT64 value = s.xess_present_value[input_slot];
-        if (value == 0) return true;
-        ID3D12Fence *fence = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(st().cs);
-            fence = st().fence;
-        }
-        if (fence == nullptr || fence->GetCompletedValue() >= value) return true;
-        return SUCCEEDED(queue->Wait(fence, value));
-    }
-
-    // Stabilise the same-size NR colour, then seal AMD colour-flow motion and a
-    // constant synthetic depth for XeSS-FG. Game depth/MV remain NR-only inputs;
-    // their presence is logged for diagnostics but is not an FG prerequisite.
-    void stream_capture_xess(stream_state &s, unsigned long long f, unsigned ii,
-                             bool colour_ok, bool depth_now, bool mvec_now)
-    {
-        static unsigned long long captured = 0, rejected = 0;
-        s.xess_inputs = {};
-        auto reject = [&](int reason)
-        {
-            s.xess_snapshot_qpc = {};
-            ++rejected;
-            if (rejected <= 3u || rejected % 120ull == 0ull)
-            {
-                char line[400];
-                snprintf(line, sizeof line,
-                         "[MGPU][XESS-CAPTURE] rejected f=%llu slot=%u reason=%d colour_ok=%d game_depth=%d game_mv=%d; total=%llu",
-                         f, ii, reason, colour_ok ? 1 : 0, depth_now ? 1 : 0, mvec_now ? 1 : 0, rejected);
-                mgpu::diag::warn(line);
-            }
-        };
-        if (!colour_ok || s.nr_final == nullptr)
-        {
-            if (mgpu::xessfg::active()) reject(1);
-            return;
-        }
-        // The AMD write parity owns both colour and dense motion. Wait on the
-        // present queue before recording any command that can overwrite either.
-        if (!stream_xess_gate_reuse(s, ii & 1u, s.nq))
-        {
-            reject(4);
-            return;
-        }
-        const bool reset = s.xess_capture_last == 0 || f != s.xess_capture_last + 1ull;
-        s.xess_capture_last = f;
-        mgpu::amd_of::capture_result of{};
-        if (!mgpu::amd_of::capture(s.nl, s.nr_final, f, ii, reset, of) || of.color == nullptr)
-        {
-            if (mgpu::xessfg::active()) reject(2);
-            return;
-        }
-        if (!mgpu::xessfg::active()) return;
-        if (!of.flow_valid || of.motion == nullptr)
-            return; // AMD failure is logged there; current-frame native mode is intentional.
-        s.xess_inputs.color = of.color;
-        s.xess_inputs.motion = of.motion;
-        s.xess_inputs.motion_state = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-        s.xess_inputs.motion_width = of.width;
-        s.xess_inputs.motion_height = of.height;
-        // AMD OF is current-to-previous in source-pixel units, the same
-        // convention XeSS-FG documents. Full-resolution flow needs no rescale.
-        s.xess_inputs.motion_scale_x = 1.0f;
-        s.xess_inputs.motion_scale_y = 1.0f;
-        s.xess_inputs.source_frame = of.source_frame;
-        s.xess_inputs.input_slot = of.input_slot;
-        s.xess_inputs.reset_history = of.reset_history;
-        ++captured;
-        if (captured <= 3u || captured % 300ull == 0ull)
-        {
-            char line[400];
-            snprintf(line, sizeof line,
-                     "[MGPU][XESS-CAPTURE] sealed capture=%llu selected=%llu slot=%u colour=%p AMD_mv=%p; AMD-flow-only, no depth supplied; total=%llu",
-                     f, of.source_frame, of.input_slot, (void *)s.xess_inputs.color,
-                     (void *)s.xess_inputs.motion, captured);
-            mgpu::diag::info(line);
-        }
     }
 
     // P7.4. THE LEFT HALF OF A SPLIT PRESENT.
@@ -10817,6 +11053,7 @@ namespace
         // frame; a split would draw the same picture twice with a seam.
         if (!s.neural) return nullptr;
         if (!s.nr_ok || s.profile) return nullptr;
+        if (t_fg_src != nullptr) return nullptr;   // R341: no split on a paced frame
         if (s.tex_in_show == nullptr || s.nr_final == nullptr) return nullptr;
         rest = s.tex_in_rest;   // R26, see stream_present_source
         pos = s.split_pos;
@@ -11073,8 +11310,8 @@ namespace
 
         char l[420];
         snprintf(l, sizeof l,
-                 "[MGPU][P7.2] mgpu.ini %s: %s (%s). Runtime setters apply live settings; "
-                 "arm-only settings take effect next launch. Check the feature's own status/log line.",
+                 "[MGPU][P7.2] mgpu.ini %s: %s (%s). THIS DOES NOT CHANGE THE RUNNING SESSION - "
+                 "the key is read at arm, so it takes effect on the next launch.",
                  ok ? "written" : "WRITE FAILED", line_new,
                  replaced ? "replaced in place" : "appended, the key was absent");
         if (ok) mgpu::diag::info(l); else mgpu::diag::error(l);
@@ -11342,6 +11579,17 @@ namespace
         return (k != nullptr) && (*k == '1');
     }
 
+    // Yihuan SkinGuard: 0 off, 1 masked blend; 2..7 retain the old diagnostics.
+    int ini_read_skinguard_mode()
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return 0;
+        const char *k = ini_find(buf, "SkinGuard");
+        if (k == nullptr) return 0;
+        const int v = std::atoi(k);
+        return (v >= 0 && v <= 7) ? v : 0;
+    }
+
     // R212. Pass2Region=<percent of the frame's AREA, 10-99>. Absent, 100 or
     // out of range: 0, off.
     unsigned ini_read_pass2_region()
@@ -11431,7 +11679,7 @@ namespace
             char l[420];
             snprintf(l, sizeof l,
                      "[MGPU][P7.7] mgpu.ini asked for Passes=%lld - CLAMPED to %u, the build "
-                     "maximum. Three or more passes exceed the frame period on the hardware "
+                     "maximum. More passes than that exceed the frame period on the hardware "
                      "this was measured on, so the second GPU clamps at its power limit and "
                      "each further pass is served on throttled clocks - it buys latency, not "
                      "picture. The bound is a power decision and is enforced here, not in the "
@@ -11440,11 +11688,18 @@ namespace
             mgpu::diag::warn(l);
             return stream_state::MAX_PASSES;
         }
+        if (v > 2)   // R350: 3 / 4 exist, as Experimental
+        {
+            char l[300];
+            snprintf(l, sizeof l,
+                     "[MGPU][R350] Passes=%lld (Experimental): %lld pass features are built at arm. Three or "
+                     "more passes hold the second GPU at its power limit; x1 / x2 are unchanged by this.", v, v);
+            mgpu::diag::warn(l);
+        }
         return (unsigned)v;
     }
 
-    // [OURS] NRCadence=1 | 15 (fixed two evaluates per three frames).
-    // Retired 2/4, adaptive 1.5 and fixed 1.3 modes use the every-frame path.
+    // [OURS] NRCadence=1 | 2 | 4. Anything else falls back to the shipped every-frame path.
     unsigned ini_read_cadence()
     {
         char buf[INI_BYTES];
@@ -11452,12 +11707,12 @@ namespace
         const char *k = ini_find(buf, "NRCadence");
         if (k == nullptr) return 1u;
         const long long v = atoll(k);
-        if (v == 15) return 15u;
+        if (v == 2 || v == 4) return (unsigned)v;
         if (v != 1)
         {
             char l[220];
             snprintf(l, sizeof l,
-                     "[MGPU][NRCADENCE] mgpu.ini asked for NRCadence=%lld; valid values are 1 and 15 (fixed 1.5-frame average). Using 1.", v);
+                     "[MGPU][NRCADENCE] mgpu.ini asked for NRCadence=%lld; valid values are 1, 2 and 4. Using 1.", v);
             mgpu::diag::warn(l);
         }
         return 1u;
@@ -11472,6 +11727,8 @@ namespace
         float base = 0.84f;
         const char *k = ini_find(buf, "Intensity");
         if (k != nullptr) base = (float)atof(k);
+        if (base < 0.0f) base = 0.0f;
+        if (base > 3.0f) base = 3.0f;
         for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) out[i] = base;
 
         unsigned named_n = 0;
@@ -11480,7 +11737,14 @@ namespace
             char key[32];
             snprintf(key, sizeof key, "Intensity%u", i + 1);
             const char *p2 = ini_find(buf, key);
-            if (p2 != nullptr) { out[i] = (float)atof(p2); named[i] = true; ++named_n; }
+            if (p2 != nullptr)
+            {
+                out[i] = (float)atof(p2);
+                if (out[i] < 0.0f) out[i] = 0.0f;
+                if (out[i] > 3.0f) out[i] = 3.0f;
+                named[i] = true;
+                ++named_n;
+            }
         }
         return named_n;
     }
@@ -11678,7 +11942,7 @@ namespace
         if (k == nullptr) return 0;
         if (*k < '0' || *k > '9') return 0;
         const int v = atoi(k);
-        return (v == 0 || v == 1) ? v : 0;
+        return (v == 0 || v == 1 || v == 2) ? v : 0;   // 2 = after this frame's submission
     }
 
     int ini_read_sr_int(const char *key, int dflt, int lo, int hi)
@@ -11893,13 +12157,34 @@ namespace
     }
 
     void stream_release();
+    void local_nr_release();
 }   // R311c: forward declaration for stream_release's drain call (r309 is defined after it)
 namespace r309 { namespace r311c { void drain(stream_state &s); } }
+static void r343_timer_close();   // R343: defined beside stream_cq_submit (file scope); closed in stream_release
 namespace {
     void stream_release()
     {
         stream_state &s = str();
+        // stop() was called WITHOUT s.cs by the owner. Drain FG's neural work
+        // before releasing any queue, shared heap or final-colour texture.
+        mgpu::fg::release();
+        s.native_last_output = 0;
+        s.native_last_bound = 0;
+        if (s.local_nr)
+        {
+            s.local_nr_cpu_stop.store(true, std::memory_order_release);
+            if (s.local_nr_cpu_event != nullptr) SetEvent(s.local_nr_cpu_event);
+        }
         r309::r311c::drain(s);   // R311c: a probe scoring on the probe thread must leave the readbacks before they are released
+        if (s.local_nr && s.local_nr_consumed_n != nullptr)
+        {
+            // The producer has stopped. Release a game-queue wait whose target
+            // would otherwise need one more game frame to become satisfiable.
+            const unsigned long long target = s.local_nr_wait_target.load(std::memory_order_acquire);
+            if (target != 0 && s.local_nr_consumed_n->GetCompletedValue() < (UINT64)target)
+                (void)s.local_nr_consumed_n->Signal((UINT64)target);
+        }
+        if (s.local_nr) local_nr_release(); // retire GPU0's pending ninput wait before any shared resource is freed
 
         // ---- R26: DRAIN THE COPY QUEUE BEFORE ANYTHING IT REFERENCES IS
         // FREED ----
@@ -11989,12 +12274,14 @@ namespace {
         if (s.ds_rs   != nullptr) { s.ds_rs->Release();   s.ds_rs   = nullptr; }
         if (s.ds_heap != nullptr) { s.ds_heap->Release(); s.ds_heap = nullptr; }
         mgpu::nr16::release();   // R208: same point, same reason
+        mgpu::mvecex::release(); // expanded motion textures, after the NGX handles
         mgpu::residual::release();   // R316: same point, same reason
+        mgpu::skinguard::release();  // Yihuan character guard, after the GPU drain
         mgpu::pfinish::release();   // PRISM-FINISH: same point, same reason
         mgpu::psync::release();     // PSYNC: before the stream textures and device
-        mgpu::prism_carry::release(); // CARRY: after the same drain, before PX1 and the device
-        mgpu::prism_x1::release();  // PX1: after the stream drain, before its textures
-        mgpu::amd_of::release();    // Same-size colour/AMD OF: after the drain, before its textures
+        mgpu::pwarp::release();     // PWARP: owned output/history, after the GPU drain
+        mgpu::prism_x1m::release_all(); // PX1: all per-pass history/coefficients after the drain
+        mgpu::ensemble::release();      // three-pass snapshot/output, after the GPU drain
         // R216: same point, same reason.
         if (s.vr_pso_g != nullptr) { s.vr_pso_g->Release(); s.vr_pso_g = nullptr; }
         if (s.vr_pso   != nullptr) { s.vr_pso->Release();   s.vr_pso   = nullptr; }
@@ -12016,6 +12303,7 @@ namespace {
         if (s.nrs_pso_res  != nullptr) { s.nrs_pso_res->Release();  s.nrs_pso_res  = nullptr; }
         if (s.nrs_rs_down  != nullptr) { s.nrs_rs_down->Release();  s.nrs_rs_down  = nullptr; }
         if (s.nrs_rs_res   != nullptr) { s.nrs_rs_res->Release();   s.nrs_rs_res   = nullptr; }
+        if (s.nrs_pso_opaque != nullptr) { s.nrs_pso_opaque->Release(); s.nrs_pso_opaque = nullptr; }
         if (s.nrs_heap     != nullptr) { s.nrs_heap->Release();     s.nrs_heap     = nullptr; }
         if (s.nrs_color    != nullptr) { s.nrs_color->Release();    s.nrs_color    = nullptr; }
         if (s.nrs_out      != nullptr) { s.nrs_out->Release();      s.nrs_out      = nullptr; }
@@ -12029,14 +12317,11 @@ namespace {
         if (s.sr_depth  != nullptr) { s.sr_depth->Release();  s.sr_depth  = nullptr; }
         if (s.sr_nrout  != nullptr) { s.sr_nrout->Release();  s.sr_nrout  = nullptr; }
         if (s.sr_expose != nullptr) { s.sr_expose->Release(); s.sr_expose = nullptr; }
-        s.xess_inputs = {};
-        s.xess_snapshot_qpc = {};
-        s.xess_capture_last = 0;
-        s.xess_pending_slot = -1;
-        s.xess_present_value[0] = s.xess_present_value[1] = 0;
         s.nr_final = nullptr;   // borrowed; released with its owning stream texture
         if (s.psync_out != nullptr) { s.psync_out->Release(); s.psync_out = nullptr; }
         if (s.nr_read != nullptr) { s.nr_read->Release(); s.nr_read = nullptr; }
+        if (s.sc_read != nullptr) { s.sc_read->Release(); s.sc_read = nullptr; }   // R338
+        free(s.sc_prev); s.sc_prev = nullptr;
         // P8.0, before the textures it describes.
         if (s.mvec_up != nullptr && s.mvec_cpu != nullptr) { s.mvec_up->Unmap(0, nullptr); }
         s.mvec_cpu = nullptr;
@@ -12077,6 +12362,8 @@ namespace {
         s.cq_gated = false;
         s.cqa_value[0] = 0;
         s.cqa_value[1] = 0;
+        s.ll_pending = 0ull; s.half_frame[0] = s.half_frame[1] = 0ull; s.eval_half = 0u;   // R343
+        r343_timer_close();                                                               // R343
         s.cq_ts_ok = false;
         if (s.nev != nullptr) { CloseHandle(s.nev); s.nev = nullptr; }
         if (s.nf  != nullptr) { s.nf->Release();  s.nf = nullptr; }
@@ -12140,6 +12427,12 @@ namespace {
         // and if it ever hits the bound the add-on writes DrainGpu0=0 and
         // DrainGpu0Off=<reason> to mgpu.ini and skips the drain on later
         // launches - one slow exit, then never again, with the reason on file.
+        s.sig_fence.store(nullptr, std::memory_order_seq_cst);
+        while (s.sig_inflight.load(std::memory_order_seq_cst) != 0u) std::this_thread::yield();
+        {
+            const unsigned long long sig_last = s.sig_gsignaled.exchange(0ull);
+            if (sig_last > s.gsignaled) s.gsignaled = sig_last;
+        }
         {
             const unsigned long long drain_to = s.gsignaled;
             if (!s.drain_on)
@@ -12206,9 +12499,18 @@ namespace {
             std::lock_guard<std::mutex> mlk(s.mvec_cs);
             s.mvec_live.store(false, std::memory_order_release);
         }
+        mgpu::stage::release();   // R333: drains the GPU 0 copy queue that writes gxfer, before gxfer goes
         if (s.gxfer != nullptr) { s.gxfer->Release(); s.gxfer = nullptr; }
         if (s.gheap != nullptr) { s.gheap->Release(); s.gheap = nullptr; }
         if (s.gshare!= nullptr) { CloseHandle(s.gshare); s.gshare = nullptr; }
+        if (s.local_nr_cpu_event != nullptr) { CloseHandle(s.local_nr_cpu_event); s.local_nr_cpu_event = nullptr; }
+        if (s.local_nr_consumed_g != nullptr) { s.local_nr_consumed_g->Release(); s.local_nr_consumed_g = nullptr; }
+        if (s.local_nr_consumed_n != nullptr) { s.local_nr_consumed_n->Release(); s.local_nr_consumed_n = nullptr; }
+        if (s.local_nr_consumed_share != nullptr) { CloseHandle(s.local_nr_consumed_share); s.local_nr_consumed_share = nullptr; }
+        s.game_queue = nullptr;
+        s.local_nr_wait_target.store(0, std::memory_order_release);
+        s.local_nr_gated_through = 0;
+        s.local_nr_cpu_gated_through = 0;
         s.gdev = nullptr;
         s.ndev_b = nullptr;   // borrowed
         s.armed = false;
@@ -13684,7 +13986,14 @@ namespace
         D3D12_GPU_DESCRIPTOR_HANDLE gh = s.cv_heap->GetGPUDescriptorHandleForHeapStart();
         gh.ptr += (UINT64)(ii * 5u) * s.cv_inc;
         s.nl->SetComputeRootDescriptorTable(0, gh);
-        const float sc[2] = { s.mvec_scale_x, s.mvec_scale_y };
+        // The transported Lumenite values remain FULL-SIZE pixel displacements,
+        // but this chain walks the LOW-RES source grid. Convert only the lookup
+        // step to source texels; the accumulated output stays in full-size pixels
+        // for DLSS-NR. At the original full-size tap both ratios are exactly 1.
+        const float sc[2] = {
+            s.mvec_scale_x * ((float)s.mvec_w / (float)s.width),
+            s.mvec_scale_y * ((float)s.mvec_h / (float)s.height)
+        };
         UINT c[8] = {};
         memcpy(&c[0], sc, sizeof sc);
         c[2] = s.mvec_w; c[3] = s.mvec_h; c[4] = n;
@@ -13818,7 +14127,12 @@ namespace
 
         D3D12_DESCRIPTOR_HEAP_DESC hd{};
         hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-        hd.NumDescriptors = 8;          // downsample 2 + resolve 5, room to spare
+        // R365: ONE RANGE PER PASS. With NRSPass=2 (R354) passes 1..N are recorded into the same command list
+        // and the GPU reads this shader-visible heap at EXECUTION time, so slots shared between passes hold the
+        // LAST pass's descriptors when the first pass runs - the 2026-10-11 defect one level up (E13, Cyberpunk
+        // x3 NRScale: black screen, 0 errors). Keep downsample (0..1), resolve (2..6)
+        // and post pass (8..9) disjoint for the whole recorded command list.
+        hd.NumDescriptors = 10u * stream_state::MAX_PASSES;
         hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
         const HRESULT hr = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.nrs_heap));
         if (FAILED(hr))
@@ -13834,17 +14148,21 @@ namespace
     static bool nrs_alloc(ID3D12Device *ndev, stream_state &s, char *line, size_t cap)
     {
         const DXGI_FORMAT fmt = (DXGI_FORMAT)s.format;
-        HRESULT hr = make_tex(ndev, s.nrs_w, s.nrs_h, fmt,
+        // R370: the scratch must hold the LARGEST per-pass work extent, not just the
+        // global one (each pass's NGX subrect is its own extent <= this size).
+        const unsigned sw = (s.nrs_sw != 0u && s.nrs_sw > s.nrs_w) ? s.nrs_sw : s.nrs_w;
+        const unsigned sh = (s.nrs_sh != 0u && s.nrs_sh > s.nrs_h) ? s.nrs_sh : s.nrs_h;
+        HRESULT hr = make_tex(ndev, sw, sh, fmt,
                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                               D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.nrs_color);
         if (SUCCEEDED(hr))
-            hr = make_tex(ndev, s.nrs_w, s.nrs_h, fmt,
+            hr = make_tex(ndev, sw, sh, fmt,
                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.nrs_out);
         if (FAILED(hr))
         {
             snprintf(line, cap, "[MGPU][OURS][NRS] scratch allocation failed 0x%08X (%ux%u fmt=%d)",
-                     (unsigned)hr, s.nrs_w, s.nrs_h, (int)fmt);
+                     (unsigned)hr, sw, sh, (int)fmt);
             return false;
         }
         return true;
@@ -13858,20 +14176,20 @@ namespace
     static void nrs_park_now(stream_state &s)
     {
         stream_state::nrs_parked_t entry{};
-        entry.h = s.nr_handle[0];
+        bool any_h = false;
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) { entry.h[i] = s.nr_handle[i]; any_h = any_h || (entry.h[i] != nullptr); s.nr_handle[i] = nullptr; }   // R342e
         entry.c = s.nrs_color;
         entry.o = s.nrs_out;
         entry.fence = (s.nf != nullptr) ? s.nf_value : 0ull;
-        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.nr_handle[i] = nullptr;
         s.nrs_color = nullptr;
         s.nrs_out = nullptr;
-        if (entry.h == nullptr && entry.c == nullptr && entry.o == nullptr) return;
+        if (!any_h && entry.c == nullptr && entry.o == nullptr) return;
         if (s.nrs_park_n >= stream_state::NRS_PARK_MAX)
         {
             // The list is full: free the oldest entry, which is the one most likely to be
             // long finished. This is the only path that frees without a fence.
             stream_state::nrs_parked_t &old = s.nrs_park[0];
-            if (old.h != nullptr && s.nr_release != nullptr) (void)s.nr_release(old.h);
+            for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) if (old.h[i] != nullptr && s.nr_release != nullptr) (void)s.nr_release(old.h[i]);   // R342e
             if (old.c != nullptr) old.c->Release();
             if (old.o != nullptr) old.o->Release();
             for (unsigned i = 1u; i < s.nrs_park_n; ++i) s.nrs_park[i - 1u] = s.nrs_park[i];
@@ -13890,7 +14208,7 @@ namespace
             stream_state::nrs_parked_t &e = s.nrs_park[i];
             if (done >= e.fence)
             {
-                if (e.h != nullptr && s.nr_release != nullptr) (void)s.nr_release(e.h);
+                for (unsigned k = 0; k < stream_state::MAX_PASSES; ++k) if (e.h[k] != nullptr && s.nr_release != nullptr) (void)s.nr_release(e.h[k]);   // R342e
                 if (e.c != nullptr) e.c->Release();
                 if (e.o != nullptr) e.o->Release();
             }
@@ -13915,13 +14233,11 @@ namespace
     // =====================================================================
     static bool nrs_live_resize_scratch(stream_state &s, char *line, size_t cap)
     {
-        mgpu::prism_carry::reset(); // low-size changes invalidate every launch-space edit coordinate
         if (s.nrs_color != nullptr || s.nrs_out != nullptr)
         {
             if (s.nrs_park_n < stream_state::NRS_PARK_MAX)
             {
-                stream_state::nrs_parked_t e{};
-                e.h = nullptr;                       // textures only: the feature is untouched
+                stream_state::nrs_parked_t e{};      // e.h[] all nullptr: textures only, the feature is untouched
                 e.c = s.nrs_color;
                 e.o = s.nrs_out;
                 e.fence = (s.nf != nullptr) ? s.nf_value : 0ull;
@@ -13956,6 +14272,108 @@ namespace
     // The keys are re-read on a timer in the evaluate path, so a sweep driver only has
     // to rewrite mgpu.ini - the same trick the proxy uses (its CheckConfigHotReload).
     // =====================================================================
+    // R361: the hint pass `i` is created with, given the live pass count.
+    static int r361_eff_preset(const stream_state &s, unsigned i, unsigned passes)
+    {
+        if (i == 0u && passes >= 2u && s.nr_preset1_x2 >= 0) return s.nr_preset1_x2;
+        return s.nr_preset_pass[i];
+    }
+
+    // R361: recreate pass 1's feature on the bridge thread (inside the open consume list, before the
+    // frame's evaluates), when a live x1 <-> x2 switch changed its effective network. The old handle is
+    // PARKED behind the stream fence (nrs_park_now's list, handle only) and released by nrs_tick_retired
+    // once the GPU has passed it - never freed on the spot (the 2026-10-12 freeze). Extent and bindings as
+    // the arm's create loop builds pass 1: the residual module's work extent and scratch when it carries
+    // pass 1, the NRScale scratch when that path is on, native otherwise.
+    // R363: recreate pass `i`'s feature with a new network hint, on the bridge thread (inside the open
+    // consume list, before the frame's evaluates). R361's pass-1 recreate generalised: the panel's network
+    // buttons now rebuild the pass LIVE (Marcelo 09:49) instead of waiting for a restart. The old handle is
+    // PARKED behind the stream fence (nrs_park_now's list, handle only) and released by nrs_tick_retired once
+    // the GPU has passed it - never freed on the spot (the 2026-10-12 freeze). Extent and bindings as the
+    // arm's create loop builds that pass: the NRScale scratch when that path carries it, the residual
+    // module's work extent and scratch when it carries it, pass 2's region when R212 is on, native otherwise.
+    static void r363_recreate_pass(stream_state &s, unsigned i, int want, const char *why, bool force = false)
+    {
+        if (i >= stream_state::MAX_PASSES || s.nr_cre_v == nullptr || s.nl == nullptr || s.nr_handle[i] == nullptr) return;
+        if (!force && want == s.nr_preset_built[i]) return;
+        LARGE_INTEGER fq{}, t0{}, t1{}; QueryPerformanceFrequency(&fq); QueryPerformanceCounter(&t0);
+        {
+            stream_state::nrs_parked_t entry{};
+            entry.h[i] = s.nr_handle[i];
+            entry.fence = (s.nf != nullptr) ? s.nf_value : 0ull;
+            s.nr_handle[i] = nullptr;
+            if (s.nrs_park_n >= stream_state::NRS_PARK_MAX)
+            {
+                stream_state::nrs_parked_t &old = s.nrs_park[0];
+                for (unsigned k = 0; k < stream_state::MAX_PASSES; ++k) if (old.h[k] != nullptr && s.nr_release != nullptr) (void)s.nr_release(old.h[k]);
+                if (old.c != nullptr) old.c->Release();
+                if (old.o != nullptr) old.o->Release();
+                for (unsigned k = 1u; k < s.nrs_park_n; ++k) s.nrs_park[k - 1u] = s.nrs_park[k];
+                s.nrs_park_n -= 1u;
+            }
+            s.nrs_park[s.nrs_park_n++] = entry;
+        }
+        UINT cw = s.width, chh = s.height;
+        const bool nrs_here = s.nrs_on && ((s.nrs_pass_mask >> i) & 1u) && s.nrs_color != nullptr && s.nrs_out != nullptr;   // R367
+        const bool p2f = (i > 0u && s.p2r_on && s.p2r_feature_region);
+        if (nrs_here)
+        {
+            // R368: N01950's path builds its features at the native CAP (nrs_cap_w/h), never at the work extent -
+            // one feature serves both the NRScale evaluate (work-sized subrect) and a full-size one (R367's live
+            // Native). E13c: a panel rebuild at the work extent followed by Native = full-size evaluates on a
+            // feature created smaller than the frame. Same extent as the arm's create loop.
+            cw = s.nrs_cap_w; chh = s.nrs_cap_h;
+            s.nr_params->Set("DLSSNR.Color", s.nrs_color);
+            s.nr_params->Set("DLSSNR.Output", s.nrs_out);
+        }
+        else if (mgpu::residual::carries(i))
+        {
+            mgpu::residual::work_extent(i, cw, chh);
+            mgpu::residual::bind_create(s.nr_params, i);
+        }
+        else if (p2f) { cw = s.p2r_w; chh = s.p2r_h; }
+        s.nr_params->Set("DLSSNR.Width",  (unsigned int)cw);
+        s.nr_params->Set("DLSSNR.Height", (unsigned int)chh);
+        s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned int)want);
+        arm_sentinel_set();
+        unsigned long seh_code = 0ul;
+        const NVSDK_NGX_Result rr = ngx_create_guarded((ngx_pf_create_seh_fn)s.nr_cre_v, s.nl,
+                                                       (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
+                                                       s.nr_params, &s.nr_handle[i], &seh_code);
+        arm_sentinel_clear();
+        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
+        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+        s.nr_params->Set("DLSSNR.Hint.Render.Preset", 0u);
+        QueryPerformanceCounter(&t1);
+        char l[400];
+        if (rr == NVSDK_NGX_Result_Success && s.nr_handle[i] != nullptr)
+        {
+            const int was = s.nr_preset_built[i];
+            s.nr_preset_built[i] = want;
+            s.nr_reset_mask |= (1u << i);
+            snprintf(l, sizeof l, "[MGPU][R361] pass %u recreated (%s): preset-hint %d -> %d, %ux%u, %.0f ms (the old feature is "
+                     "parked behind the stream fence). Its first evaluate runs with Reset=1.",
+                     i + 1u, why, was, want, cw, chh,
+                     (fq.QuadPart > 0) ? (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart : 0.0);
+            mgpu::diag::info(l);
+        }
+        else
+        {
+            snprintf(l, sizeof l, "[MGPU][R361] pass %u recreate FAILED (0x%08X%s): the neural stage runs transport-only until the next arm.",
+                     i + 1u, (unsigned)rr, ((unsigned)rr == NGX_RESULT_MGPU_SEH_FAULT) ? ", SEH" : "");
+            mgpu::diag::error(l);
+            s.nr_ok = false;
+        }
+    }
+
+    // R361: the x1 <-> x2 rule for pass 1 (NRPreset1x2), through the same recreate.
+    static void r361_recreate_pass1(stream_state &s)
+    {
+        s.nr_p1_recreate_req = false;
+        char why[16]; snprintf(why, sizeof why, "for x%u", s.passes);
+        r363_recreate_pass(s, 0u, r361_eff_preset(s, 0u, s.passes), why);
+    }
+
     static bool nrs_live_recreate(stream_state &s, char *line, size_t cap)
     {
         if (s.nrs_cre_v == nullptr || s.nl == nullptr || s.nrs_dev == nullptr) return false;
@@ -13981,13 +14399,15 @@ namespace
 
         arm_sentinel_set();
         NVSDK_NGX_Result rr = NVSDK_NGX_Result_Success;
-        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+        for (unsigned i = 0; i < s.nr_built; ++i)   // R350
         {
-            const bool nrs1 = (i == 0u);
+            const bool nrs1 = ((s.nrs_pass_mask >> i) & 1u) != 0u;   // R354 / R367: the live recreate follows the mask
             const UINT cw  = nrs1 ? s.nrs_w : s.width;
             const UINT chh = nrs1 ? s.nrs_h : s.height;
             s.nr_params->Set("DLSSNR.Width",  (unsigned int)cw);
             s.nr_params->Set("DLSSNR.Height", (unsigned int)chh);
+            s.nr_preset_built[i] = r361_eff_preset(s, i, s.passes);   // R361
+            if (s.nr_preset_any) s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned int)s.nr_preset_built[i]);   // R349: a recreated feature keeps its pass's hint
             unsigned long seh_code = 0ul;
             rr = ngx_create_guarded((ngx_pf_create_seh_fn)s.nrs_cre_v, s.nl,
                                     (NVSDK_NGX_Feature)NVSDK_NGX_Feature_Reserved18,
@@ -14002,12 +14422,13 @@ namespace
             }
             snprintf(line, cap,
                      "[MGPU][OURS][NRS] LIVE recreate handle %u/%u %ux%u: result=0x%08X handle=0x%p",
-                     i + 1, stream_state::MAX_PASSES, cw, chh, (unsigned)rr, (void *)s.nr_handle[i]);
+                     i + 1, s.nr_built, cw, chh, (unsigned)rr, (void *)s.nr_handle[i]);
             mgpu::diag::info(line);
             if (rr != NVSDK_NGX_Result_Success || s.nr_handle[i] == nullptr) break;
         }
         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
         s.nr_params->Set("DLSSNR.Height", (unsigned int)s.height);
+        if (s.nr_preset_any) s.nr_params->Set("DLSSNR.Hint.Render.Preset", 0u);   // R349
         arm_sentinel_clear();
 
         const bool ok = (rr == NVSDK_NGX_Result_Success && s.nr_handle[0] != nullptr);
@@ -14237,9 +14658,14 @@ namespace
 
     // Pass 1: native colour -> the work-sized model input. Constants are the
     // 4 uints the bytecode reads (src w/h, dst w/h).
-    static void nrs_dispatch_down(stream_state &s, ID3D12Resource *native_src)
+    static void nrs_dispatch_down(stream_state &s, ID3D12Resource *native_src, unsigned pi,
+                                  unsigned src_w = 0u, unsigned src_h = 0u,
+                                  ID3D12Resource *exact_dst = nullptr)
     {
         if (s.nl == nullptr || s.nrs_heap == nullptr || native_src == nullptr) return;
+        if (pi >= stream_state::MAX_PASSES) pi = 0u;
+        if (src_w == 0u) src_w = s.width;
+        if (src_h == 0u) src_h = s.height;
         const DXGI_FORMAT fmt = (DXGI_FORMAT)s.format;
         ID3D12DescriptorHeap *heaps[1] = { s.nrs_heap };
         s.nl->SetDescriptorHeaps(1, heaps);
@@ -14247,13 +14673,19 @@ namespace
         s.nl->SetPipelineState(s.nrs_pso_down);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.nrs_heap->GetCPUDescriptorHandleForHeapStart();
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.nrs_heap->GetGPUDescriptorHandleForHeapStart();
+        cpu.ptr += (SIZE_T)(10u * pi) * s.nrs_inc;   // R365: this pass's range
+        gpu.ptr += (UINT64)(10u * pi) * s.nrs_inc;
         nrs_make_srv(s.nrs_dev, native_src, cpu, fmt);
         D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu; cpu1.ptr += s.nrs_inc;
-        nrs_make_uav(s.nrs_dev, s.nrs_color, cpu1, fmt);
+        nrs_make_uav(s.nrs_dev, exact_dst ? exact_dst : s.nrs_color, cpu1, fmt);
         s.nl->SetComputeRootDescriptorTable(1, gpu);
-        const nrs_consts_down c{ (unsigned)s.width, (unsigned)s.height, s.nrs_w, s.nrs_h };
+        // B1 later passes supply the previous pass's logical extent explicitly;
+        // the resource allocation may be larger and must not leak into sampling.
+        const unsigned pwi = s.nrs_pw[pi] ? s.nrs_pw[pi] : s.nrs_w;
+        const unsigned phi = s.nrs_ph[pi] ? s.nrs_ph[pi] : s.nrs_h;
+        const nrs_consts_down c{ src_w, src_h, pwi, phi };
         s.nl->SetComputeRoot32BitConstants(0, 4, &c, 0);
-        s.nl->Dispatch((s.nrs_w + 7u) / 8u, (s.nrs_h + 7u) / 8u, 1u);
+        s.nl->Dispatch((pwi + 7u) / 8u, (phi + 7u) / 8u, 1u);
     }
 
     // Pass 2: the residual composite. smallInput/smallOutput are the model's
@@ -14261,11 +14693,13 @@ namespace
     // anchor, depth is the native depth buffer (may be null - the bytecode takes
     // a has_depth flag), and native_out is where the frame's final image goes.
     static void nrs_dispatch_res(stream_state &s, ID3D12Resource *native_color,
-                                 ID3D12Resource *native_out, ID3D12Resource *depth)
+                                 ID3D12Resource *native_out, ID3D12Resource *depth, unsigned pi,
+                                 float inten_mult)   // R371: >200% intensity lands here
     {
         if (s.nl == nullptr || s.nrs_heap == nullptr || native_color == nullptr ||
             native_out == nullptr || s.nrs_color == nullptr || s.nrs_out == nullptr)
             return;
+        if (pi >= stream_state::MAX_PASSES) pi = 0u;
         const DXGI_FORMAT fmt = (DXGI_FORMAT)s.format;
         ID3D12DescriptorHeap *heaps[1] = { s.nrs_heap };
         s.nl->SetDescriptorHeaps(1, heaps);
@@ -14282,12 +14716,12 @@ namespace
         // returned zeros, the residual composite collapsed to native + 0 = native
         // bit-exactly, mode 0 produced a pure black screen, the power still fell (the
         // network really was smaller - it was denoising zero), and the probe measured
-        // 0.00000 with Sharpness=0 (23:55 run). One heap, two disjoint slot ranges:
-        //   downsample 0..1   resolve 2..6   (the heap holds 8)
+        // 0.00000 with Sharpness=0 (23:55 run). One heap, disjoint slot ranges:
+        //   downsample 0..1   resolve 2..6   post pass 8..9   (10 per pass)
         D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.nrs_heap->GetCPUDescriptorHandleForHeapStart();
-        cpu.ptr += 2u * s.nrs_inc;
+        cpu.ptr += (SIZE_T)(10u * pi + 2u) * s.nrs_inc;   // R365: this pass's range, resolve slots 2..6
         D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.nrs_heap->GetGPUDescriptorHandleForHeapStart();
-        gpu.ptr += 2u * s.nrs_inc;
+        gpu.ptr += (UINT64)(10u * pi + 2u) * s.nrs_inc;
         nrs_make_srv(s.nrs_dev, s.nrs_color, cpu, fmt);                                  // t0
         D3D12_CPU_DESCRIPTOR_HANDLE h1 = cpu; h1.ptr += s.nrs_inc;
         nrs_make_srv(s.nrs_dev, s.nrs_out, h1, fmt);                                     // t1
@@ -14301,9 +14735,9 @@ namespace
         nrs_consts_res c{};
         c.native_w = (unsigned)s.width;
         c.native_h = (unsigned)s.height;
-        c.work_w = s.nrs_w;
-        c.work_h = s.nrs_h;
-        c.transfer = s.nrs_gain;          // 1.0 = the model's full contribution
+        c.work_w = s.nrs_pw[pi] ? s.nrs_pw[pi] : s.nrs_w;   // R370: this pass's own work extent
+        c.work_h = s.nrs_ph[pi] ? s.nrs_ph[pi] : s.nrs_h;
+        c.transfer = s.nrs_gain * inten_mult;   // R371: the model got a capped 2.0; the remainder scales the residual
         c.sharpness = s.nrs_sharpness;
         c.mode = s.nrs_mode;              // 1 = RGB residual over the native anchor, 0 = the model output itself
         c.color = s.nrs_color_strength;
@@ -14313,9 +14747,172 @@ namespace
         s.nl->Dispatch((s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u);
     }
 
+    // R372/R373: after the vendored resolve (or a native-pass evaluate), fix the
+    // output in one small pass: force alpha=1, and optionally amplify the
+    // residual against the anchor.
+    //
+    // R372 mechanism (2026-11-14, screenshot-proven): the vendored resolve
+    // bytecode propagates whatever alpha its inputs carry. On a 10-bit chain
+    // (R10G10B10A2, 2-bit alpha) the neural visual then has translucent
+    // regions, and what shows through is NOT the current game frame - the
+    // game's swapchain content in the DWM tree freezes the moment the bridge
+    // visual roots on top of the window (V53), so the user sees a frozen OLD
+    // viewpoint bleeding through: "重影". The native path never hit this
+    // because prism_finish (which would overwrite alpha with a sane value)
+    // was excluded when NRS is on (R373 removed that exclusion).
+    //
+    // R373 boost: DLSSNR.Intensity saturates at 2.0 inside the model. Above
+    // 2.0 the NRS composite carries the remainder into the residual transfer
+    // (nrs_inten_mult); a NATIVE pass had nothing - the slider simply died.
+    // boost = intensity/2.0 > 0 replicates the same math on the native
+    // output: out = anchor + (out - anchor) * boost.
+    //
+    // Reuses the downsample root signature (1 SRV + 1 UAV table, 4 constants),
+    // but never its descriptors: post pass owns per-pass heap slots 8..9.
+    typedef HRESULT (WINAPI *pfn_d3dcompile_r372)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,
+                                                  ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
+                                                  ID3DBlob **, ID3DBlob **);
+    static const char *const kPostHlsl =
+        "Texture2D<float4> gIn : register(t0);\n"
+        "RWTexture2D<float4> gOut : register(u0);\n"
+        "cbuffer C { uint gW; uint gH; float gBoost; uint gPad; };\n"
+        "[numthreads(8,8,1)] void CS(uint3 id : SV_DispatchThreadID) {\n"
+        "    if (id.x >= gW || id.y >= gH) return;\n"
+        "    float4 c = gOut[id.xy];\n"
+        "    if (gBoost > 0.0) {\n"
+        "        float3 a = gIn[id.xy].rgb;\n"
+        "        c.rgb = a + (c.rgb - a) * gBoost;\n"
+        "    }\n"
+        "    gOut[id.xy] = float4(c.rgb, 1.0);\n"
+        "}\n";
+
+    static void nrs_post_pass(stream_state &s, ID3D12Resource *anchor, ID3D12Resource *out,
+                              unsigned pi, float boost)
+    {
+        if (s.nl == nullptr || s.nrs_heap == nullptr || out == nullptr || s.nrs_rs_down == nullptr) return;
+        if (boost > 0.0f && anchor == nullptr) boost = 0.0f;
+        if (s.nrs_pso_opaque == nullptr)
+        {
+            HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+            pfn_d3dcompile_r372 compile = (dc != nullptr)
+                ? (pfn_d3dcompile_r372)GetProcAddress(dc, "D3DCompile") : nullptr;
+            if (compile == nullptr)
+            {
+                mgpu::diag::warn("[MGPU][OURS][NRS] R372: d3dcompiler_47 unavailable - post pass skipped");
+                return;
+            }
+            ID3DBlob *code = nullptr, *err = nullptr;
+            // cs_5_0, matching prism_finish: FC6's d3dcompiler_47 rejects cs_5_1.
+            const HRESULT hr = compile(kPostHlsl, strlen(kPostHlsl), "r372_post", nullptr, nullptr,
+                                       "CS", "cs_5_0", 0, 0, &code, &err);
+            if (FAILED(hr) || code == nullptr)
+            {
+                mgpu::diag::warn("[MGPU][OURS][NRS] R372: post pass compile failed - skipped");
+                if (err != nullptr) err->Release();
+                return;
+            }
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = s.nrs_rs_down;
+            pd.CS.pShaderBytecode = code->GetBufferPointer();
+            pd.CS.BytecodeLength = code->GetBufferSize();
+            const HRESULT hr2 = s.nrs_dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.nrs_pso_opaque));
+            code->Release();
+            if (FAILED(hr2))
+            {
+                mgpu::diag::warn("[MGPU][OURS][NRS] R372: post pass PSO failed - skipped");
+                return;
+            }
+            mgpu::diag::info("[MGPU][OURS][NRS] R372: post pass armed (alpha=1, native-pass intensity boost)");
+        }
+        const DXGI_FORMAT fmt = (DXGI_FORMAT)s.format;
+        ID3D12DescriptorHeap *heaps[1] = { s.nrs_heap };
+        s.nl->SetDescriptorHeaps(1, heaps);
+        s.nl->SetComputeRootSignature(s.nrs_rs_down);
+        s.nl->SetPipelineState(s.nrs_pso_opaque);
+        // UAV barrier between whatever wrote `out` and this read-modify-write.
+        D3D12_RESOURCE_BARRIER ub{};
+        ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        ub.UAV.pResource = out;
+        s.nl->ResourceBarrier(1, &ub);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.nrs_heap->GetCPUDescriptorHandleForHeapStart();
+        // Slots 8..9 belong exclusively to this post pass. Reusing downsample's
+        // 0..1 here would rewrite its descriptors before the GPU executes it.
+        cpu.ptr += (SIZE_T)(10u * pi + 8u) * s.nrs_inc;
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.nrs_heap->GetGPUDescriptorHandleForHeapStart();
+        gpu.ptr += (UINT64)(10u * pi + 8u) * s.nrs_inc;
+        nrs_make_srv(s.nrs_dev, boost > 0.0f ? anchor : out, cpu, fmt);          // t0
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu1 = cpu; cpu1.ptr += s.nrs_inc;
+        nrs_make_uav(s.nrs_dev, out, cpu1, fmt);                                // u0
+        s.nl->SetComputeRootDescriptorTable(1, gpu);
+        unsigned cwh[4];
+        cwh[0] = (unsigned)s.width; cwh[1] = (unsigned)s.height;
+        float b = boost > 0.0f ? boost : 0.0f;
+        memcpy(&cwh[2], &b, 4);
+        cwh[3] = 0u;
+        s.nl->SetComputeRoot32BitConstants(0, 4, cwh, 0);   // 4 values to match the signature's Num32BitValues
+        s.nl->Dispatch((s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u);
+    }
+
+    // Apply staged per-pass scales after 250 ms of slider stillness. Defined
+    // here because B1's GPU0 producer calls it as well as the legacy consumer.
+    static void nrs_flush_staged_scales(stream_state &s)
+    {
+        if (s.nrs_stage_pmask == 0u || s.nrs_stage_pt.QuadPart == 0) return;
+        LARGE_INTEGER n{}, f{};
+        QueryPerformanceCounter(&n);
+        QueryPerformanceFrequency(&f);
+        if (f.QuadPart == 0) return;
+        if ((double)(n.QuadPart - s.nrs_stage_pt.QuadPart) * 1000.0 / (double)f.QuadPart < 250.0)
+            return;
+        for (unsigned pass = 0; pass < stream_state::MAX_PASSES && pass < 31u; ++pass)
+        {
+            const unsigned bit = 1u << pass;
+            if (!(s.nrs_stage_pmask & bit)) continue;
+            s.nrs_stage_pmask &= ~bit;
+            float scale = s.nrs_stage_pscale[pass];
+            if (scale < 0.05f) scale = 0.05f;
+            if (scale > 1.0f) scale = 1.0f;
+            const auto pe = mgpu::b1::pass_extent(s.width, s.height, scale);
+            const unsigned pw = pe.width, ph = pe.height;
+            if (s.nrs_on && s.nrs_sw != 0u && (pw > s.nrs_sw || ph > s.nrs_sh))
+            {
+                char l[220];
+                snprintf(l, sizeof l, "[MGPU][R370] pass %u scale %.3f (%ux%u) exceeds the arm-time scratch %ux%u - "
+                         "kept the old value; restart to raise it.", pass + 1u, (double)scale, pw, ph, s.nrs_sw, s.nrs_sh);
+                mgpu::diag::warn(l);
+                continue;
+            }
+            s.nrs_pscale[pass] = scale;
+            s.nrs_pw[pass] = pw; s.nrs_ph[pass] = ph;
+            if (scale < 0.999f) s.nrs_pass_mask |= bit; else s.nrs_pass_mask &= ~bit;
+            if (s.local_nr)
+            {
+                s.local_nr_ngx_reset_mask.fetch_or(bit, std::memory_order_release);
+                s.local_nr_px1_reset_mask.fetch_or(bit, std::memory_order_release);
+            }
+            else
+            {
+                s.nr_reset_mask |= bit;
+                if (pass < mgpu::prism_x1m::kMaxPasses)
+                    mgpu::prism_x1m::reset_history(pass);
+            }
+            char l[200];
+            snprintf(l, sizeof l, "[MGPU][R370] pass %u -> scale %.3f (%ux%u) applied after debounce (mask 0x%X); "
+                     "Reset=1 on its next evaluate.", pass + 1u, (double)scale, pw, ph, s.nrs_pass_mask);
+            mgpu::diag::info(l);
+        }
+    }
+#include "local_nr.inc"
+
     bool stream_nr_create(stream_state &s, ID3D12Device *ndev)
     {
         char line[900];
+        if (s.local_nr)
+        {
+            if (!stream_composite_create(s, ndev)) return false;
+            (void)local_nr_arm(s); // failure leaves a per-frame current-native fallback
+            return true;
+        }
 
         // R210. Diagnostic only, OFF unless ProcessCensus=1 (R211: absent, the
         // launch is the 0.2.5 launch - no module walk, no version.dll or
@@ -14344,6 +14941,7 @@ namespace
                          "is ours alone, so the Init below is the FIRST one it has seen and NGX "
                          "binds to the adapter we pass.", arm_where);
                 mgpu::diag::info(sl);
+                r351_snippet_version_line(mods.snippet);   // R351
             }
             else
             {
@@ -14374,6 +14972,7 @@ namespace
         ngx_pf_init_ext       p_iext  = (ngx_pf_init_ext)      ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_Init_Ext", w[2], sizeof w[2]);
         ngx_pf_populate_params p_pop  = (ngx_pf_populate_params)ngx_resolve_strict(mods.snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl", w[3], sizeof w[3]);
         ngx_pf_create_feature p_cre   = (ngx_pf_create_feature)ngx_resolve(mods, "NVSDK_NGX_D3D12_CreateFeature",           ngx_prefer::snippet, w[4], sizeof w[4]);
+        s.nr_cre_v   = (void *)p_cre;   // R361: for the live pass-1 recreate
         s.nr_eval    = (ngx_pf_evaluate_feature)ngx_resolve(mods, "NVSDK_NGX_D3D12_EvaluateFeature", ngx_prefer::snippet, w[5], sizeof w[5]);
         s.nr_release = (ngx_pf_release_feature) ngx_resolve(mods, "NVSDK_NGX_D3D12_ReleaseFeature",  ngx_prefer::snippet, w[6], sizeof w[6]);
         // V36. Keep the session's own closer, and the device it belongs to.
@@ -14536,6 +15135,7 @@ namespace
             s.nrs_color_strength = ini_read_float("NRColorStrength", 0.90f);
             s.nrs_res_depth = !ini_has_key("NRScaleResolveDepth") ||
                               ini_read_flag("NRScaleResolveDepth");   // absent = unchanged
+            s.nrs_all = ini_has_key("NRSPass") && ini_read_float("NRSPass", 1.0f) >= 2.0f;   // R354
             // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
             // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
             const bool nrs_want = ini_has_key("NRScale") &&
@@ -14582,19 +15182,64 @@ namespace
                 if (nw > 8192u) nw = 8192u;
                 if (nh > 8192u) nh = 8192u;
                 s.nrs_w = nw; s.nrs_h = nh; s.nrs_scale = nrs_scx;
+                // R370: per-pass scale overrides. NRScale1/2/3; absent (or junk) = pass 1
+                // follows the global NRScale, passes 2+ run NATIVE (the pre-R370 default,
+                // where only pass 1 took the scale path unless NRSPass=2). The scratch is
+                // sized to the LARGEST extent a CARRYING pass uses (nrs_sw/sh), so a pass
+                // may be raised above the global scale without a rebuild.
+                {
+                    for (unsigned pi = 0; pi < stream_state::MAX_PASSES; ++pi)
+                    {
+                        char pk[16];
+                        snprintf(pk, sizeof pk, "NRScale%u", pi + 1u);
+                        float ps = ini_read_float(pk, -1.0f);
+                        if (ps < 0.05f || ps > 2.0f) ps = (pi == 0u) ? nrs_sc : 1.0f;
+                        if (ps > capsc) ps = capsc;
+                        unsigned pw = (unsigned)((double)s.width  * (double)ps + 0.5);
+                        unsigned ph = (unsigned)((double)s.height * (double)ps + 0.5);
+                        if (pw < 128u) pw = 128u;
+                        if (ph < 128u) ph = 128u;
+                        pw &= ~1u; ph &= ~1u;
+                        s.nrs_pscale[pi] = ps;
+                        s.nrs_pw[pi] = pw; s.nrs_ph[pi] = ph;
+                    }
+                    unsigned mxw = nw, mxh = nh;
+                    for (unsigned i = 0; i < s.nr_built && i < stream_state::MAX_PASSES; ++i)
+                        if (s.nrs_all || s.nrs_pscale[i] < 0.999f)
+                        {
+                            if (s.nrs_pw[i] > mxw) mxw = s.nrs_pw[i];
+                            if (s.nrs_ph[i] > mxh) mxh = s.nrs_ph[i];
+                        }
+                    s.nrs_sw = mxw; s.nrs_sh = mxh;
+                }
                 if (nrs_init(ndev, s, line, sizeof line) && nrs_alloc(ndev, s, line, sizeof line))
                 {
                     s.nrs_on = true;
+                    // R370: the mask follows the per-pass scales - a pass takes the NRScale
+                    // path iff its own scale is below native (NRSPass=2 still forces all).
+                    s.nrs_pass_mask = 0u;
+                    for (unsigned i = 0; i < s.nr_built && i < stream_state::MAX_PASSES; ++i)
+                        if (s.nrs_all || s.nrs_pscale[i] < 0.999f) s.nrs_pass_mask |= 1u << i;
                     g_pr_on.store(1, std::memory_order_relaxed);   // R299
                     s.nrs_dev = ndev;
                     s.nrs_cre_v = (void *)p_cre;   // [OURS] NRS: stashed for live scale changes
                     s.nrs_live = true;
-                    // PX1 reuses the scratch pair and native-cap NGX feature, never its residual resolve.
-                    (void)mgpu::prism_x1::arm(ndev, s.width, s.height, (DXGI_FORMAT)s.format,
-                                              s.nrs_w, s.nrs_h);
-                    (void)mgpu::prism_carry::arm(ndev, s.width, s.height, (DXGI_FORMAT)s.format,
-                                                 s.depth_w, s.depth_h, (DXGI_FORMAT)s.depth_format,
-                                                 s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format);
+                    // PX1 is per pass: independent low-size history, GuidedFit
+                    // coefficients, descriptors and strength. Arm every built pass so
+                    // a live 100% -> reduced change already has its own instance.
+                    const float px1_guard = ini_read_float("PrismX1Guard",
+                        ini_read_float("PrismSyncGuard", ini_read_float("FinishGuard", 1.0f)));
+                    for (unsigned pi = 0; pi < s.nr_built && pi < mgpu::prism_x1m::kMaxPasses; ++pi)
+                    {
+                        const unsigned pw = s.nrs_pw[pi] ? s.nrs_pw[pi] : s.nrs_w;
+                        const unsigned ph = s.nrs_ph[pi] ? s.nrs_ph[pi] : s.nrs_h;
+                        if (mgpu::prism_x1m::arm(pi, ndev, s.width, s.height,
+                                                 (DXGI_FORMAT)s.format, pw, ph))
+                        {
+                            mgpu::prism_x1m::set_intensity(pi, s.intensity[pi]);
+                            mgpu::prism_x1m::set_guard(pi, px1_guard);
+                        }
+                    }
                     snprintf(line, sizeof line,
                              "[MGPU][OURS][NRS] scale x=%.3f y=%.3f -> work=%ux%u native=%ux%u "
                              "gain=%.2f sharp=%.2f fmt=%d: PSOs built, scratch allocated. Each evaluate "
@@ -14660,6 +15305,7 @@ namespace
         s.skin_strength      = ini_read_float("SkinStrength",      1.0f);
         s.style              = ini_read_float("Style",             0.0f);
         s.auto_mask          = ini_read_flag("AutoMask");
+        s.face_mask_strength = std::clamp(ini_read_float("FaceMaskStrength", 0.30f), 0.0f, 1.0f);
 
         // R214: pass 1 foveated. Off unless Pass1Fovea=alt or =window.
         {
@@ -14941,6 +15587,12 @@ namespace
                      s.auto_mask ? 1u : 0u);
             mgpu::diag::warn(line);
         }
+        snprintf(line, sizeof line,
+                 "[MGPU][FACE-MASK] FaceMaskStrength=%.2f; DLSSNR.UseAutoMask=1 is set on EVERY pass. "
+                 "This is NVIDIA automatic face/skin-region structure control, independent of character "
+                 "guard. Zero still keeps neural output over the whole frame.",
+                 s.face_mask_strength);
+        mgpu::diag::info(line);
 
         const DXGI_FORMAT nrfmt = nr_linear_format(s.format);
 
@@ -15014,8 +15666,28 @@ namespace
             h = make_tex(ndev, s.width, s.height, nrfmt,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_pong);
-        // 1024-byte liveness sample + four 32-row motion tiles at 256-byte pitch.
-        if (SUCCEEDED(h)) h = make_buf(ndev, 1024 + 4 * 32 * 256, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
+        if (SUCCEEDED(h)) h = make_buf(ndev, 1024, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
+        // R338 (StrobeCalib=1 only): the two 64x64 boxes, output and input, one readback. A failure turns the
+        // calibrator off and never fails the arm.
+        if (SUCCEEDED(h) && s.sc_on != 0u && s.width >= 64u && s.height >= 64u)
+        {
+            const unsigned bpp = (nrfmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8u : 4u;
+            s.sc_pitch = 64u * bpp;   // 256 or 512: both multiples of D3D12_TEXTURE_DATA_PITCH_ALIGNMENT
+            s.sc_bytes = s.sc_pitch * 64u;
+            s.sc_fp_out = D3D12_PLACED_SUBRESOURCE_FOOTPRINT{};
+            s.sc_fp_out.Footprint.Format = nrfmt; s.sc_fp_out.Footprint.Width = 64; s.sc_fp_out.Footprint.Height = 64;
+            s.sc_fp_out.Footprint.Depth = 1; s.sc_fp_out.Footprint.RowPitch = s.sc_pitch; s.sc_fp_out.Offset = 0;
+            s.sc_fp_in = s.sc_fp_out; s.sc_fp_in.Offset = s.sc_bytes;
+            s.sc_fp_in.Footprint.Format = ini_read_srgb_input() ? s.format : nrfmt;   // tex_in's own format (P7.8b)
+            s.sc_prev = (unsigned char *)calloc(2u * s.sc_bytes, 1u);
+            if (s.sc_prev == nullptr || FAILED(make_buf(ndev, 2ull * s.sc_bytes, D3D12_HEAP_TYPE_READBACK, &s.sc_read)))
+            {
+                if (s.sc_read != nullptr) { s.sc_read->Release(); s.sc_read = nullptr; }
+                free(s.sc_prev); s.sc_prev = nullptr; s.sc_on = 0u;
+                mgpu::diag::warn("[MGPU][R338] StrobeCalib: the strip readback could not be built - calibrator OFF this arm.");
+            }
+        }
+        else if (s.sc_on != 0u) { s.sc_on = 0u; mgpu::diag::warn("[MGPU][R338] StrobeCalib: frame smaller than 64x64 - calibrator OFF this arm."); }
         // R208: the FP16 input path. Reads NRInput16 itself; a failure here
         // leaves it off and never fails the arm.
         if (SUCCEEDED(h)) { (void)mgpu::nr16::arm(ndev, s.width, s.height); s.n16_ini_ok = true; }
@@ -15045,16 +15717,24 @@ namespace
             else if (s.p2r_on || s.p2f_mode != 0u) rsd_why = "Pass2Region / Pass2Fovea is set";
             // R319: MAX_PASSES, not s.passes - the panel switches x1 / x2 live, so the carrying
             // pass's feature is built at the work extent whichever one the session starts on.
-            (void)mgpu::residual::arm(ndev, s.width, s.height, nrfmt, stream_state::MAX_PASSES,
+            // R350: nr_built - the sets follow what the arm builds, 2 unless Passes=3 / 4.
+            (void)mgpu::residual::arm(ndev, s.width, s.height, nrfmt, s.nr_built,
                                       s.nrs_on, rsd_rw, rsd_rh, rsd_why, ini_read_srgb_input());
+            mgpu::skinguard::configure(ini_read_float("SkinCb", 117.0f),
+                                       ini_read_float("SkinCr", 142.0f),
+                                       ini_read_float("SkinRin", 11.0f),
+                                       ini_read_float("SkinRout", 26.0f), 0.0f);
+            (void)mgpu::skinguard::arm(ini_read_skinguard_mode(), ndev,
+                                       s.width, s.height, nrfmt, rsd_why);
         }
-        // PSYNC and PX1 own their reconstruction and character guards. PRISM-FINISH
-        // still arms alongside either one so the menu's Look/custom Grade can run
-        // as a separate grade-only pass on the final output. Residual keeps priority
-        // only on the old path: its armed state must not disable PX1's colour menu,
-        // because rsd_here is already false whenever the NRS/PX1 path is active.
+        // PSYNC owns reconstruction and its character guard. PRISM-FINISH still arms
+        // alongside it so the menu's Look/custom Grade can run as a separate grade-only
+        // pass on PSYNC's output; the residual module keeps priority on the old path.
         if (SUCCEEDED(h))
             (void)mgpu::psync::arm(ndev, s.width, s.height, nrfmt);
+        // PWARP owns a separate presenter output and never feeds it back to NGX.
+        if (SUCCEEDED(h))
+            (void)mgpu::pwarp::arm(ndev, s.width, s.height, nrfmt);
         // x1 keeps the accepted spare tex_pong destination. x2 needs a third
         // texture: tex_out holds pass 1 and tex_pong holds the final NR answer.
         if (SUCCEEDED(h) && mgpu::psync::active())
@@ -15063,8 +15743,26 @@ namespace
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.psync_out);
         if (SUCCEEDED(h))
             (void)mgpu::pfinish::arm(ndev, s.width, s.height, nrfmt,
-                                     mgpu::residual::active() && !mgpu::psync::active() &&
-                                         !mgpu::prism_x1::active());
+                                     mgpu::residual::active() && !mgpu::psync::active());
+        if (SUCCEEDED(h))
+            (void)mgpu::ensemble::arm(ndev, s.width, s.height, nrfmt);
+        // Official 0.6.0 FG contract: use the stream's GPU1-local MV/depth.
+        // NativeInput=1 is a separate diagnostic and never an FG prerequisite.
+        if (SUCCEEDED(h))
+        {
+            mgpu::fg::arm_info fi{};
+            fi.ndev = ndev; fi.nqueue = s.nq; fi.w = s.width; fi.h = s.height; fi.fmt = nrfmt;
+            fi.mvec_w = s.mvec_w; fi.mvec_h = s.mvec_h;
+            fi.depth_w = s.depth_w; fi.depth_h = s.depth_h;
+            fi.depth_inverted = s.depth_inverted != 0;
+            fi.mvec_scale_x = s.mvec_scale_x; fi.mvec_scale_y = s.mvec_scale_y;
+            mgpu::adapter::selection_result native_sel{};
+            mgpu::adapter::get_selection(native_sel);
+            if (native_sel.game_luid_from_swapchain)
+                fi.game_luid = ((uint64_t)(uint32_t)native_sel.game_luid.HighPart << 32) |
+                               (uint32_t)native_sel.game_luid.LowPart;
+            (void)mgpu::fg::arm(fi);
+        }
 
         // P8.0. Always created, like tex_pong and for the same reason: the mode
         // is live, so "will it be used" is not knowable at arm time and a lazy
@@ -15134,6 +15832,13 @@ namespace
                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &s.tex_mvec_keep);
             s.mvec_keep_f = 0;
         }
+
+        // Optional Lumenite transport reduction. The small source pair remains
+        // the unpack destination; NGX receives the full-size expansion below.
+        if (SUCCEEDED(h) && s.mvec_mode == 3)
+            (void)mgpu::mvecex::arm(ndev, ini_read_sr_int("MVecExpand", 0, 0, 1) != 0,
+                                    s.mvec_w, s.mvec_h, s.width, s.height,
+                                    (DXGI_FORMAT)s.mvec_format, s.tex_mvec_r);
 
         // R216: built last, once every texture it reads exists.
         if (SUCCEEDED(h) && s.vr_mode != 0u && !vr_arm(s, ndev, nrfmt))
@@ -15244,16 +15949,6 @@ namespace
         s.nr_fp.Footprint.Height = 4;
         s.nr_fp.Footprint.Depth = 1;
         s.nr_fp.Footprint.RowPitch = 256;
-        s.dyn15_fp = s.mvec_fp2;
-        s.dyn15_fp.Offset = 1024;
-        s.dyn15_fp.Footprint.Width = 32;
-        s.dyn15_fp.Footprint.Height = 32;
-        s.dyn15_fp.Footprint.Depth = 1;
-        s.dyn15_fp.Footprint.RowPitch = 256;
-        s.dyn15_sample_frame = ~0ull;
-        s.dyn15_samples = s.dyn15_forced_motion = s.dyn15_forced_guard = 0;
-        s.dyn15_mean = s.dyn15_p90 = 0.0f;
-        s.dyn15_valid = s.dyn15_risky = false;
 
         // CreateFeature records init work into the list it is handed, and that
         // work must execute before anything it touched is released - P1.0's
@@ -15324,7 +16019,7 @@ namespace
             }
             mgpu::residual::bind_create(s.nr_params);   // R316: no-op unless the module is on
             arm_sentinel_set();
-            for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+            for (unsigned i = 0; i < s.nr_built; ++i)   // R350: nr_built (2 unless Passes=3 / 4), not the capacity
             {
                 // R212: pass 2's own feature at the region's size, when asked.
                 // [OURS] NRS step 2: when the caller-side scale path is on, PASS
@@ -15332,15 +16027,24 @@ namespace
                 // tells the snippet how big a network to run, and it is the whole
                 // point of the port. Pass 2's region feature keeps its own size.
                 const bool p2f = (i > 0u && s.p2r_on && s.p2r_feature_region);
-                const bool nrs1 = s.nrs_on && i == 0u;
+                const bool nrs1 = s.nrs_on && ((s.nrs_pass_mask >> i) & 1u);   // R354 / R367: the mask (every built pass with NRSPass=2)
                 UINT cw  = nrs1 ? s.nrs_cap_w : (p2f ? s.p2r_w : s.width);
                 UINT chh = nrs1 ? s.nrs_cap_h : (p2f ? s.p2r_h : s.height);
                 // R316: the residual pass's feature at the work extent (the module is off
                 // whenever nrs1 can be true, so the two never meet). Off: cw/chh as above.
-                if (mgpu::residual::active() && i == mgpu::residual::pass())
-                    mgpu::residual::work_extent(cw, chh);
+                // R332: per pass - with NRS=1 both passes may carry, each with its own pair.
+                if (mgpu::residual::carries(i))
+                {
+                    mgpu::residual::work_extent(i, cw, chh);
+                    if (mgpu::residual::nrs_on())                 // NRS absent: the one bind above, as R316
+                        mgpu::residual::bind_create(s.nr_params, i);
+                }
                 s.nr_params->Set("DLSSNR.Width",  (unsigned int)cw);
                 s.nr_params->Set("DLSSNR.Height", (unsigned int)chh);
+                const int r361_hint = r361_eff_preset(s, i, s.passes);   // R361: pass 1 follows the launch pass count
+                s.nr_preset_built[i] = r361_hint;
+                if (s.nr_preset_any)   // R349: the create-time hint, per feature
+                    s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned int)r361_hint);
                 const LARGE_INTEGER t0 = [] { LARGE_INTEGER v{}; QueryPerformanceCounter(&v); return v; }();
                 {
                     char am[200];
@@ -15369,11 +16073,15 @@ namespace
                 LARGE_INTEGER t1{}; QueryPerformanceCounter(&t1);
                 snprintf(line, sizeof line,
                          "[MGPU][P4.1] CreateFeature(Reserved18) handle %u/%u %ux%u fmt=%d: "
-                         "result=0x%08X (%s) handle=0x%p elapsed=%.0fms",
-                         i + 1, stream_state::MAX_PASSES, cw, chh, (int)s.format,
+                         "result=0x%08X (%s) handle=0x%p elapsed=%.0fms%s",
+                         i + 1, s.nr_built, cw, chh, (int)s.format,
                          (unsigned)r, ngx_result_name(r), (void *)s.nr_handle[i],
-                         (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0);
+                         (fq.QuadPart > 0) ? ((double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart) : 0.0,
+                         s.nr_preset_any ? (r361_hint == 2 ? " preset-hint=2" : (r361_hint == 1 ? " preset-hint=1" : " preset-hint=0")) : "");   // R349: what WE wrote (R361: the effective one)
                 mgpu::diag::info(line);
+                if (r != NVSDK_NGX_Result_Success) r337_identity_line((unsigned)r);   // R337: error path only
+                if ((unsigned)r == 0xBAD00001u && s.gdev != nullptr)   // R339 (A): FeatureNotSupported on the neural device
+                    r339_adapter_hint(s.gdev->GetAdapterLuid(), "CreateFeature refused with 0xBAD00001 (FeatureNotSupported) on the bridge's card");
                 if (r != NVSDK_NGX_Result_Success || s.nr_handle[i] == nullptr) break;
             }
             // R212: the block is shared with every evaluate; back to full size.
@@ -15383,6 +16091,7 @@ namespace
             // foveated pass 1 off; it never fails the arm.
             for (unsigned i = 0; i < s.p1f_n && r == NVSDK_NGX_Result_Success; ++i)
             {
+                if (s.nr_preset_any) s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned int)s.nr_preset_pass[0]);   // R349: pass 1's
                 unsigned long seh_p1 = 0ul;
                 const NVSDK_NGX_Result rp =
                     ngx_create_guarded((ngx_pf_create_seh_fn)p_cre, s.nl,
@@ -15411,6 +16120,7 @@ namespace
             // alternating strips off (pass 2 is then the band alone, R212).
             for (unsigned i = 0; s.p2f_mode != 0u && i < 2u && r == NVSDK_NGX_Result_Success; ++i)
             {
+                if (s.nr_preset_any) s.nr_params->Set("DLSSNR.Hint.Render.Preset", (unsigned int)s.nr_preset_pass[1]);   // R349: pass 2's
                 unsigned long seh_p2 = 0ul;
                 const NVSDK_NGX_Result rp =
                     ngx_create_guarded((ngx_pf_create_seh_fn)p_cre, s.nl,
@@ -15435,6 +16145,7 @@ namespace
                     break;
                 }
             }
+            if (s.nr_preset_any) s.nr_params->Set("DLSSNR.Hint.Render.Preset", 0u);   // R349: every feature is built; back to the default so no evaluate inherits it
             // Survived NGX. Whether the RESULT was a success does not matter
             // here - a returned error code means the process is alive, which
             // is the only thing this key claims.
@@ -15457,7 +16168,7 @@ namespace
             }
         }
         bool all = (SUCCEEDED(ch) && r == NVSDK_NGX_Result_Success);
-        for (unsigned i = 0; i < stream_state::MAX_PASSES && all; ++i)
+        for (unsigned i = 0; i < s.nr_built && all; ++i)   // R350
             if (s.nr_handle[i] == nullptr) all = false;
         if (!all)
         {
@@ -15484,17 +16195,6 @@ namespace
         // P5.0 line when it does start. It is advanced below, per frame, and
         // ONLY when the final pass actually wrote.
         s.nr_final = nullptr;
-        // Same-size colour history is not an upscaler: ResidualMode=1 keeps the
-        // native-size original-colour anchor. AMD OF is only for the optional FG stage.
-        if (!mgpu::amd_of::arm(
-                ndev, s.width, s.height, nrfmt,
-                ui_ini_read("XeSSFG", 0) != 0,
-                std::clamp(ui_ini_read("TemporalStrength", 70), 0, 95) / 100.0f,
-                ui_ini_read("TemporalMotionAdaptive", 1) != 0))
-            mgpu::diag::warn("[MGPU][TEMPORAL] colour history unavailable; the ordinary NR output remains active");
-        const int middle = std::clamp(ui_ini_read("MiddleFrame", 1), 0, 2);
-        mgpu::amd_of::set_frame_source(middle);
-        if (middle == 2) mgpu::present_queue::request(0);
         return true;
     }
 }
@@ -15708,7 +16408,7 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
 
     {
         std::lock_guard<std::mutex> lk(S.cs);
-        for (int i = 0; i < 2; ++i)
+        for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)   // BB1
             if (S.backbuffer[i] != nullptr) { S.backbuffer[i]->Release(); S.backbuffer[i] = nullptr; }
     }
 
@@ -15729,16 +16429,10 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
     }
 
     // want_fmt, not a constant. This is DEFECT H's actual repair.
-    // Preserve the chain's creation flags as well. A waitable HWND chain must
-    // keep DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT across resize:
-    // passing zero here reproduces E_INVALIDARG and strands the present loop
-    // without backbuffers (verified on the 5060 Ti with a standalone A/B).
-    DXGI_SWAP_CHAIN_DESC1 resize_desc{};
-    const HRESULT resize_desc_hr = sc->GetDesc1(&resize_desc);
-    const UINT resize_flags = SUCCEEDED(resize_desc_hr) ? resize_desc.Flags :
-        (mgpu::present_queue::waitable() ? UINT(DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT) : 0u);
     const double r313_rb0 = mgpu::strace::now_ms();
-    const HRESULT rb = sc->ResizeBuffers(2, buf_w, buf_h, want_fmt, resize_flags);
+    UINT rcount = 2u;   // BB1: the count the chain was made with
+    { std::lock_guard<std::mutex> lk(S.cs); rcount = S.present_buffers; }
+    const HRESULT rb = sc->ResizeBuffers(rcount, buf_w, buf_h, want_fmt, 0);
     if (mgpu::strace::on()) { char d[96]; snprintf(d, sizeof d, "%ux%u fmt=%d, %.2f ms", buf_w, buf_h, (int)want_fmt, mgpu::strace::now_ms() - r313_rb0); mgpu::strace::ev(mgpu::strace::R_BT, "ResizeBuffers", d, (unsigned)rb); }
 
     // ---- V69: A COMPOSITION SWAPCHAIN NEEDS A COMMIT AFTER A RESIZE ----
@@ -15776,23 +16470,27 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
         }
     }
     bool ok = SUCCEEDED(rb);
+    if (ok) mgpu::chain::bridge_chain_resized();   // R369: auto decides again on the next present; else no-op
 
-    // Re-acquire the backbuffers and rebuild the two RTVs.
+    // Re-acquire the backbuffers and rebuild their RTVs.
     if (ok)
     {
-        ID3D12Resource *b0 = nullptr, *b1 = nullptr;
-        HRESULT h0 = sc->GetBuffer(0, IID_PPV_ARGS(&b0));
-        HRESULT h1 = SUCCEEDED(h0) ? sc->GetBuffer(1, IID_PPV_ARGS(&b1)) : h0;
-        if (SUCCEEDED(h1) && heap != nullptr)
+        ID3D12Resource *b[state::MAX_BACKBUFFERS] = {};   // BB1
+        HRESULT hb = S_OK;
+        for (UINT i = 0; i < rcount && SUCCEEDED(hb); ++i)
+            hb = sc->GetBuffer(i, IID_PPV_ARGS(&b[i]));
+        if (SUCCEEDED(hb) && heap != nullptr)
         {
             const UINT rs = dev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-            D3D12_CPU_DESCRIPTOR_HANDLE d0 = heap->GetCPUDescriptorHandleForHeapStart();
-            D3D12_CPU_DESCRIPTOR_HANDLE d1 = d0; d1.ptr += rs;
-            dev->CreateRenderTargetView(b0, nullptr, d0);
-            dev->CreateRenderTargetView(b1, nullptr, d1);
+            D3D12_CPU_DESCRIPTOR_HANDLE d = heap->GetCPUDescriptorHandleForHeapStart();
+            for (UINT i = 0; i < rcount; ++i)
+            {
+                dev->CreateRenderTargetView(b[i], nullptr, d);
+                d.ptr += rs;
+            }
             std::lock_guard<std::mutex> lk(S.cs);
-            S.backbuffer[0] = b0;
-            S.backbuffer[1] = b1;
+            for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)
+                S.backbuffer[i] = b[i];
             S.chain_w = buf_w;
             S.chain_h = buf_h;
             S.chain_fmt = want_fmt;
@@ -15800,8 +16498,8 @@ bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 
         }
         else
         {
-            if (b0 != nullptr) b0->Release();
-            if (b1 != nullptr) b1->Release();
+            for (unsigned i = 0; i < state::MAX_BACKBUFFERS; ++i)
+                if (b[i] != nullptr) b[i]->Release();
             ok = false;
         }
     }
@@ -18206,6 +18904,7 @@ void stream_shutdown()
     if (mgpu::t119::gpu0_timers())     mgpu::p0t::shutdown();                 // R300h
 
     stream_state &s = str();
+    mgpu::fg::stop();   // R341a (F4): join the pacing thread BEFORE s.cs - its present_frame takes s.cs
     std::lock_guard<std::mutex> lk(s.cs);
 
     // V38. FIRST CALLER WINS. s.armed is NOT cleared by stream_release(), so
@@ -18425,6 +19124,17 @@ bool ui_ini_write_float(const char *key, float value)
     char v[32];
     snprintf(v, sizeof v, "%.2f", (double)value);
     return ini_write_text(key, v);
+}
+
+// R370: the panel's per-pass resolution sliders read NRScale1/2/3 straight from the file.
+float ui_ini_read_float(const char *key, float dflt)
+{
+    if (key == nullptr) return dflt;
+    char buf[INI_BYTES];
+    if (!ini_slurp(buf, sizeof buf)) return dflt;
+    const char *k = ini_find(buf, key);
+    if (k == nullptr) return dflt;
+    return (float)atof(k);
 }
 
 // T1.19 (Dom, T1.17): a word value through the same line-anchored writer. Used only by PanelPersist=1.
@@ -18898,10 +19608,11 @@ void ui_read(ui_state &out)
     out.skin_strength      = s.skin_strength;
     out.style              = s.style;
     out.auto_mask          = s.auto_mask;
+    out.face_mask_strength = s.face_mask_strength;
 
     out.passes      = s.passes;
     out.nr_cadence  = s.nr_cadence;
-    out.max_passes  = stream_state::MAX_PASSES;
+    out.max_passes  = s.nr_built;   // R350: the panel offers the passes that have a feature (2 unless Passes=3 / 4)
     out.profile     = s.profile;
     out.present_mode = s.present_mode;
     out.mvec_mode    = s.mvec_mode;
@@ -18934,21 +19645,19 @@ void ui_read(ui_state &out)
                 s.ui_fps_prod = (double)(s.produced - s.ui_plast) / dt;
                 s.ui_fps_cons = (double)(s.consumed - s.ui_clast) / dt;
                 s.ui_fps_eval = (double)(s.nr_evaluated - s.ui_elast) / dt;
-                s.ui_fps_over = (double)(s.overrun - s.ui_olast) / dt;
                 s.ui_tlast = now; s.ui_plast = s.produced; s.ui_clast = s.consumed;
-                s.ui_elast = s.nr_evaluated; s.ui_olast = s.overrun;
+                s.ui_elast = s.nr_evaluated;
             }
         }
         else
         {
             s.ui_tlast = now; s.ui_plast = s.produced; s.ui_clast = s.consumed;
-            s.ui_elast = s.nr_evaluated; s.ui_olast = s.overrun;
+            s.ui_elast = s.nr_evaluated;
         }
     }
     out.fps_produced = s.ui_fps_prod;
     out.fps_consumed = s.ui_fps_cons;
     out.fps_evaluated = s.ui_fps_eval;
-    out.fps_overrun = s.ui_fps_over;
     if (mgpu::t119::panel_stats())   // T1.17 (PanelStats=1): derived figures for the panel only
     {
         out.slot_bytes_live = (unsigned long long)s.slot_bytes;
@@ -18964,6 +19673,11 @@ void ui_read(ui_state &out)
     out.nrs_cap = s.nrs_cap_scale;
     out.nrs_work_w = s.nrs_w; out.nrs_work_h = s.nrs_h;
     out.nrs_native_w = s.width; out.nrs_native_h = s.height;
+    for (unsigned i = 0; i < 4u && i < stream_state::MAX_PASSES; ++i)
+    {
+        out.nrs_pscale[i] = s.nrs_pscale[i];
+        out.nrs_pw[i] = s.nrs_pw[i]; out.nrs_ph[i] = s.nrs_ph[i];
+    }
     out.nrs_gain = s.nrs_gain; out.nrs_sharpness = s.nrs_sharpness;
     out.nrs_color = s.nrs_color_strength; out.nrs_mode = s.nrs_mode;
     out.nrs_probe_d = s.nrs_probe_last;
@@ -18994,27 +19708,6 @@ void ui_read(ui_state &out)
             out.present_low1_ms = (worst > 0u) ? (wsum / (double)worst) : 0.0;
         }
     }
-
-    // XeSS's vendor-reported output is distinct from the application's Present
-    // cadence above and from the neural evaluation rate. Never substitute one
-    // for another: only framesPresented proves that interpolation happened.
-    out.xess_requested = ui_ini_read("XeSSFG", 0) != 0;
-    mgpu::xessfg::stats xs{};
-    mgpu::xessfg::read_stats(xs);
-    out.xess_active = xs.active;
-    out.xess_generating = xs.generating;
-    out.xess_last_frames_presented = xs.last_frames_presented;
-    out.xess_frame_result = xs.last_frame_result;
-    out.xess_last_error = xs.last_error;
-    out.xess_output_fps = xs.output_fps;
-    out.xess_application_presents = xs.application_presents;
-    out.xess_generated_frames = xs.generated_frames;
-    out.temporal_strength = mgpu::amd_of::temporal_strength();
-    out.temporal_motion_adaptive = mgpu::amd_of::motion_adaptive();
-    out.middle_frame = mgpu::amd_of::frame_source();
-    out.present_queue = mgpu::present_queue::requested();
-    out.present_queue_applied = mgpu::present_queue::applied();
-    out.present_queue_waitable = mgpu::present_queue::waitable();
 
     // ---- GPU 1's own timestamps. THE SAME DIVISOR THE P2.2 SUMMARY USES. ----
     // A panel that computes a mean differently from the summary is a second
@@ -19050,6 +19743,13 @@ void ui_read(ui_state &out)
     out.crop_ini_mode = s.vr_ini_mode;   // R219
     out.crop_ini_auto = s.vr_ini_auto;
     out.crop_ini_ok   = s.vr_ini_ok;
+    // R352: the running configuration for the panel's readout
+    for (unsigned i = 0; i < 4u && i < stream_state::MAX_PASSES; ++i) out.nr_preset_pass[i] = s.nr_preset_built[i];   // R361: what each handle was built with
+    out.nr_preset_any = s.nr_preset_any;
+    snprintf(out.nr_dll_version, sizeof out.nr_dll_version, "%s", g_r351_version);
+    out.stage_on = mgpu::stage::active();
+    out.nrs_pass_mask = s.nrs_pass_mask;   // R367
+    out.fg_on    = mgpu::fg::on();
     out.n16_ini_ok    = s.n16_ini_ok;   // R219-2
     mgpu::nr16::ini_values(out.n16_ini_on, out.n16_ini_power);
     out.sr_mv_lowres = s.sr_mv_lowres;
@@ -19124,6 +19824,69 @@ void ui_set_preset(int mode)
     if (mgpu::t119::panel_persist()) ui_ini_write_word("Preset", mode == 1 ? "front" : (mode == 2 ? "back" : "manual"));   // T1.17
 }
 
+// R363: the panel's network buttons. `hint` 0 = the DLL's default (Light-FP8 on 310.9.16+), 1 = Full-FP8, 2 = small
+// by name. Pass 1 at two or more passes sets NRPreset1x2's live value (the x1 value stays), so the row always means
+// "the network this pass runs right now". The bridge thread rebuilds the pass before its next evaluates.
+void ui_set_network(unsigned pass, int hint)
+{
+    if (pass >= stream_state::MAX_PASSES) return;
+    if (hint < 0) hint = 0;
+    if (hint > 2) hint = 2;
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (pass == 0u && s.passes >= 2u) s.nr_preset1_x2 = hint;
+    else s.nr_preset_pass[pass] = hint;
+    s.nr_preset_any = true;
+    s.nr_recreate_mask |= (1u << pass);
+}
+
+// R364: the panel's Residual / Native buttons, live. The bridge thread flips the residual module for that pass
+// (residual::set_pass_live) and rebuilds the pass's feature at the new extent before its next evaluates.
+void ui_set_resolution(unsigned pass, bool residual)
+{
+    if (pass >= stream_state::MAX_PASSES) return;
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (s.nrs_on)
+    {
+        // R367: N01950's path carries the residual this session - Residual / Native per pass means "the NRScale
+        // path on this pass" / "a full pass". No recreate (his features are built at the native cap); the pass's
+        // next evaluate runs with Reset=1 since its history was the other size.
+        const unsigned bit = 1u << pass;
+        const bool was = (s.nrs_pass_mask & bit) != 0u;
+        if (was == residual) return;
+        if (residual) s.nrs_pass_mask |= bit; else s.nrs_pass_mask &= ~bit;
+        if (s.local_nr)
+        {
+            s.local_nr_ngx_reset_mask.fetch_or(bit, std::memory_order_release);
+            s.local_nr_px1_reset_mask.fetch_or(bit, std::memory_order_release);
+        }
+        else s.nr_reset_mask |= bit;
+        char l[200];
+        snprintf(l, sizeof l, "[MGPU][R367] pass %u -> %s live on N01950's path (NRScale mask 0x%X); Reset=1 on its next evaluate.",
+                 pass + 1u, residual ? "NRScale (residual)" : "NATIVE (full pass)", s.nrs_pass_mask);
+        mgpu::diag::info(l);
+        return;
+    }
+    if (residual) s.nr_res_want_mask |= (1u << pass); else s.nr_res_want_mask &= ~(1u << pass);
+    s.nr_res_req_mask |= (1u << pass);
+}
+
+void ui_set_scale(unsigned pass, float scale)
+{
+    if (pass >= stream_state::MAX_PASSES) return;
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    if (scale < 0.05f) scale = 0.05f;
+    if (scale > 1.0f) scale = 1.0f;
+    // R375: stage only. The pre-debounce version applied every slider tick live -
+    // a drag was a Reset=1 storm on the pass (see nrs_flush_staged_scales).
+    if (s.nrs_stage_pmask == 0u) s.nrs_stage_pt.QuadPart = 0;
+    s.nrs_stage_pscale[pass] = scale;
+    s.nrs_stage_pmask |= 1u << pass;
+    QueryPerformanceCounter(&s.nrs_stage_pt);   // stillness is measured from the LAST edit of a drag
+}
+
 void ui_set_passes(unsigned n)
 {
     if (n < 1) n = 1;
@@ -19132,9 +19895,19 @@ void ui_set_passes(unsigned n)
     unsigned was;
     {
         std::lock_guard<std::mutex> lk(s.cs);
+        if (n > s.nr_built) n = s.nr_built;   // R350: only passes with a feature
         was = s.passes;
         if (was == n) return;
         s.passes = n;
+        if (s.local_nr)
+            for (unsigned pi = was; pi < n && pi < 3u; ++pi)
+            {
+                const unsigned bit = 1u << pi;
+                s.local_nr_ngx_reset_mask.fetch_or(bit, std::memory_order_release);
+                s.local_nr_px1_reset_mask.fetch_or(bit, std::memory_order_release);
+            }
+        if (n > was && s.pass2_reset_on != 0u) s.r332_p2_reset = true;   // R332 (E12)
+        if (s.nr_preset1_x2 >= 0 && (was >= 2u) != (n >= 2u)) s.nr_p1_recreate_req = true;   // R361
         // Every handle exists from arm time, so this is a count change and
         // nothing is created or destroyed here. nr_final is recomputed on the
         // next consumed frame.
@@ -19150,7 +19923,7 @@ void ui_set_passes(unsigned n)
     snprintf(l, sizeof l,
              "[MGPU][P6.4] passes %u -> %u, live from the next frame. Handles for all %u were "
              "created at arm, so nothing is built or torn down here.",
-             was, n, stream_state::MAX_PASSES);
+             was, n, s.nr_built);
     mgpu::diag::info(l);
     if (mgpu::t119::panel_persist()) ui_ini_write("Passes", (int)n);   // T1.17
 }
@@ -19160,7 +19933,7 @@ void ui_set_passes(unsigned n)
 // switching cadence never waits for an old launch/land state to drain.
 void ui_set_cadence(unsigned n)
 {
-    if (n != 15u) n = 1u;
+    if (n != 2u && n != 4u) n = 1u;
     stream_state &s = str();
     unsigned was;
     {
@@ -19168,20 +19941,14 @@ void ui_set_cadence(unsigned n)
         was = s.nr_cadence;
         if (was == n) return;
         s.nr_cadence = n;
-        s.nr_cadence_wait = 0;
+        s.nr_cadence_wait = n - 1u;
         s.nr_cadence_hold_said = false;
-        s.dyn15_sample_frame = ~0ull;
-        s.dyn15_valid = s.dyn15_risky = false;
     }
-    mgpu::prism_carry::reset();
-    char l[360];
+    char l[260];
     snprintf(l, sizeof l,
-             "[MGPU][NRCADENCE] %s -> %s, live from the next consumed frame. "
-             "Passes and NRScale are unchanged; fixed 1.5 alternates two-frame and one-frame "
-             "evaluation intervals (NR, hold, NR), without motion-risk, scene-load or "
-             "missing-guide fallback to x1.",
-             was == 15u ? "fixed 1.5-frame average" : "every frame",
-             n == 15u ? "fixed 1.5-frame average" : "every frame");
+             "[MGPU][NRCADENCE] every %u -> %u frame(s), live from the next consumed frame. "
+             "Passes and NRScale are unchanged; held frames keep the previous neural output.",
+             was, n);
     mgpu::diag::info(l);
     if (mgpu::t119::panel_persist()) ui_ini_write("NRCadence", (int)n);
 }
@@ -19196,13 +19963,42 @@ void ui_set_cadence(unsigned n)
 // be executing against. (It did once; the stream froze on screen with the game running.)
 void ui_nrs_stage(float scale)
 {
-    // Up to 2.00 here; the apply site clamps to NRScaleCap, because that is what the feature
-    // was actually built for.
     if (!(scale > 0.05f)) return;
     if (scale > 2.0f) scale = 2.0f;
     stream_state &s = str();
-    std::lock_guard<std::mutex> lk(s.cs);
-    s.nrs_stage_scale = scale;
+    unsigned count = 0u;
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        // R377: the legacy master slider becomes a per-pass master whenever
+        // per-pass extents exist. It must not arm the old global scratch resize.
+        if (s.nrs_pw[0] != 0u && s.nr_built != 0u)
+        {
+            if (scale > 1.0f) scale = 1.0f;
+            count = s.passes < s.nr_built ? s.passes : s.nr_built;
+            if (count > stream_state::MAX_PASSES) count = stream_state::MAX_PASSES;
+            if (s.nrs_stage_pmask == 0u) s.nrs_stage_pt.QuadPart = 0;
+            for (unsigned pass = 0; pass < count; ++pass)
+            {
+                s.nrs_stage_pscale[pass] = scale;
+                s.nrs_stage_pmask |= 1u << pass;
+            }
+            QueryPerformanceCounter(&s.nrs_stage_pt);
+            s.nrs_stage_scale = -1.0f;
+            s.nrs_stage_seen = -1.0f;
+            s.nrs_stage_t.QuadPart = 0;
+        }
+        else s.nrs_stage_scale = scale;
+    }
+    if (count != 0u)
+    {
+        (void)ui_ini_write_float("NRScale", scale);
+        for (unsigned pass = 0; pass < count; ++pass)
+        {
+            char key[16];
+            snprintf(key, sizeof key, "NRScale%u", pass + 1u);
+            (void)ui_ini_write_float(key, scale);
+        }
+    }
 }
 
 void ui_nrs_set(int which, float v)
@@ -19247,31 +20043,56 @@ void ui_set_tuning(bool on)
     if (mgpu::t119::panel_persist()) ui_ini_write("Tuning", on ? 1 : 0);   // T1.17
 }
 
+void ui_set_face_mask_strength(float v)
+{
+    v = std::clamp(v, 0.0f, 1.0f);
+    stream_state &s = str();
+    {
+        std::lock_guard<std::mutex> lk(s.cs);
+        if (std::fabs(s.face_mask_strength - v) <= 1e-4f) return;
+        s.face_mask_strength = v;
+        // Deliberately DO NOT enable Tuning or change skin_strength here.
+        // The next evaluate of every pass applies this independent parameter.
+    }
+    (void)ui_ini_write_float("FaceMaskStrength", v);
+    char l[440];
+    snprintf(l, sizeof l,
+             "[MGPU][FACE-MASK] strength=%.2f on every pass; UseAutoMask=1. Whole-frame neural "
+             "output remains enabled at zero; character guard and SkinStrength are unchanged.", v);
+    mgpu::diag::info(l);
+}
+
 void ui_set_tuning_value(int which, float v)
 {
     stream_state &s = str();
-    std::lock_guard<std::mutex> lk(s.cs);
-    switch (which)
+    bool persist = false;
     {
-    case 0: s.tone_strength      = v; break;
-    case 1: s.structure_strength = v; break;
-    case 2: s.skin_strength      = v; break;
-    case 3: s.style              = v; break;
-    case 4: s.auto_mask = (v != 0.0f); break;
-    default: return;
+        std::lock_guard<std::mutex> lk(s.cs);
+        switch (which)
+        {
+        case 0: s.tone_strength      = v; break;
+        case 1: s.structure_strength = v; break;
+        case 2: s.skin_strength      = v; break;
+        case 3: s.style              = v; break;
+        case 4: s.auto_mask = (v != 0.0f); break;
+        default: return;
+        }
+        // First touch enables the group. The panel shows these controls whether or
+        // not tuning is on, because they are the first thing to reach for when the
+        // image looks wrong - but nothing is SET until someone moves one, so a run
+        // nobody touched is still identical to every published measurement.
+        s.tuning_on = true;
+        ++s.intensity_edits;
+        persist = s.nrs_on || mgpu::t119::panel_persist();   // R299 (NRScale set) or T1.17 (PanelPersist=1): the tuning keys persist
     }
-    // First touch enables the group. The panel shows these controls whether or
-    // not tuning is on, because they are the first thing to reach for when the
-    // image looks wrong - but nothing is SET until someone moves one, so a run
-    // nobody touched is still identical to every published measurement.
-    s.tuning_on = true;
-    ++s.intensity_edits;
     // [OURS] 2026-10-12: AND NOW THEY PERSIST. The arm has always read these keys (P7.9:
     // Tuning / ToneStrength / StructureStrength / SkinStrength / Style / AutoMask), so the
     // only thing missing was the write side - which is why a panel change used to vanish on
     // the next launch. Tuning=1 goes with them, or the next arm reads the values and ignores
     // them because the group was never enabled.
-    if (s.nrs_on || mgpu::t119::panel_persist())   // R299 (NRScale set) or T1.17 (PanelPersist=1): the tuning keys persist
+    // R342e (E5): the ini writes run AFTER the lock scope, as ui_nrs_set and every sibling do -
+    // a file write under s.cs held the bridge thread for the write's duration.
+    if (persist)
     {
         const char *fkey = (which == 0) ? "ToneStrength" : (which == 1) ? "StructureStrength"
                          : (which == 2) ? "SkinStrength"  : (which == 3) ? "Style" : nullptr;
@@ -19366,8 +20187,7 @@ void ui_set_mvec_value(int which, float v)
 void ui_set_intensity(unsigned pass_1based, float v)
 {
     if (v < 0.0f) v = 0.0f;
-    // PRISM-FINISH: the prism menu's 强度 goes to 300% (prism-core 1.5.1's top of the slider);
-    // the published 0..2 clamp becomes 0..3. Values above 2 are a tuning-run choice, same as ever.
+    // MGPU's public intensity range is 0..200%; every UI entry point uses it.
     if (v > 3.0f) v = 3.0f;
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
@@ -19375,6 +20195,14 @@ void ui_set_intensity(unsigned pass_1based, float v)
         for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) s.intensity[i] = v;
     else if (pass_1based <= stream_state::MAX_PASSES)
         s.intensity[pass_1based - 1] = v;
+    // B1/native-DLSS performs the visible 0..300% edit in PX1 on GPU1.
+    // Update that destination immediately as well as the per-frame stream copy;
+    // saving Intensity alone cannot alter this pipeline (NGX intentionally runs at 1.0).
+    if (pass_1based == 0)
+        for (unsigned i = 0; i < stream_state::MAX_PASSES && i < mgpu::prism_x1m::kMaxPasses; ++i)
+            mgpu::prism_x1m::set_intensity(i, v);
+    else if (pass_1based <= mgpu::prism_x1m::kMaxPasses)
+        mgpu::prism_x1m::set_intensity(pass_1based - 1u, v);
     ++s.intensity_edits;
     // P7.4: touching a value by hand means the shape is no longer a preset.
     // Silently keeping the preset label over hand-edited numbers is how a run
@@ -19391,12 +20219,14 @@ void ui_persist_intensity(unsigned pass_1based, float v)
 {
     if (!mgpu::t119::panel_persist()) return;
     if (v < 0.0f) v = 0.0f;
-    if (v > 2.0f) v = 2.0f;
+    if (v > 3.0f) v = 3.0f;
     if (pass_1based == 0) {
         ui_ini_write_float("Intensity", v);
-        ui_ini_write_float("Intensity1", v);
-        ui_ini_write_float("Intensity2", v);
-    } else {
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) {
+            char key[32]; snprintf(key, sizeof key, "Intensity%u", i + 1u);
+            ui_ini_write_float(key, v);
+        }
+    } else if (pass_1based <= stream_state::MAX_PASSES) {
         char key[32]; snprintf(key, sizeof key, "Intensity%u", pass_1based);
         ui_ini_write_float(key, v);
     }
@@ -19495,9 +20325,16 @@ void ui_set_neural(bool on)
     }
     char l[260];
     snprintf(l, sizeof l, "[MGPU][P6.4] neural stage %s (handles kept alive either way)",
-             on ? "ON" : "OFF - transport only, the window shows the last neural frame");
+             on ? "ON" : "OFF - transport only, the worker presents the LIVE game frame");
     mgpu::diag::info(l);
     if (mgpu::t119::panel_persist()) ui_ini_write("Neural", on ? 1 : 0);   // T1.17
+}
+
+bool stream_neural_enabled()
+{
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    return s.neural;
 }
 
 // Cycle which pass the steps act on: all -> 1 -> 2 -> ... -> passes -> all.
@@ -19526,7 +20363,7 @@ void intensity_step(int dir)
     stream_state &s = str();
     const unsigned n = (s.passes >= 1 && s.passes <= stream_state::MAX_PASSES) ? s.passes : 1u;
     const float STEP = 0.05f;
-    const float LO = 0.0f, HI = 2.0f;
+    const float LO = 0.0f, HI = 3.0f;
 
     for (unsigned i = 0; i < n; ++i)
     {
@@ -19639,6 +20476,31 @@ void stream_request()
     // 38.6 s, TR-11). The arm HOLDS for vectors as on D3D12, bounded by MVecHold
     // frames; the degrade, with the R227 line, happens in the hold itself.
     s.mvec_hold = ini_read_mvec_hold();
+    s.mvec_hold_d3d12 = (unsigned long long)ini_read_sr_int("MVecHoldD3D12", 0, 0, 1000000);   // R336
+    s.late_probe_on   = (unsigned)ini_read_sr_int("MVecLateProbe", 0, 0, 1);                   // R336
+    s.r336_fired = false; s.r336_probe_said = false;
+    s.latch_k_ini = (unsigned)ini_read_sr_int("MVecLatchOffset", 0, 0, (int)stream_state::RING - 2);   // R338
+    s.latch_k = s.latch_k_ini; s.latch_applied = s.latch_overruns = 0ull;
+    s.sc_on = (unsigned)ini_read_sr_int("StrobeCalib", 0, 0, 1);                                      // R338
+    s.sc_hold_s = (unsigned)ini_read_sr_int("StrobeHold", 8, 3, 60);
+    s.sc_step = 0u; s.sc_n = s.sc_rest_n = 0u; s.sc_res_n = 0u; s.sc_done = s.sc_said = s.sc_have_prev = false;
+    s.sc_t0.QuadPart = 0; s.sc_out_sum = s.sc_in_sum = s.sc_rest_out_sum = 0.0;
+    if (s.latch_k_ini != 0u || s.sc_on != 0u)
+    {
+        char sl[300];
+        snprintf(sl, sizeof sl, "[MGPU][R338] MVecLatchOffset=%u StrobeCalib=%u (hold %u s per setting): %s", s.latch_k_ini, s.sc_on, s.sc_hold_s,
+                 s.sc_on ? "the stepper walks 12 settings (latch 0/1/2 x PassReset x NRFrameFilter) and scores each on a 64x64 strip of the output against the input, then restores the launch values"
+                         : "the consumer binds the vectors of frame f-k to frame f's colour");
+        mgpu::diag::info(sl);
+    }
+    if (s.mvec_hold_d3d12 != 0ull)
+    {
+        char hl[260];
+        snprintf(hl, sizeof hl, "[MGPU][R336] MVecHoldD3D12=%llu: if the game's vectors have not appeared after that many "
+                                "held frames and no NGX contract was seen, the stream arms on the synthetic zero field%s.",
+                 s.mvec_hold_d3d12, s.late_probe_on ? " (MVecLateProbe=1: what the game declares when it creates DLSS later is logged)" : "");
+        mgpu::diag::info(hl);
+    }
     if (s.mvec_mode == 2)
     {
         mgpu::diag::warn("[MGPU][P8.0] MVec=estimated requested, but this build has no flow "
@@ -19651,6 +20513,13 @@ void stream_request()
     s.mvec_scale_x = ini_read_named_float("MVecScaleX", 1.0f);
     s.mvec_scale_y = ini_read_named_float("MVecScaleY", 1.0f);
     s.mvec_dirty   = true;
+    s.local_nr = ini_read_flag("B1") || ini_read_flag("LocalNR");
+    if (s.local_nr)
+    {
+        s.depth_mode = 0;
+        s.mvec_mode = 0;
+        mgpu::diag::info("[MGPU][B1] requested: GPU0 low-res multi-NR, GPU1 same-frame single PX1; Depth/MVec/CopyQueue/StageCopy disabled");
+    }
     {
         const int cqm = ini_read_copy_queue();
         if (cqm < 0)
@@ -19664,6 +20533,12 @@ void stream_request()
         s.copy_queue_mode = (cqm < 0) ? 0 : cqm;
         s.copy_queue      = (s.copy_queue_mode != 0);
         s.cq_gated        = (s.copy_queue_mode == 2);
+        if (s.local_nr)
+        {
+            s.copy_queue_mode = 0;
+            s.copy_queue = false;
+            s.cq_gated = false;
+        }
     }
     {
         // R102. Read here rather than at first evaluate so the arm line reports
@@ -19723,6 +20598,50 @@ void stream_request()
             s.sr_snippet    = (unsigned)ini_read_sr_int("SRSnippet", 1, 0, 1);
             s.rw_on         = (unsigned)ini_read_sr_int("RingWindow", 0, 0, 1);
             s.sr_mv_mode    = (unsigned)ini_read_sr_int("SRMvLowRes", 0, 0, 2);
+            s.seal_valid_on = (unsigned)ini_read_sr_int("MVecSealValid", 0, 0, 1);   // R331
+            if (s.seal_valid_on != 0u)
+                mgpu::diag::info("[MGPU][R331] MVecSealValid=1: the consumer binds depth and vectors by the frame "
+                                 "tag written with the seal, not by the live slot flag; with the copy queue it "
+                                 "binds what the copy actually carried. [R78]/[R63] flag disagreements compare the seal "
+                                 "against what was bound, for evaluated frames only (R331a); the [R331a] line every 1200 "
+                                 "frames splits them and names the ring-edge case.");
+            s.r331_cmp = s.r331_depth_dis = s.r331_mvec_dis = s.r331_depth_retag = s.r331_mvec_retag = 0ull;   // R331a
+            s.r331_report_at = 0ull; s.r331_bind_depth[0] = s.r331_bind_depth[1] = s.r331_bind_mvec[0] = s.r331_bind_mvec[1] = 0u;
+            s.ll_on  = (unsigned)ini_read_sr_int("LateLatch", 0, 0, 1);      // R343
+            s.ll_age = (unsigned)ini_read_sr_int("LateLatchAge", 2, 0, 4);   // R343
+            s.ll_pending = 0ull; s.ll_list_ms = s.ll_copy_ms = 0.0;
+            s.ll_issued = s.ll_hits = s.ll_stale = s.ll_early = s.ll_refused = 0ull; s.ll_report_at = 0ull;
+            s.half_frame[0] = s.half_frame[1] = 0ull; s.eval_half = 0u;
+            if (s.ll_on != 0u && mgpu::t119::prefetch_active())
+            {
+                mgpu::diag::warn("[MGPU][R343] LateLatch=1 and PerfPrefetch=1 both choose the frame the consumer evaluates; "
+                                 "PerfPrefetch wins this run and LateLatch is OFF.");
+                s.ll_on = 0u;
+            }
+            if (s.ll_on != 0u)
+            {
+                char lll[520];
+                snprintf(lll, sizeof lll,
+                         "[MGPU][R343] LateLatch=1, LateLatchAge=%u (Dave's OPT2). Near the end of each evaluate the newest "
+                         "arrived frame is copied on the copy queue into the tex_in half this evaluate is not reading, and "
+                         "the next poll evaluates it if it is at most %u frame(s) older than the newest arrival. Output "
+                         "latency rises by up to that many game frames; the serial unpack leaves the per-frame critical "
+                         "path. %s", s.ll_age, s.ll_age,
+                         s.copy_queue ? "Copy queue is ON, so this is active."
+                                      : "CopyQueue=0 - LATE-LATCH NEEDS CopyQueue=1 or 2 AND IS INACTIVE THIS RUN.");
+                if (s.copy_queue) mgpu::diag::info(lll); else mgpu::diag::warn(lll);
+            }
+            s.re_on = (unsigned)ini_read_sr_int("RingEdgeProbe", 0, 0, 1);   // R344
+            for (unsigned q = 0; q < 8u; ++q) { s.re_hist[q] = s.re_nodepth[q] = s.re_nomvec[q] = 0ull; }
+            s.re_report_at = 0ull;
+            if (s.re_on != 0u)
+                mgpu::diag::info("[MGPU][R344] RingEdgeProbe=1: at every evaluated frame's copy decision the distance "
+                                 "producer - frame (in game frames; the ring holds 6) is counted, with the frames that then "
+                                 "went without depth / vectors per distance. A line every 1200 frames; nothing changes.");
+            s.pass2_reset_on = (unsigned)ini_read_sr_int("Pass2Reset", 0, 0, 1);    // R332 (E12)
+            s.weak_warn_on   = (unsigned)ini_read_sr_int("WeakGpuWarn", 1, 0, 1);   // R332 (E16), log only
+            s.r332_p2_reset = false; s.e16_t0.QuadPart = 0; s.e16_ev0 = s.e16_prod0 = 0ull;
+            s.e16_slow_windows = 0u; s.e16_said = false;
             g_present_vsync.store(s.present_vsync, std::memory_order_relaxed);
             if (s.present_vsync == 0u)
                 mgpu::diag::warn(
@@ -19754,7 +20673,16 @@ void stream_request()
             // this - two readers because they need it at two different times.
             s.sf_path.store(ini_read_sr_int("SFPath", -2, 0, 1),
                             std::memory_order_relaxed);
-            s.sr_scale_pct = (unsigned)ini_read_sr_int("SRScale", 0, 0, 99);
+            s.sr_scale_pct = (unsigned)ini_read_sr_int("SRScale", 0, 0, 100);   // R342d: 100 accepted (was 99)
+            // R342d (Jay): SRScale=100 = native input. R would equal the display extent and the C2-SR guard
+            // below would refuse it with the DLAA message; the meaning is "no upscale this run", so that
+            // is what it does, in one line, before the guard. Launcher: the 100% option writes this.
+            if (s.sr_scale_pct == 100u && s.sr_on != 0u)
+            {
+                s.sr_on = 0u;
+                mgpu::diag::info("[MGPU][R342] SRScale=100: native input - DLSS-NR runs at the display extent and SRUpscale is "
+                                 "not used this run (the 100% option). Set SRScale to 50-99 to upscale again.");
+            }
 
             // R213, comment only. WHAT THIS CHECK REALLY DOES: it runs before
             // Passes is read from mgpu.ini (a few lines below), and this
@@ -19840,6 +20768,10 @@ void stream_request()
         const char *k = have ? ini_find(buf, "Passes") : nullptr;
         const long long asked = (k != nullptr) ? atoll(k) : 1;
         s.passes = ini_read_passes();
+        // Prism exposes 1 / 2 / 3 as live choices. Prebuild the third handle even
+        // when the launch default is two passes; ui_set_passes can only select an
+        // existing handle and otherwise silently clamps the user's 3 back to 2.
+        s.nr_built = (s.passes > 3u) ? s.passes : 3u;
         if (k != nullptr && asked != (long long)s.passes)
         {
             char pl[400];
@@ -19854,6 +20786,68 @@ void stream_request()
     s.nr_cadence = ini_read_cadence();
     s.nr_cadence_wait = 0;
     s.nr_cadence_hold_said = false;
+    if (s.local_nr)
+    {
+        // Three independent handles are built once. Passes selects how many of
+        // them consume the current frame; only the final answer crosses to GPU1.
+        if (s.passes > 3u) s.passes = 3u;
+        s.nr_built = 3u;
+        s.nr_cadence = 1u;
+        s.sr_on = 0u;
+        s.subrect_pct = 100u;
+        mgpu::diag::info("[MGPU][B1] every-frame multi-NR: three independent native-cap handles, Passes=1..3; NRCadence=1");
+    }
+
+    // R349: NRPreset is the fallback, NRPresetN overrides pass N. Arm-time only (the preset chooses the
+    // weights CreateFeature builds). No key -> nr_preset_any false -> the hint is never written.
+    {
+        s.nr_preset_any = false;
+        int fallback = ini_has_key("NRPreset") ? (int)ini_read_float("NRPreset", 0.0f) : 0;
+        if (fallback < 0) fallback = 0;
+        if (fallback > 2) fallback = 2;
+        bool any_key = ini_has_key("NRPreset");
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+        {
+            char key[32];
+            snprintf(key, sizeof key, "NRPreset%u", i + 1u);
+            int v = fallback;
+            if (ini_has_key(key)) { v = (int)ini_read_float(key, (float)fallback); any_key = true; }
+            if (v < 0) v = 0;
+            if (v > 2) v = 2;
+            s.nr_preset_pass[i] = v;
+            if (v != 0) s.nr_preset_any = true;
+        }
+        s.nr_preset1_x2 = -1;   // R361
+        if (ini_has_key("NRPreset1x2"))
+        {
+            int v = (int)ini_read_float("NRPreset1x2", 0.0f);
+            if (v < 0) v = 0;
+            if (v > 2) v = 2;
+            s.nr_preset1_x2 = v;
+            any_key = true;
+            s.nr_preset_any = true;   // the hint is written whenever pass 1 differs by pass count
+            char xl[260];
+            snprintf(xl, sizeof xl, "[MGPU][R361] NRPreset1x2=%d: pass 1 runs this network while two or more passes run "
+                     "(NRPreset1=%d at x1). A live x1 <-> x2 switch recreates pass 1's feature once.", v, s.nr_preset_pass[0]);
+            mgpu::diag::info(xl);
+        }
+        if (any_key)
+        {
+            char pl[300];
+            snprintf(pl, sizeof pl,
+                     "[MGPU][R349] per-pass DLSS-NR model preset hint: p1=%d p2=%d (0 = snippet default, 1 / 2 as N01950's "
+                     "R419 names them), create-time only - a change needs a relaunch. Whether the snippet honours it: "
+                     "NGXLog=1 and the nvngx_dlssnr log, not this line.",
+                     s.nr_preset_pass[0], s.nr_preset_pass[1]);
+            mgpu::diag::info(pl);
+            if (s.nr_built > 2u)   // R350: the extra passes' hints, only when they are built
+            {
+                snprintf(pl, sizeof pl, "[MGPU][R349][R350] p3=%d p4=%d", s.nr_preset_pass[2],
+                         (s.nr_built > 3u) ? s.nr_preset_pass[3] : 0);
+                mgpu::diag::info(pl);
+            }
+        }
+    }
 
     // P6.2. Read after `passes`, because the per-pass overrides only make
     // sense once we know how many passes there are.
@@ -19915,7 +20909,10 @@ void stream_request()
     // produced by the instrument's own permissiveness. An unknown name is now
     // refused loudly, by name, with the implemented set listed.
     {
-        static const char *KNOWN[] = { "none", "pitch", "alias", "magic", "drop", "stale" };
+        static const char *KNOWN[] = {
+            "none", "pitch", "alias", "magic", "drop", "stale",
+            "nr_first", "nr_eval", "nr_tag", "nr_stale", "nr_generation"
+        };
         bool ok = false;
         for (unsigned i = 0; i < sizeof KNOWN / sizeof KNOWN[0]; ++i)
             if (strcmp(s.fault, KNOWN[i]) == 0) { ok = true; break; }
@@ -19924,7 +20921,7 @@ void stream_request()
             char e[500];
             snprintf(e, sizeof e,
                      "[MGPU][P4.0] mgpu.ini requests Fault=\"%s\", which this build CANNOT "
-                     "inject. Implemented: pitch, alias, magic, drop, stale. Running clean "
+                     "inject. Implemented: pitch, alias, magic, drop, stale, nr_first, nr_eval, nr_tag, nr_stale, nr_generation. Running clean "
                      "instead - and the summary will say so, because a run that injects nothing "
                      "and reports all-zero counters would otherwise read as a checker that "
                      "failed to trip. NOT implemented: tear, which needs the barcode shader to "
@@ -19985,6 +20982,11 @@ void stream_request()
     else if (strcmp(s.fault, "pitch") == 0) s.fault_id = stream_state::FK_PITCH;
     else if (strcmp(s.fault, "alias") == 0) s.fault_id = stream_state::FK_ALIAS;
     else if (strcmp(s.fault, "magic") == 0) s.fault_id = stream_state::FK_MAGIC;
+    else if (strcmp(s.fault, "nr_first") == 0) s.fault_id = stream_state::FK_NR_FIRST;
+    else if (strcmp(s.fault, "nr_eval") == 0) s.fault_id = stream_state::FK_NR_EVAL;
+    else if (strcmp(s.fault, "nr_tag") == 0) s.fault_id = stream_state::FK_NR_TAG;
+    else if (strcmp(s.fault, "nr_stale") == 0) s.fault_id = stream_state::FK_NR_STALE;
+    else if (strcmp(s.fault, "nr_generation") == 0) s.fault_id = stream_state::FK_NR_GENERATION;
 
     char l[1100];
     // R102: full frame is the shipped default and prints nothing extra, so a
@@ -20066,7 +21068,42 @@ void stream_on_present(void *cmd_queue_v)
     ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(cmd_queue_v);
     if (gq == nullptr) return;
 
-    if (SUCCEEDED(gq->Signal(s.gfence, s.produced))) s.gsignaled = s.produced;   // R275
+    if (s.local_nr && local_nr_signal_input(s, gq))
+    {
+        s.gsignaled = s.produced;
+        return;
+    }
+    if (mgpu::stage::signal(gq, s.gfence, s.produced)) s.gsignaled = s.produced;   // R275; R333: routed, the old call when off
+}
+
+// SignalAt=2: no s.cs on the game thread. The local neural transport retains
+// its own signal path; the staged transport uses the community stage signal.
+static void r409_signal_door(void *queue_v)
+{
+    stream_state &s = str();
+    if (s.sig_fence.load(std::memory_order_relaxed) == nullptr) return;
+    s.sig_inflight.fetch_add(1u, std::memory_order_seq_cst);
+    ID3D12Fence *f = s.sig_fence.load(std::memory_order_seq_cst);
+    const unsigned long long n = s.produced_a.load(std::memory_order_acquire);
+    ID3D12CommandQueue *gq = reinterpret_cast<ID3D12CommandQueue *>(queue_v);
+    bool signalled = false;
+    if (f != nullptr && n != 0ull && gq != nullptr)
+    {
+        if (s.local_nr && local_nr_signal_input(s, gq)) signalled = true;
+        else signalled = mgpu::stage::signal(gq, f, n);
+    }
+    if (signalled) s.sig_gsignaled.store(n, std::memory_order_relaxed);
+    s.sig_inflight.fetch_sub(1u, std::memory_order_seq_cst);
+}
+
+void stream_on_finish_present(void *cmd_queue_v)
+{
+    r409_signal_door(cmd_queue_v);
+}
+
+void stream_signal_after_submit(void *cmd_queue_v)
+{
+    r409_signal_door(cmd_queue_v);
 }
 
 // ================= REFLEX: FORCE LOW LATENCY ON GPU 0 =====================
@@ -20663,6 +21700,14 @@ unsigned long long game_effects_frames()
 // must not re-pick a different buffer on its own after this - the ring is laid out.
 bool stream_producing() { return str().produced_a.load(std::memory_order_acquire) != 0ull; }
 
+// Read by the DX11 producer on the game's render thread (init_swapchain) to
+// gate a chain-rebuild resize: an armed ring slot was sized from the old
+// colour texture and cannot take the new size, an unarmed one has not been
+// sized yet. armed is written on the bridge thread at the arm and cleared at
+// release; a plain read here races benignly - the worst case is taking the
+// conservative branch (stop feeding) one rebuild early, never the unsafe one.
+bool stream_armed() { return str().armed; }
+
 void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                               unsigned long long rtv_handle,
                               unsigned long long depth_handle,
@@ -20762,6 +21807,12 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     }
 
     stream_state &s = str();
+    // Only the exact queue captured from the game-adapter arm may enter this
+    // gate; the bridge's own finish-effects event must never wait on itself.
+    // Most importantly, no s.cs ownership is held across the CPU fence wait.
+    if (s.local_nr && cmd_queue_v != nullptr && cmd_queue_v == s.game_queue &&
+        !local_nr_cpu_gate(s, s.produced_a.load(std::memory_order_acquire) + 1ull))
+        return;
     // R309 (MVecStepAside=1 only): how long THIS thread waited for s.cs - R168 below times the
     // hold, never the wait. Key off: one relaxed load, nothing else.
     const LONGLONG r309_w0 = r309::time_game.load(std::memory_order_relaxed) ? sfdiag::qpc() : 0;
@@ -21064,6 +22115,31 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                              "field (MVec=1, MVecDX/MVecDY - zero unless you set them) is bound from the arm, never MVec unset.");
             s.mvec_mode = 1;
         }
+        // R336 (MVecHoldD3D12=N, absent = no bound): the D3D12 hold's bound. Same landing as
+        // MVecStepAside=1 (MVec=1, the zero field), so DLSS-NR runs with depth and a picture is
+        // on screen instead of ARMING. Only when no NGX contract has been seen: a contract title
+        // whose handle is churning keeps the R78 hold as before.
+        // R336a (suite run H, finding #5): the first-launch learning tap (R278, `learnable`) made `can_tap` true
+        // and switched the bound off on exactly the launch it was for; the hold ran 6600 frames with no candidate.
+        // The bound now counts under the learning tap too, and when it fires the learning is turned off for the
+        // session (the N frames were its budget; a candidate it never found cannot be applied live over the zero
+        // field - G4: no switching). An EXPLICIT MVecTap=1/2 still holds as before: the user asked for the tap.
+        if (s.mvec_mode == 3 && mvec_handle == 0 && s.mvec_hold_d3d12 != 0ull &&
+            s.mvec_arm_waits >= s.mvec_hold_d3d12 && !(tap_k == 1 || tap_k == 2) && !game_contract_seen())
+        {
+            char hl[520];
+            snprintf(hl, sizeof hl,
+                     "[MGPU][R336] MVec=3 held %llu frame(s) on D3D12 with no vector buffer and no NGX contract seen "
+                     "(MVecHoldD3D12=%llu). Arming on the synthetic zero field (MVec=1) with depth, as MVecStepAside=1 "
+                     "does. The picture is NR without the game's motion; that is the state, not a fault.%s%s",
+                     s.mvec_arm_waits, s.mvec_hold_d3d12,
+                     learnable ? " The first-launch velocity tap found no candidate in that time and is off for this session (R336a)." : "",
+                     s.late_probe_on ? " MVecLateProbe=1 will say what the game declares if it creates DLSS later." : "");
+            mgpu::diag::warn(hl);
+            if (learnable) g_mvec_tap_live.store(0, std::memory_order_relaxed);   // R336a
+            s.mvec_mode = 1;
+            s.r336_fired = true;
+        }
         if (s.mvec_mode == 3 && mvec_handle == 0 && g_no_real_vectors.load(std::memory_order_acquire) &&
             (s.mvec_arm_waits >= s.mvec_hold || (!mgpu::calibrator::game_ngx_init_seen() && !can_tap)))
         {
@@ -21174,6 +22250,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                              (unsigned)gl.HighPart, (unsigned)gl.LowPart,
                              sel_now.selected_desc, sel_now.rule);
                     mgpu::diag::error(ln);
+                    r339_adapter_hint(gl, "ERROR 207: the game renders on the card the bridge selected for NR");   // R339 (A)
                 }
                 s.luid_collapse = true;
                 return;
@@ -21289,6 +22366,63 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             }
         }
 
+        // B1: the main card's reduced NR answer shares the colour slot and its
+        // produced fence. A strict frame tag on the consumer rejects old answers.
+        if (s.local_nr)
+        {
+            float master = ini_read_float("NRScale", 0.62f);
+            if (!(master > 0.05f)) master = 0.62f;
+            if (master > 1.0f) master = 1.0f;
+            s.nrs_scale = master;
+            s.nrs_on = true;
+            s.nrs_live = true;
+            s.nrs_cap_scale = 1.0f;
+            s.nrs_cap_w = s.width; s.nrs_cap_h = s.height;
+            s.nrs_sw = s.width; s.nrs_sh = s.height;
+            s.nrs_pass_mask = 0u;
+            for (unsigned pi = 0; pi < 3u; ++pi)
+            {
+                char key[16];
+                snprintf(key, sizeof key, "NRScale%u", pi + 1u);
+                float ps = ini_read_float(key, master);
+                if (!(ps > 0.05f)) ps = master;
+                if (ps > 1.0f) ps = 1.0f;
+                const auto pe = mgpu::b1::pass_extent(s.width, s.height, ps);
+                s.nrs_pscale[pi] = ps;
+                s.nrs_pw[pi] = pe.width; s.nrs_ph[pi] = pe.height;
+                if (ps < 0.999f) s.nrs_pass_mask |= 1u << pi;
+            }
+            const unsigned final_pass = (s.passes >= 1u && s.passes <= 3u) ? s.passes - 1u : 0u;
+            s.local_nr_width = s.nrs_pw[final_pass];
+            s.local_nr_height = s.nrs_ph[final_pass];
+            s.local_nr_max_width = s.width;
+            s.local_nr_max_height = s.height;
+            s.local_nr_format = (unsigned)s.format;
+            s.nrs_w = s.local_nr_width;
+            s.nrs_h = s.local_nr_height;
+            D3D12_RESOURCE_DESC ld = rd;
+            ld.Width = s.local_nr_max_width;
+            ld.Height = s.local_nr_max_height;
+            UINT nr_rows = 0; UINT64 nr_row_bytes = 0;
+            gdev->GetCopyableFootprints(&ld, 0, 1, 0, &s.local_nr_fp,
+                                        &nr_rows, &nr_row_bytes, &s.local_nr_bytes);
+            s.local_nr_off = ((slot_end + SEAL_STRIDE - 1) / SEAL_STRIDE) * SEAL_STRIDE;
+            slot_end = s.local_nr_off + s.local_nr_bytes;
+            for (unsigned q = 0; q < stream_state::RING; ++q)
+            {
+                s.local_nr_slot_frame[q].store(0ull, std::memory_order_relaxed);
+                s.local_nr_slot_generation[q].store(0ull, std::memory_order_relaxed);
+            }
+            char ll[700];
+            snprintf(ll, sizeof ll,
+                     "[MGPU][B1] slot NR storage=%ux%u fmt=%u pitch=%u bytes=%llu offset=%llu | P1=%ux%u P2=%ux%u P3=%ux%u; each seal carries its actual final extent",
+                     s.local_nr_max_width, s.local_nr_max_height, s.local_nr_format,
+                     (unsigned)s.local_nr_fp.Footprint.RowPitch,
+                     (unsigned long long)s.local_nr_bytes, (unsigned long long)s.local_nr_off,
+                     s.nrs_pw[0], s.nrs_ph[0], s.nrs_pw[1], s.nrs_ph[1], s.nrs_pw[2], s.nrs_ph[2]);
+            mgpu::diag::info(ll);
+        }
+
         // One slot = seal (padded to the placement alignment) + payload, plus
         // the depth region when it is on, rounded up so that every slot offset
         // is itself 512-aligned. Whole slots only: sub-slot arithmetic is how
@@ -21345,6 +22479,9 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         if (SUCCEEDED(h))
             h = gdev->CreateSharedHandle(s.gfence, nullptr, GENERIC_ALL, nullptr,
                                          &s.gfence_share);
+        // R333 (StageCopy=1 only): the GPU 0 staging ring + copy queue. Never fails the arm; turns itself
+        // off on its own failure. Off: nothing is built, dst() is gxfer, signal() is the old call.
+        if (SUCCEEDED(h) && !s.local_nr) (void)mgpu::stage::arm(gdev, gq, s.gxfer, heap_bytes, s.slot_bytes, stream_state::RING);
         // R300h (T1.16a, Gpu0Timers=1 only): GPU 0 timestamps on the game's device. A failure only turns
         // the measurement off. Read from the key here, not from a module configured later (Dom's T1.16 defect).
         if (SUCCEEDED(h) && mgpu::t119::gpu0_timers()) (void)mgpu::p0t::init(gdev, gq);
@@ -21381,6 +22518,36 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             if (SUCCEEDED(h)) h = s.nl->Close();
             if (SUCCEEDED(h))
                 h = ndev->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&s.nf));
+            if (SUCCEEDED(h) && s.local_nr)
+            {
+                h = ndev->CreateFence(0, (D3D12_FENCE_FLAGS)(D3D12_FENCE_FLAG_SHARED |
+                                                             D3D12_FENCE_FLAG_SHARED_CROSS_ADAPTER),
+                                      IID_PPV_ARGS(&s.local_nr_consumed_n));
+                if (SUCCEEDED(h))
+                    h = ndev->CreateSharedHandle(s.local_nr_consumed_n, nullptr, GENERIC_ALL,
+                                                 nullptr, &s.local_nr_consumed_share);
+                if (SUCCEEDED(h))
+                    h = gdev->OpenSharedHandle(s.local_nr_consumed_share,
+                                               IID_PPV_ARGS(&s.local_nr_consumed_g));
+                if (SUCCEEDED(h))
+                {
+                    s.local_nr_cpu_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+                    if (s.local_nr_cpu_event == nullptr) h = E_FAIL;
+                }
+                if (SUCCEEDED(h))
+                {
+                    s.game_queue = gq;
+                    s.local_nr_gated_through = 0;
+                    s.local_nr_wait_target.store(0, std::memory_order_release);
+                    s.local_nr_backpressure_waits = 0;
+                    s.local_nr_backpressure_failures = 0;
+                    s.local_nr_cpu_stop.store(false, std::memory_order_release);
+                    s.local_nr_cpu_gated_through = 0;
+                    s.local_nr_cpu_waits = 0;
+                    s.local_nr_cpu_failures = 0;
+                    mgpu::diag::info("[MGPU][B1] ring ownership ARMED: GPU0 CPU recording and GPU execution both retire F-RING before slot reuse");
+                }
+            }
             if (SUCCEEDED(h))
             {
                 s.nev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
@@ -21619,6 +22786,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             return;
         }
         s.armed = true;
+        if (s.signal_at == 2u && s.gfence != nullptr)
+            s.sig_fence.store(s.gfence, std::memory_order_seq_cst);
         // R270b. Off unless mgpu.ini says LaunchRecord=1 (the launcher writes it).
         QueryPerformanceCounter(&s.ll_t0); s.ll_p0 = s.produced; s.ll_c0 = s.consumed;
         s.rec_on = ini_read_flag("LaunchRecord");
@@ -21675,7 +22844,17 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 float sx = 0.0f, sy = 0.0f;
                 if (_stricmp(un, "uv") == 0)          { sx = (float)s.width;        sy = (float)s.height; }
                 else if (_stricmp(un, "uvhalf") == 0) { sx = (float)s.width * 0.5f; sy = (float)s.height * 0.5f; }
-                else if (_stricmp(un, "px") == 0)     { sx = (float)s.width / (float)s.mvec_w; sy = (float)s.height / (float)s.mvec_h; }
+                else if (_stricmp(un, "px") == 0)
+                {
+                    // Lumenite's small field already stores FULL-RESOLUTION
+                    // pixel displacement. Expansion duplicates those values;
+                    // it must not multiply them by the grid ratio a second time.
+                    if (ini_read_sr_int("MVecExpand", 0, 0, 1) != 0 &&
+                        (s.mvec_w != s.width || s.mvec_h != s.height))
+                    { sx = 1.0f; sy = 1.0f; }
+                    else
+                    { sx = (float)s.width / (float)s.mvec_w; sy = (float)s.height / (float)s.mvec_h; }
+                }
                 if (sx != 0.0f)
                 {
                     s.mvec_scale_x = (float)gx * sx; s.mvec_scale_y = (float)gy * sy; s.mvec_dirty = true;
@@ -21726,10 +22905,20 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // storage being zero is the kind of assumption this file pays for.
         for (unsigned q = 0; q < stream_state::RING; ++q)
             s.mvec_slot_valid[q].store(0u, std::memory_order_relaxed);
+        for (unsigned q = 0; q < stream_state::TAG_RING; ++q)   // R331 / R331b
+        {
+            s.mvec_slot_frame[q].store(0ull, std::memory_order_relaxed);
+            s.depth_slot_frame[q].store(0ull, std::memory_order_relaxed);
+        }
+        s.cq_mvec_ok[0] = s.cq_mvec_ok[1] = s.cq_depth_ok[0] = s.cq_depth_ok[1] = 0u;   // R331
         s.mvec_live.store(s.mvec_mode == 3 && s.mvec_bytes2 != 0,
                           std::memory_order_release);
         return;    // record nothing on the arming frame
     }
+
+    // B1: this covers every finish-effects write to the next slot. Mid-scene
+    // vector copies call the same gate earlier, with the same frame number.
+    if (s.local_nr && !local_nr_gate(s, gq, s.produced + 1ull)) return;
 
     // ---- R170: SwapGuard. OFF BY DEFAULT, and it is a BEHAVIOUR change ----
     //
@@ -21857,6 +23046,29 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // previous frame's list has necessarily been submitted - it had to be, to
     // present - so a Signal here lands behind it. One fence, whose value is the
     // count of frames whose copies are known to have been submitted.
+    // R336 (MVecLateProbe=1, after the bound armed on the zero field): the game created
+    // DLSS later - say what it declares, once. A probe, not a switch.
+    if (s.late_probe_on != 0u && s.r336_fired && !s.r336_probe_said && (s.game_frames % 60ull) == 0ull)
+    {
+        mgpu::calibrator::table ct;
+        const bool have = mgpu::calibrator::read(ct) && ct.have != 0u;
+        const unsigned long long creates = mgpu::calibrator::feature_creates();
+        if (have || creates != 0ull)
+        {
+            s.r336_probe_said = true;
+            char pl[620];
+            snprintf(pl, sizeof pl,
+                     "[MGPU][R336] LATE DLSS on a title armed on the zero field: the game created %llu NGX feature(s) and its table "
+                     "%s (have=0x%X, evals=%llu) | color=0x%llX depth=0x%llX mvec=0x%llX output=0x%llX | render %ux%u display %ux%u "
+                     "subrect %ux%u | MVecScale %.3f/%.3f reset=%u | our game frame %llu. This session stays on the zero field; "
+                     "the line is what the title declares, for the next design.",
+                     creates, have ? "is populated" : "is still empty", ct.have, ct.evals,
+                     ct.color, ct.depth, ct.mvec, ct.output, ct.render_w, ct.render_h, ct.display_w, ct.display_h,
+                     ct.sub_w, ct.sub_h, ct.mv_scale_x, ct.mv_scale_y, ct.reset, s.game_frames);
+            mgpu::diag::warn(pl);
+        }
+    }
+
     if (s.produced > 0)
     {
         // L1: sample BEFORE the signal, so the reading is the backlog this
@@ -21875,8 +23087,11 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // L3: at SignalAt=1 the signal is issued from the PRESENT event
         // instead, one event earlier, which is a whole frame earlier. See
         // stream_on_present.
-        if (s.signal_at == 0u && SUCCEEDED(gq->Signal(s.gfence, s.produced)))
-            s.gsignaled = s.produced;   // R275
+        if (s.signal_at == 0u)
+        {
+            if (s.local_nr && local_nr_signal_input(s, gq)) s.gsignaled = s.produced;
+            else if (mgpu::stage::signal(gq, s.gfence, s.produced)) s.gsignaled = s.produced;
+        }
     }
 
     if (s.produced >= s.max_frames)
@@ -21884,6 +23099,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         // Bound reached. Stop touching the game's list; the bridge thread
         // prints the summary once the last frames have been consumed.
         s.finished = true;
+        s.sig_fence.store(nullptr, std::memory_order_seq_cst);
         // ---- HANGFIX 2026-09-12: STOP THE MID-FRAME MVec RECORDER TOO ----
         //
         // This return stops stream_on_finish_effects touching the game's list,
@@ -22052,11 +23268,21 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     seal.mvec_pitch  = s.mvec_fp2.Footprint.RowPitch;
     seal.mvec_mode   = (unsigned)s.mvec_mode;
     seal.mvec_valid  = 0u;
+    seal.local_nr_offset = s.local_nr_off;
+    seal.local_nr_bytes = s.local_nr_bytes;
+    seal.local_nr_width = s.local_nr_width;
+    seal.local_nr_height = s.local_nr_height;
+    seal.local_nr_format = s.local_nr_format;
+    seal.local_nr_pitch = s.local_nr_fp.Footprint.RowPitch;
+    seal.local_nr_valid = 0u;
+    seal.local_nr_pass = 0u;
     if (s.mvec_mode == 3)
     {
         if (s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u) seal.mvec_valid = 1u;
         else ++s.mvec_missing;
     }
+    if (s.seal_valid_on != 0u)   // R331: the vector tag, from the same read as seal.mvec_valid
+        s.mvec_slot_frame[(fi - 1) % stream_state::TAG_RING].store(seal.mvec_valid != 0u ? fi : 0ull, std::memory_order_release);   // R331b: by frame
     // R323 (HistoryGate=1 only): stamp the slot with dllmain's fact for this game frame.
     if (g_hist_gate.load(std::memory_order_relaxed) != 0)
         s.slot_dlss[slot].store((signed char)g_game_dlss.load(std::memory_order_relaxed), std::memory_order_release);
@@ -22099,6 +23325,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
 
         if (depth_ok) { seal.depth_valid = 1u; ++s.depth_valid_frames; }
         else          { ++s.depth_invalid_frames; }
+        if (s.seal_valid_on != 0u)   // R331: the depth tag, from the same decision as seal.depth_valid
+            s.depth_slot_frame[(fi - 1) % stream_state::TAG_RING].store(depth_ok ? fi : 0ull, std::memory_order_release);   // R331b: by frame
 
         // The consumer unpacks BEFORE the seal readback is available - the seal
         // is copied to a readback buffer and inspected a frame later - so it
@@ -22115,6 +23343,15 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // and the metric would quietly under-report the true motion gap. This is
     // the right unit, recorded where the seal is written.
     s.slot_game_frame[slot] = s.game_frames;
+    // Bind only a snapshot that precedes this colour seal. The history anchor
+    // advances solely after a successful final neural output, never on a failed evaluate.
+    if (mgpu::fg::capture_requested())
+    {
+        LARGE_INTEGER native_seal_qpc{};
+        QueryPerformanceCounter(&native_seal_qpc);
+        s.native_last_bound = mgpu::fg::bind_color(
+            s.game_frames, s.native_last_output, (uint64_t)native_seal_qpc.QuadPart);
+    }
     // R300 (T1.19): Dom's per-seal stamps, each only with its key.
     if (mgpu::t119::temporal_active())
         mgpu::tdiag::note_seal(slot, fi, s.game_frames, seal.mvec_valid != 0u, s.depth_slot_valid[slot] != 0u);   // R300a1
@@ -22134,6 +23371,29 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         (slot + 1) % stream_state::RING;
     if (s.fault_id == stream_state::FK_MAGIC && fi == 30) seal.magic = 0xDEADBEEFu;
 
+    if (s.local_nr)
+    {
+        const bool nr_ok = local_nr_record(s, slot, slot_off, fi);
+        unsigned long long answer_frame = nr_ok ? fi : 0ull;
+        unsigned long long answer_generation = nr_ok ? s.local_nr_generation : 0ull;
+        if (nr_ok && fi == 30ull)
+        {
+            if (s.fault_id == stream_state::FK_NR_TAG) answer_frame = fi + 1ull;
+            if (s.fault_id == stream_state::FK_NR_STALE) answer_frame = fi - 1ull;
+            if (s.fault_id == stream_state::FK_NR_GENERATION) answer_generation = s.local_nr_generation - 1ull;
+        }
+        seal.local_nr_frame = answer_frame;
+        seal.local_nr_generation = answer_generation;
+        seal.local_nr_width = s.local_nr_width;
+        seal.local_nr_height = s.local_nr_height;
+        // Use the pass that actually produced this answer, not a potentially
+        // newer menu value read after recording completed.
+        seal.local_nr_pass = s.local_nr_answer_pass;
+        s.local_nr_slot_generation[slot].store(answer_generation, std::memory_order_release);
+        s.local_nr_slot_frame[slot].store(answer_frame, std::memory_order_release);
+        seal.local_nr_valid = nr_ok ? 1u : 0u;
+    }
+
     memcpy(s.gup_cpu + (size_t)(slot * SEAL_STRIDE), &seal, sizeof seal);
 
     // Seal first, payload second, in one list. Command-list order guarantees
@@ -22143,7 +23403,8 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     const bool t119_pd = mgpu::t119::producer_active();
     LARGE_INTEGER pq0{};
     if (t119_pd) { QueryPerformanceCounter(&pq0); mgpu::p0t::mark(gl, fi, 0); }
-    gl->CopyBufferRegion(s.gxfer, slot_off, s.gup, (UINT64)slot * SEAL_STRIDE, sizeof(MgpuSeal));
+    ID3D12Resource *const xdst = mgpu::stage::dst(s.gxfer);   // R333: the staging ring when up, gxfer otherwise
+    gl->CopyBufferRegion(xdst, slot_off, s.gup, (UINT64)slot * SEAL_STRIDE, sizeof(MgpuSeal));
 
     D3D12_RESOURCE_BARRIER b{};
     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -22156,10 +23417,11 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     D3D12_TEXTURE_COPY_LOCATION cs{}, cd{};
     cs.pResource = src; cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     cs.SubresourceIndex = 0;
-    cd.pResource = s.gxfer; cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    cd.pResource = xdst; cd.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;   // R333
     cd.PlacedFootprint = s.fp; cd.PlacedFootprint.Offset = slot_off + SEAL_STRIDE;
     if (t119_pd) mgpu::p0t::mark(gl, fi, 1);   // R300h: after the first barrier, before the colour copy
-    gl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
+    if (!mgpu::stage::copy_colour(gl, cs, cd))
+        gl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
 
     // Restore EXACTLY. The game did not ask us to change its resource state and
     // must not be able to tell that we did.
@@ -22186,11 +23448,12 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         ds.pResource = dsrc;
         ds.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         ds.SubresourceIndex = 0;
-        dt.pResource = s.gxfer;
+        dt.pResource = xdst;   // R333
         dt.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         dt.PlacedFootprint = s.depth_fp;
         dt.PlacedFootprint.Offset = slot_off + s.depth_off;
-        gl->CopyTextureRegion(&dt, 0, 0, 0, &ds, nullptr);
+        if (!mgpu::stage::copy_depth(gl, ds, dt))
+            gl->CopyTextureRegion(&dt, 0, 0, 0, &ds, nullptr);
     }
 
     if (t119_pd)
@@ -22272,6 +23535,9 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     // measurement - if it does not go to zero on the next run, this fix did
     // not work and I would rather the log say so than assume it.
     if (!s.mvec_live.load(std::memory_order_acquire)) return;
+    if (s.local_nr &&
+        !local_nr_cpu_gate(s, s.produced_a.load(std::memory_order_acquire) + 1ull))
+        return;
 
     std::unique_lock<std::mutex> lk(s.mvec_cs, std::try_to_lock);
     if (!lk.owns_lock())
@@ -22354,11 +23620,15 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
     LARGE_INTEGER mq0{};
     if (t119_pd) QueryPerformanceCounter(&mq0);   // R300g1
 
+    // This mid-scene copy is the earliest write to the slot on some titles.
+    // It must pass the same ownership gate as the later colour and seal copies.
+    if (s.local_nr && !local_nr_gate(s, s.game_queue, t119_mfi)) return;
+
     D3D12_TEXTURE_COPY_LOCATION ms{}, mt{};
     ms.pResource = msrc;
     ms.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
     ms.SubresourceIndex = 0;
-    mt.pResource = s.gxfer;
+    mt.pResource = mgpu::stage::dst(s.gxfer);   // R333: same layout either way
     mt.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     mt.PlacedFootprint = s.mvec_fp2;
     mt.PlacedFootprint.Offset = slot_off + (r315_compare ? s.mvec2_off : s.mvec_off);
@@ -22373,7 +23643,8 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
         t119_b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
         gl->ResourceBarrier(1, &t119_b);
     }
-    gl->CopyTextureRegion(&mt, 0, 0, 0, &ms, nullptr);
+    if (r315_tail || !mgpu::stage::copy_mvec(gl, ms, mt))
+        gl->CopyTextureRegion(&mt, 0, 0, 0, &ms, nullptr);
     if (t_t119_tag_barrier)
     {   // restore exactly the state the game declared
         t119_b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
@@ -22496,9 +23767,188 @@ void stream_mvec_copy_tagged(void *cmd_list_v, unsigned long long mvec_handle,
 //    in COMMON in this mode, is read as NON_PIXEL_SHADER_RESOURCE on the
 //    direct queue, and is put back to COMMON at the end of that list, ready
 //    for the copy queue to take it again two frames later.
-static bool stream_cq_submit(stream_state &s, unsigned long long f)
+// R331. The one place the consumer asks "does slot `slot` carry frame f's lane".
+// Key absent: the live flag, exactly the expression every call site had.
+static inline bool r331_mvec_in_slot(const stream_state &s, unsigned slot, unsigned long long f)
 {
-    const unsigned ii = (unsigned)(f & 1ull);
+    if (s.seal_valid_on != 0u) return s.mvec_slot_frame[(f - 1) % stream_state::TAG_RING].load(std::memory_order_acquire) == f;   // R331b
+    return s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u;
+}
+static inline bool r331_depth_in_slot(const stream_state &s, unsigned slot, unsigned long long f)
+{
+    if (s.seal_valid_on != 0u) return s.depth_slot_frame[(f - 1) % stream_state::TAG_RING].load(std::memory_order_acquire) == f;   // R331b
+    return s.depth_slot_valid[slot] != 0u;
+}
+// R331 (OPT4). With the copy queue the lane was copied one poll before the bind:
+// require both that the copy was recorded and that this exact frame's seal is now
+// present. Mode 2 may record that copy speculatively, before the CPU can see the
+// seal; copied bytes alone must never make an invalid lane eligible for DLSS.
+static inline bool r331_mvec_bound(const stream_state &s, unsigned slot, unsigned long long f, bool use_cq, unsigned ii)
+{
+    if (s.seal_valid_on != 0u && use_cq)
+        return s.cq_mvec_ok[ii] != 0u && r331_mvec_in_slot(s, slot, f);
+    return r331_mvec_in_slot(s, slot, f);
+}
+static inline bool r331_depth_bound(const stream_state &s, unsigned slot, unsigned long long f, bool use_cq, unsigned ii)
+{
+    if (s.seal_valid_on != 0u && use_cq)
+        return s.cq_depth_ok[ii] != 0u && r331_depth_in_slot(s, slot, f);
+    return r331_depth_in_slot(s, slot, f);
+}
+
+// R338: StrobeCalib - the score and the stepper. Bridge thread, under s.cs, once per consumed frame
+// that ran NR, after the consume list of the PREVIOUS frame has completed (the readback holds that
+// frame's two boxes: the same ordering the liveness sample relies on).
+//
+// SCORE. Byte-level mean absolute difference, frame over frame, of the output box (out) and of the
+// input box (in). Both boxes are the same 64x64 at the frame centre. The strobe number is the output
+// change on frames whose input did NOT change ("at rest": in-diff below 1 code value per byte):
+// anything the output does there is the model's history, not the game. out/in over all frames is the
+// second column. Bytes, not decoded values, so the number compares settings on ONE title and format
+// and is not a quality metric across titles.
+//
+// STEPPER. 12 settings, StrobeHold seconds each (60 frames minimum), in this order:
+//   step 0..2    latch k = 0, 1, 2          with PassReset and NRFrameFilter as launched
+//   step 3..5    the same three              with PassReset=2 (every pass resets)
+//   step 6..8    the same three              with NRFrameFilter flipped (3 -> 0, or 0 -> 3)
+//   step 9..11   the same three              with both
+// Step 0 is the launch baseline. At the end the launch values are restored and the ranking is
+// printed with the arm-time levers it could not step (DepthTransport, MVecBarrierSource,
+// HistoryGate) and the 0.3.0-binding launch that steps them.
+static void r338_apply(stream_state &s, unsigned step)
+{
+    const unsigned k = step % 3u;
+    const bool pr2 = ((step / 3u) % 2u) == 1u;
+    const bool ff  = (step / 6u) == 1u;
+    s.latch_k = k;
+    s.pass_reset = pr2 ? 2 : s.sc_pr0;
+    const int ffm = ff ? (s.sc_ff0 == 0 ? 3 : 0) : s.sc_ff0;
+    if (mgpu::fgmap::ui_mode() != ffm) mgpu::fgmap::ui_set_mode(ffm);
+    char l[260];
+    snprintf(l, sizeof l, "[MGPU][R338] STROBE setting #%u: MVecLatchOffset=%u PassReset=%d NRFrameFilter=%d - holding %u s",
+             step, k, s.pass_reset, ffm, s.sc_hold_s);
+    mgpu::diag::info(l);
+}
+
+static void r338_close(stream_state &s)
+{
+    const unsigned step = s.sc_step;
+    stream_state::sc_result r{};
+    r.k = step % 3u; r.pr = s.pass_reset; r.ff = mgpu::fgmap::ui_mode();
+    r.n = s.sc_n; r.rest_n = s.sc_rest_n;
+    r.out_mean  = s.sc_n ? s.sc_out_sum / s.sc_n : 0.0;
+    r.in_mean   = s.sc_n ? s.sc_in_sum / s.sc_n : 0.0;
+    r.rest_out  = s.sc_rest_n ? s.sc_rest_out_sum / s.sc_rest_n : -1.0;
+    if (s.sc_res_n < 12u) s.sc_res[s.sc_res_n++] = r;
+    char l[420];
+    snprintf(l, sizeof l,
+             "[MGPU][R338] STROBE result #%u (latch=%u PassReset=%d NRFrameFilter=%d): frames=%u | at rest %u frames, output change %.3f "
+             "(the strobe number; -1 = the scene never rested) | out %.3f / in %.3f = %.3f | latch applied=%llu overruns=%llu",
+             step, r.k, r.pr, r.ff, r.n, r.rest_n, r.rest_out, r.out_mean, r.in_mean,
+             (r.in_mean > 1e-6) ? r.out_mean / r.in_mean : 0.0, s.latch_applied, s.latch_overruns);
+    mgpu::diag::info(l);
+    s.sc_n = s.sc_rest_n = 0u; s.sc_out_sum = s.sc_in_sum = s.sc_rest_out_sum = 0.0;
+}
+
+static void r338_finish(stream_state &s)
+{
+    // restore the launch values
+    s.latch_k = s.latch_k_ini;
+    s.pass_reset = s.sc_pr0;
+    if (mgpu::fgmap::ui_mode() != s.sc_ff0) mgpu::fgmap::ui_set_mode(s.sc_ff0);
+    s.sc_done = true;
+    // ranking: lowest at-rest output change first (settings that never rested rank last by out/in)
+    int order[12]; unsigned n = s.sc_res_n;
+    for (unsigned i = 0; i < n; ++i) order[i] = (int)i;
+    for (unsigned i = 0; i < n; ++i)
+        for (unsigned j = i + 1u; j < n; ++j)
+        {
+            const stream_state::sc_result &a = s.sc_res[order[i]], &b = s.sc_res[order[j]];
+            const double ka = (a.rest_out >= 0.0) ? a.rest_out : 1e9 + ((a.in_mean > 1e-6) ? a.out_mean / a.in_mean : 0.0);
+            const double kb = (b.rest_out >= 0.0) ? b.rest_out : 1e9 + ((b.in_mean > 1e-6) ? b.out_mean / b.in_mean : 0.0);
+            if (kb < ka) { const int tmp = order[i]; order[i] = order[j]; order[j] = tmp; }
+        }
+    char l[900];
+    int w = snprintf(l, sizeof l, "[MGPU][R338] STROBE RANKING (best first; setting: latch/PassReset/NRFrameFilter = at-rest output change, out/in):");
+    for (unsigned i = 0; i < n && w > 0 && (size_t)w < sizeof l - 80; ++i)
+    {
+        const stream_state::sc_result &r = s.sc_res[order[i]];
+        w += snprintf(l + w, sizeof l - (size_t)w, " #%d %u/%d/%d=%.3f,%.3f", order[i], r.k, r.pr, r.ff, r.rest_out,
+                      (r.in_mean > 1e-6) ? r.out_mean / r.in_mean : 0.0);
+    }
+    mgpu::diag::info(l);
+    mgpu::diag::info("[MGPU][R338] STROBE: launch values restored. A setting that wins here AND on the split view is the per-title "
+                     "answer (write its keys into mgpu.ini). The levers this stepper cannot move are arm-time: DepthTransport "
+                     "(1 = full-frame depth as 0.3.0, 3 = render size), MVecBarrierSource (0 = the barrier route as 0.3.0), "
+                     "HistoryGate (0 = as 0.3.0). The 0.3.0-binding launch is DepthTransport=1 MVecBarrierSource=0 HistoryGate=0 "
+                     "- one relaunch with those three lines, then this stepper again.");
+}
+
+static void r338_score_and_step(stream_state &s)
+{
+    // the score of the frame whose boxes the readback holds
+    unsigned char *m = nullptr;
+    D3D12_RANGE rr{0, (SIZE_T)(2u * s.sc_bytes)};
+    if (SUCCEEDED(s.sc_read->Map(0, &rr, (void **)&m)) && m != nullptr)
+    {
+        if (s.sc_have_prev)
+        {
+            unsigned long long dout = 0ull, din = 0ull;
+            const unsigned nb = s.sc_bytes;
+            const unsigned char *po = s.sc_prev, *pi = s.sc_prev + nb;
+            const unsigned char *co = m, *ci = m + nb;
+            for (unsigned i = 0; i < nb; ++i)
+            {
+                dout += (unsigned long long)((co[i] > po[i]) ? co[i] - po[i] : po[i] - co[i]);
+                din  += (unsigned long long)((ci[i] > pi[i]) ? ci[i] - pi[i] : pi[i] - ci[i]);
+            }
+            const double mo = (double)dout / (double)nb, mi = (double)din / (double)nb;
+            s.sc_out_sum += mo; s.sc_in_sum += mi; ++s.sc_n;
+            if (mi < 1.0) { s.sc_rest_out_sum += mo; ++s.sc_rest_n; }
+        }
+        memcpy(s.sc_prev, m, 2u * s.sc_bytes);
+        s.sc_have_prev = true;
+        D3D12_RANGE nn{0, 0};
+        s.sc_read->Unmap(0, &nn);
+    }
+
+    // the stepper
+    LARGE_INTEGER now{}, fq{};
+    QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
+    if (s.sc_t0.QuadPart == 0)
+    {
+        s.sc_pr0 = s.pass_reset; s.sc_ff0 = mgpu::fgmap::ui_mode();
+        s.sc_t0 = now; s.sc_step = 0u;
+        r338_apply(s, 0u);
+        return;
+    }
+    if (fq.QuadPart <= 0) return;
+    const double held = (double)(now.QuadPart - s.sc_t0.QuadPart) / (double)fq.QuadPart;
+    if (held < (double)s.sc_hold_s || s.sc_n < 60u) return;
+    r338_close(s);
+    if (s.sc_step + 1u >= 12u) { r338_finish(s); return; }
+    ++s.sc_step;
+    s.sc_t0 = now;
+    r338_apply(s, s.sc_step);
+}
+
+// R338: the slot the vectors are taken from for frame f. k = 0: this frame's own slot (today). k > 0: the
+// slot of frame f-k, if the ring still holds it (the producer has not written frame f-k+RING yet);
+// otherwise this frame's, counted as an overrun. Bridge thread, under s.cs; produced_a is the lock-free mirror.
+static inline void r338_mvec_source(stream_state &s, unsigned slot, unsigned long long f,
+                                    unsigned &src_slot, unsigned long long &src_f)
+{
+    src_slot = slot; src_f = f;
+    const unsigned k = s.latch_k;
+    if (k == 0u || f <= (unsigned long long)k) return;
+    const unsigned long long lf = f - k;
+    if (s.produced_a.load(std::memory_order_acquire) >= lf + (unsigned long long)stream_state::RING) { ++s.latch_overruns; return; }
+    src_slot = (unsigned)((lf - 1ull) % stream_state::RING); src_f = lf;
+    ++s.latch_applied;
+}
+
+static bool stream_cq_submit(stream_state &s, unsigned long long f, unsigned ii)   // R343 (FIX6): the half is the caller's; key absent it is f & 1
+{
     if (s.cq == nullptr || s.cqf == nullptr || s.cqa[ii] == nullptr ||
         s.cql[ii] == nullptr || s.tex_in[ii] == nullptr || s.nxfer == nullptr)
         return false;
@@ -22542,9 +23992,14 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
     // submission decays the destination to COMMON, and the direct queue
     // transitions from there - which is what the before-state comment in
     // stream_poll is about.
+    bool r331_depth_copied = false, r331_mvec_copied = false;   // R331 (OPT4)
+    // Mode 2 can arm f+1 before its CPU-side seal exists. The GPU fence below
+    // guarantees arrival before these copies execute, so record all three lanes
+    // together; r331_*_bound still requires the exact frame's valid seal at use.
     if (s.depth_mode != 0 && s.tex_depth[ii] != nullptr &&
-        s.depth_bytes != 0 && s.depth_slot_valid[slot] != 0u)
+        s.depth_bytes != 0 && (s.cq_gated || r331_depth_in_slot(s, slot, f)))
     {
+        r331_depth_copied = true;
         D3D12_TEXTURE_COPY_LOCATION dsu{}, ddu{};
         dsu.pResource = s.nxfer;
         dsu.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
@@ -22561,14 +24016,18 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
     // same slot, same argument as depth's - one batch, one fence, no extra
     // round trip. The synthetic modes still never appear here: they are
     // uploaded on GPU 1 and never touch the bus.
+    unsigned r338_slot = slot; unsigned long long r338_f = f;   // R338: latched source (slot, f when MVecLatchOffset=0)
+    r338_mvec_source(s, slot, f, r338_slot, r338_f);
+    s.r338_slot_ii[ii] = r338_slot; s.r338_f_ii[ii] = r338_f;   // R338a: the pair every gate of frame f reads
     if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-        s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
+        s.mvec_bytes2 != 0 && (s.cq_gated || r331_mvec_in_slot(s, r338_slot, r338_f)))
     {
+        r331_mvec_copied = true;
         D3D12_TEXTURE_COPY_LOCATION msu{}, mdu{};
         msu.pResource = s.nxfer;
         msu.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
         msu.PlacedFootprint = s.mvec_fp2;
-        msu.PlacedFootprint.Offset = slot_off + s.mvec_off;
+        msu.PlacedFootprint.Offset = (UINT64)r338_slot * s.slot_bytes + s.mvec_off;   // R338
         mdu.pResource = s.tex_mvec_r[ii];
         mdu.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
         mdu.SubresourceIndex = 0;
@@ -22576,6 +24035,7 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
         ++s.mvec_unpacks;
     }
 
+    if (s.seal_valid_on != 0u) { s.cq_depth_ok[ii] = r331_depth_copied ? 1u : 0u; s.cq_mvec_ok[ii] = r331_mvec_copied ? 1u : 0u; }   // R331 (OPT4)
     if (s.cq_ts_ok)
     {
         s.cql[ii]->EndQuery(s.cq_tsheap, D3D12_QUERY_TYPE_TIMESTAMP, ii * 2u + 1u);
@@ -22606,12 +24066,113 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
     {
         if (FAILED(s.cq->Wait(s.nfence, (UINT64)f))) return false;
     }
+
     ID3D12CommandList *const cls[1] = { s.cql[ii] };
     s.cq->ExecuteCommandLists(1, cls);
     if (FAILED(s.cq->Signal(s.cqf, (UINT64)f))) return false;
     s.cqf_value = (UINT64)f;
     s.cqa_value[ii] = (UINT64)f;
+    s.half_frame[ii] = f;   // R343 (FIX6): written always, read only with LateLatch=1
     return true;
+}
+
+// R343 (FIX6): the half holding frame f, or 2 if neither does. LateLatch=1 only.
+static unsigned r343_half_of(const stream_state &s, unsigned long long f)
+{
+    if (f != 0ull && s.half_frame[0] == f) return 0u;
+    if (f != 0ull && s.half_frame[1] == f) return 1u;
+    return 2u;
+}
+
+// R343: the late latch itself. Bridge thread, s.cs HELD. Picks the newest ARRIVED frame (whatever its
+// parity), copies it into the half the running evaluate is not reading. Mode 2 may latch f+1 before it
+// arrives (the GPU gate on the game's fence holds the copy, as the shipped prefetch does); mode 1 never
+// latches a frame that has not landed. The copy must finish before the producer laps the slot.
+static void r343_latch(stream_state &s, unsigned long long f)
+{
+    if (s.nfence == nullptr || s.cq == nullptr) return;
+    const unsigned long long arrived = (unsigned long long)s.nfence->GetCompletedValue();
+    unsigned long long p = (arrived > f) ? arrived : 0ull;
+    if (p == 0ull)
+    {
+        if (!s.cq_gated) return;
+        p = f + 1ull;
+    }
+    if (p <= s.cq_issued) return;
+    if (arrived + 2ull >= p + (unsigned long long)stream_state::RING) { ++s.ll_refused; return; }
+    if (stream_cq_submit(s, p, 1u - s.eval_half))
+    {
+        s.cq_issued = p;
+        s.ll_pending = p;
+        ++s.ll_issued;
+        if (p > arrived) ++s.cq_spec;
+    }
+}
+
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+// R343: the latch timer. Bridge thread only; created on first use, closed in stream_release.
+static HANDLE g_r343_timer = nullptr;
+static bool   g_r343_timer_tried = false;
+static HANDLE r343_timer()
+{
+    if (!g_r343_timer_tried)
+    {
+        g_r343_timer_tried = true;
+        g_r343_timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (g_r343_timer == nullptr) g_r343_timer = CreateWaitableTimerW(nullptr, TRUE, nullptr);
+    }
+    return g_r343_timer;
+}
+static void r343_timer_close()
+{
+    if (g_r343_timer != nullptr) { CancelWaitableTimer(g_r343_timer); CloseHandle(g_r343_timer); g_r343_timer = nullptr; }
+    g_r343_timer_tried = false;
+}
+
+// R343: replaces the plain WaitForSingleObject(s.nev, 5000) on the evaluate when LateLatch=1. Called with
+// lk HELD, returns with lk HELD and the wait's result exactly as the plain call would. Waits until the
+// evaluate is nearly done (last list ms - last copy ms - 1.5 ms margin), latches, then waits the rest.
+// The lock is held only around the latch, never across a wait (DEFECT E).
+static DWORD r343_wait_and_latch(stream_state &s, std::unique_lock<std::mutex> &lk, unsigned long long f)
+{
+    double lead = s.ll_list_ms - s.ll_copy_ms - 1.5;
+    if (lead < 0.0) lead = 0.0;
+    const HANDLE ev = s.nev;
+    lk.unlock();
+    bool nr_done = false, failed = false;
+    DWORD wr = WAIT_TIMEOUT;
+    if (lead > 0.0)
+    {
+        const HANDLE tm = r343_timer();
+        LARGE_INTEGER due{};
+        due.QuadPart = -(LONGLONG)(lead * 10000.0);
+        if (tm != nullptr && SetWaitableTimer(tm, &due, 0, nullptr, nullptr, FALSE))
+        {
+            const HANDLE hs[2] = { ev, tm };
+            const DWORD r = WaitForMultipleObjects(2, hs, FALSE, 5000);
+            if (r == WAIT_OBJECT_0)          { nr_done = true; wr = r; CancelWaitableTimer(tm); }
+            else if (r != WAIT_OBJECT_0 + 1) { failed = true;  wr = r; CancelWaitableTimer(tm); }
+        }
+        else
+        {
+            const DWORD r = WaitForSingleObject(ev, (DWORD)(lead + 0.5));
+            if (r == WAIT_OBJECT_0)     { nr_done = true; wr = r; }
+            else if (r != WAIT_TIMEOUT) { failed = true;  wr = r; }
+        }
+    }
+    if (!failed)
+    {
+        lk.lock();
+        if (s.nev == nullptr || s.cq == nullptr || s.nl == nullptr) return WAIT_FAILED;   // released while we waited unlocked: touch nothing
+        if (nr_done) ++s.ll_early;
+        r343_latch(s, f);
+        lk.unlock();
+    }
+    if (!nr_done && !failed) wr = WaitForSingleObject(ev, 5000);
+    lk.lock();
+    return wr;
 }
 
 // Bridge thread, once per present. Cheap and does nothing until frames exist.
@@ -22621,6 +24182,25 @@ static bool stream_cq_submit(stream_state &s, unsigned long long f)
 // periodic line in stream_poll carries the count. Per kind rather than in
 // aggregate, so a storm of one kind cannot hide a single instance of another -
 // which is exactly the case a shared budget would lose.
+// R359 (Marcelo 2026-11-09 01:33): with StageCopy on, the seal checker's DROPPED / REORDERED / STALE lines are
+// printed as WARN with one note, not as ERROR, until they are shown to be a real fault. Seen on RE4 at stream start
+// only (R4 / R4d: first ~3 s, menu 230-280 fps, 4.4 of 6 ring slots in flight, 75% of sealed frames never
+// evaluated); the picture was right (Marcelo). BEHAVIOUR UNCHANGED: the counters, the skip of the frame and the
+// 20-per-kind cap are exactly as before; only the level and the wording of the line change. StageCopy off: ERROR as
+// always.
+static void seal_fault_line(const char *l)
+{
+    if (!mgpu::stage::active()) { mgpu::diag::error(l); return; }
+    static std::atomic<bool> said{false};
+    char w[640];
+    snprintf(w, sizeof w, "%s [R359: StageCopy on - WARN until shown to be a real fault; the frame is skipped as before]", l);
+    mgpu::diag::warn(w);
+    if (!said.exchange(true, std::memory_order_relaxed))
+        mgpu::diag::warn("[MGPU][R359] StageCopy is on: seal-order lines (DROPPED / REORDERED / STALE) are logged as WARN. "
+                         "They were seen only at stream start with the ring nearly full (the game far ahead of the neural "
+                         "card); the frames concerned are skipped, nothing wrong is shown. Whether this is a fault is open.");
+}
+
 static bool fault_log(stream_state &s, unsigned long long &per_kind)
 {
     ++per_kind;
@@ -22781,91 +24361,33 @@ static void costcurve_solve(stream_state &s)
     }
 }
 
-// Dynamic 1.5: record four tiny motion-vector tiles on evaluated frames.
-// This is called while the transported vector texture is already an SRV. The
-// readback shares nr_read and the frame's existing completion fence.
-static void dynamic15_record(stream_state &s, unsigned long long f, unsigned slot, unsigned ii)
+// Read B1 identity from THIS frame's CPU-staged seal while recording GPU1's
+// list. nseal cannot answer here: this frame's readback copy has not executed
+// yet. gup_cpu is stable under s.cs during recording, and ring backpressure
+// prevents its GPU copy from being overwritten before the consumer retires.
+// seal_consume independently validates the cross-adapter readback after the
+// list completes; an invalid staged identity can only select native fallback.
+static void sealed_local_nr_identity(stream_state &s, unsigned long long f, unsigned slot,
+                                     unsigned long long &frame, unsigned long long &generation,
+                                     unsigned &answer_w, unsigned &answer_h, unsigned &answer_pass)
 {
-    s.dyn15_sample_frame = ~0ull;
-    if (s.nr_cadence != 15u || !s.nrs_on || !mgpu::prism_x1::ab_enabled() ||
-        !mgpu::prism_carry::active() || s.mvec_mode != 3 || s.mvec_bytes2 == 0 ||
-        s.mvec_slot_valid[slot].load(std::memory_order_acquire) == 0u ||
-        s.mvec_w < 32u || s.mvec_h < 32u || mv_texel_bytes(s.mvec_format) == 0u)
+    frame = 0ull;
+    generation = 0ull;
+    answer_w = answer_h = answer_pass = 0u;
+    if (s.gup_cpu == nullptr) return;
+    MgpuSeal got{};
+    memcpy(&got, s.gup_cpu + (size_t)(slot * SEAL_STRIDE), sizeof got);
+    if (got.magic != SEAL_MAGIC || got.seal_version != SEAL_VERSION ||
+        got.frame_index != f || got.slot_index != slot || got.local_nr_valid == 0u ||
+        !mgpu::b1::valid_answer_extent(got.local_nr_width, got.local_nr_height,
+                                       s.local_nr_max_width, s.local_nr_max_height) ||
+        got.local_nr_pass >= 3u)
         return;
-    ID3D12Resource *const motion = s.tex_mvec_r[ii];
-    if (motion == nullptr || s.nl == nullptr || s.nr_read == nullptr) return;
-    barrier(s.nl, motion, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-            D3D12_RESOURCE_STATE_COPY_SOURCE);
-    for (unsigned t = 0; t < 4; ++t)
-    {
-        const unsigned cx = ((t & 1u) ? 3u : 1u) * s.mvec_w / 4u;
-        const unsigned cy = ((t & 2u) ? 3u : 1u) * s.mvec_h / 4u;
-        const unsigned sx = std::min(cx >= 16u ? cx - 16u : 0u, s.mvec_w - 32u);
-        const unsigned sy = std::min(cy >= 16u ? cy - 16u : 0u, s.mvec_h - 32u);
-        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-        src.pResource = motion;
-        src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-        src.SubresourceIndex = 0;
-        dst.pResource = s.nr_read;
-        dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-        dst.PlacedFootprint = s.dyn15_fp;
-        dst.PlacedFootprint.Offset = 1024ull + (UINT64)t * 32u * 256u;
-        const D3D12_BOX box{ sx, sy, 0u, sx + 32u, sy + 32u, 1u };
-        s.nl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-    }
-    barrier(s.nl, motion, D3D12_RESOURCE_STATE_COPY_SOURCE,
-            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    s.dyn15_sample_frame = f;
-}
-
-static void dynamic15_read(stream_state &s, unsigned long long f)
-{
-    if (s.dyn15_sample_frame != f) return;
-    s.dyn15_sample_frame = ~0ull;
-    s.dyn15_valid = false;
-    const unsigned tb = mv_texel_bytes(s.mvec_format);
-    unsigned char *sm = nullptr;
-    const D3D12_RANGE range{ 1024, 1024 + 4 * 32 * 256 };
-    if (tb != 0u && s.nr_read != nullptr)
-        (void)s.nr_read->Map(0, &range, (void **)&sm);
-    float magnitude[4 * 32 * 32] = {};
-    unsigned n = 0;
-    if (sm != nullptr)
-    {
-        for (unsigned t = 0; t < 4; ++t)
-            for (unsigned y = 0; y < 32; ++y)
-                for (unsigned x = 0; x < 32; ++x)
-                {
-                    const unsigned char *px = sm + 1024 + t * 32 * 256 + y * 256 + x * tb;
-                    float vx = 0.0f, vy = 0.0f;
-                    if (!mv_read(s.mvec_format, px, vx, vy)) continue;
-                    const float mx = vx * s.mvec_scale_x, my = vy * s.mvec_scale_y;
-                    if (!std::isfinite(mx) || !std::isfinite(my) ||
-                        std::fabs(mx) > 100000.0f || std::fabs(my) > 100000.0f) continue;
-                    magnitude[n++] = std::sqrt(mx * mx + my * my);
-                }
-        const D3D12_RANGE none{0, 0};
-        s.nr_read->Unmap(0, &none);
-    }
-    if (n < 1024u) return; // Too little reliable data: the scheduler takes the NR fallback.
-    std::sort(magnitude, magnitude + n);
-    double sum = 0.0;
-    for (unsigned i = 0; i < n; ++i) sum += magnitude[i];
-    s.dyn15_mean = (float)(sum / n);
-    s.dyn15_p90 = magnitude[(n * 90u) / 100u];
-    s.dyn15_risky = s.dyn15_mean > 4.0f || s.dyn15_p90 > 14.0f;
-    s.dyn15_valid = true;
-    ++s.dyn15_samples;
-    if (s.dyn15_samples == 1 || s.dyn15_samples % 300ull == 0ull)
-    {
-        char line[360];
-        snprintf(line, sizeof line,
-                 "[MGPU][DYN15] samples=%llu mean=%.2f px p90=%.2f px risk=%u "
-                 "forced-by-motion=%llu forced-by-guard=%llu (thresholds 4/14 px).",
-                 s.dyn15_samples, (double)s.dyn15_mean, (double)s.dyn15_p90,
-                 s.dyn15_risky ? 1u : 0u, s.dyn15_forced_motion, s.dyn15_forced_guard);
-        mgpu::diag::info(line);
-    }
+    frame = got.local_nr_frame;
+    generation = got.local_nr_generation;
+    answer_w = got.local_nr_width;
+    answer_h = got.local_nr_height;
+    answer_pass = got.local_nr_pass;
 }
 
 // ---- D1: the seal checker, lifted out so ONE copy serves TWO callers ----
@@ -22934,6 +24456,9 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     if (tv[i] < tv[i - 1]) sane = false;   // a wrapped or unwritten mark
                 if (sane)
                 {
+                    // R343: the whole direct list, first mark to last - the latch's estimate of how long the NEXT
+                    // evaluate takes; taken from every frame (it predicts, it does not report). Key absent: a store.
+                    s.ll_list_ms = (double)(tv[stream_state::TS_MARKS - 1] - tv[0]) * 1000.0 / (double)s.ts_freq;
                     if (mgpu::t119::perf_active())
                     {   // R300e1: this job's own GPU1 timestamps, ms - pre-NGX (seal copy + unpack), NGX evaluate, output
                         const double kms = 1000.0 / (double)s.ts_freq;
@@ -23119,6 +24644,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     const double cms = (double)(mk[1] - mk[0]) * 1000.0
                                      / (double)s.cq_ts_freq;
                     s.cq_ts_sum += cms;
+                    s.ll_copy_ms = cms;   // R343: the latch's copy estimate
                     if (cms < s.cq_ts_min) s.cq_ts_min = cms;
                     if (cms > s.cq_ts_max) s.cq_ts_max = cms;
                     ++s.cq_ts_n;
@@ -23148,6 +24674,8 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 s.nr_read->Unmap(0, &nn);
             }
         }
+        if (run_nr && !s.profile && s.sc_on != 0u && s.sc_read != nullptr && s.sc_prev != nullptr && !s.sc_done)   // R338
+            r338_score_and_step(s);
 
         if (got.magic != SEAL_MAGIC || got.seal_version != SEAL_VERSION)
         {
@@ -23195,6 +24723,27 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 mgpu::diag::error(line);
             }
 
+            if (s.local_nr &&
+                (got.local_nr_offset != s.local_nr_off ||
+                 got.local_nr_bytes != s.local_nr_bytes ||
+                 !mgpu::b1::valid_answer_extent(got.local_nr_width, got.local_nr_height,
+                                                s.local_nr_max_width, s.local_nr_max_height) ||
+                 got.local_nr_format != s.local_nr_format ||
+                 got.local_nr_pitch != s.local_nr_fp.Footprint.RowPitch ||
+                 got.local_nr_pass >= 3u))
+            {
+                ++s.contract;
+                snprintf(line, sizeof line,
+                         "[MGPU][B1] NR CONTRACT MISMATCH f=%llu: off=%llu bytes=%llu actual=%ux%u pass=%u fmt=%u pitch=%u | storage=%ux%u fmt=%u pitch=%u",
+                         f, (unsigned long long)got.local_nr_offset,
+                         (unsigned long long)got.local_nr_bytes,
+                         got.local_nr_width, got.local_nr_height, got.local_nr_pass,
+                         got.local_nr_format, got.local_nr_pitch,
+                         s.local_nr_max_width, s.local_nr_max_height, s.local_nr_format,
+                         (unsigned)s.local_nr_fp.Footprint.RowPitch);
+                mgpu::diag::error(line);
+            }
+
             // ---- R63: the depth half of the contract ----
             //
             // Checked against OUR arm-time values, not against the seal's own
@@ -23232,7 +24781,22 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 // The seal crossed the adapter; depth_slot_valid did not. They
                 // describe the same fact by two different routes, so a
                 // disagreement is a real finding rather than a tie to break.
-                if ((got.depth_valid != 0u) != (s.depth_slot_valid[slot] != 0u))
+                if (s.seal_valid_on != 0u)
+                {   // R331a: compare the seal against the lane decision of the frame the consumer EVALUATED (sampled
+                    // at the bind), not against a tag read now - and only for evaluated frames. A seal that said
+                    // valid while the bind was refused and the slot's tag has moved past f is the ring-edge case.
+                    if (run_nr)
+                    {
+                        const bool bound = s.r331_bind_depth[ii] != 0u;
+                        if ((got.depth_valid != 0u) != bound)
+                        {
+                            ++s.depth_flag_disagree; ++s.r331_depth_dis;
+                            const unsigned long long tg = s.depth_slot_frame[(f - 1) % stream_state::TAG_RING].load(std::memory_order_acquire);   // R331b
+                            if (got.depth_valid != 0u && !bound && tg > f) ++s.r331_depth_retag;
+                        }
+                    }
+                }
+                else if ((got.depth_valid != 0u) != r331_depth_in_slot(s, slot, f))
                     ++s.depth_flag_disagree;
 
                 // Periodic, because Frames=0 runs print no summary and a
@@ -23326,7 +24890,20 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
 
                 // The seal crossed the adapter; mvec_slot_valid did not. Same
                 // fact by two routes, so a disagreement is a finding.
-                if ((got.mvec_valid != 0u) != (s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u))
+                if (s.seal_valid_on != 0u)
+                {   // R331a: as for depth - evaluated frames only, against what was bound.
+                    if (run_nr)
+                    {
+                        const bool bound = s.r331_bind_mvec[ii] != 0u;
+                        if ((got.mvec_valid != 0u) != bound)
+                        {
+                            ++s.mvec_flag_disagree; ++s.r331_mvec_dis;
+                            const unsigned long long tg = s.mvec_slot_frame[(f - 1) % stream_state::TAG_RING].load(std::memory_order_acquire);   // R331b
+                            if (got.mvec_valid != 0u && !bound && tg > f) ++s.r331_mvec_retag;
+                        }
+                    }
+                }
+                else if ((got.mvec_valid != 0u) != r331_mvec_in_slot(s, slot, f))
                     ++s.mvec_flag_disagree;
 
                 if (f >= s.mvec_report_at)
@@ -23751,7 +25328,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                              "[MGPU][SEAL] STALE f=%llu: the slot still holds seal %llu. The fence "
                              "said frame %llu had landed and it had not.",
                              f, (unsigned long long)got.frame_index, f);
-                    mgpu::diag::error(line);
+                    seal_fault_line(line);   // R359
                 }
             }
             else if (got.frame_index < s.last_seen)
@@ -23762,7 +25339,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     snprintf(line, sizeof line,
                              "[MGPU][SEAL] REORDERED f=%llu: seal says %llu, last seen %llu",
                              f, (unsigned long long)got.frame_index, s.last_seen);
-                    mgpu::diag::error(line);
+                    seal_fault_line(line);   // R359
                 }
             }
             else
@@ -23781,7 +25358,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         snprintf(line, sizeof line,
                                  "[MGPU][SEAL] DROPPED f=%llu gap=%llu (last_new=%llu)",
                                  f, gap, s.last_seen);
-                        mgpu::diag::error(line);
+                        seal_fault_line(line);   // R359
                     }
                 }
                 const double lat = (s.freq.QuadPart > 0)
@@ -23821,6 +25398,49 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                     mgpu::diag::info(line);
                 }
             }
+        }
+        // R331a / R343 / R344: the fix-phase lines, each only with its key, every 1200 evaluated frames.
+        if (run_nr && s.seal_valid_on != 0u)
+        {
+            ++s.r331_cmp;
+            if (f >= s.r331_report_at)
+            {
+                s.r331_report_at = f + 1200ull;
+                char rl[520];
+                snprintf(rl, sizeof rl,
+                         "[MGPU][R331a] f=%llu MVecSealValid=1: seal vs bound, EVALUATED frames only: compared=%llu | depth "
+                         "disagreements=%llu (seal valid, not bound, slot already re-tagged past f: %llu) | vector "
+                         "disagreements=%llu (re-tagged: %llu). A re-tagged count is the ring edge: the producer was 5+ frames "
+                         "past the frame when its copy was decided (RingEdgeProbe=1 sizes it).",
+                         f, s.r331_cmp, s.r331_depth_dis, s.r331_depth_retag, s.r331_mvec_dis, s.r331_mvec_retag);
+                mgpu::diag::info(rl);
+            }
+        }
+        if (run_nr && s.ll_on != 0u && f >= s.ll_report_at)
+        {
+            s.ll_report_at = f + 1200ull;
+            char ll[560];
+            snprintf(ll, sizeof ll,
+                     "[MGPU][R343] f=%llu LateLatch=1 age<=%u: latched=%llu used=%llu too-old=%llu latched-after-NR-finished=%llu "
+                     "refused-at-ring-edge=%llu | last list est %.2f ms, last copy %.2f ms | cq ahead=%llu spec=%llu fails=%llu. HOW TO "
+                     "READ IT: used/latched near 1 means the unpack left the critical path; too-old high means raise LateLatchAge "
+                     "or the estimate is early; latched-after-NR-finished high means the estimate is late and the copy still "
+                     "runs mostly in series.",
+                     f, s.ll_age, s.ll_issued, s.ll_hits, s.ll_stale, s.ll_early, s.ll_refused, s.ll_list_ms, s.ll_copy_ms,
+                     s.cq_ahead, s.cq_spec, s.cq_fails);
+            mgpu::diag::info(ll);
+        }
+        if (run_nr && s.re_on != 0u && f >= s.re_report_at)
+        {
+            s.re_report_at = f + 1200ull;
+            char re[700];
+            int w = snprintf(re, sizeof re, "[MGPU][R344] f=%llu RingEdgeProbe: producer distance past the evaluated frame at its copy "
+                                            "decision (ring=%u), evaluated frames / then without depth / without vectors:", f, stream_state::RING);
+            for (unsigned q = 0; q < 8u && w > 0 && (size_t)w < sizeof re - 60; ++q)
+                w += snprintf(re + w, sizeof re - (size_t)w, " [%u%s] %llu/%llu/%llu", q, q == 7u ? "+" : "", s.re_hist[q], s.re_nodepth[q], s.re_nomvec[q]);
+            if (w > 0 && (size_t)w < sizeof re - 120)
+                snprintf(re + w, sizeof re - (size_t)w, ". At 5+ the slot's tag has moved on; at 6+ its bytes are being rewritten.");
+            mgpu::diag::info(re);
         }
 }
 
@@ -24225,10 +25845,25 @@ void stream_poll()
     // T1.12 (PerfPrefetch=1 with Perf11=1 only): the frame the loop below works up to - the frame the copy
     // queue already armed instead of the newest. Key absent: sched_to == completed, the live loop exactly.
     // Overrun detection keeps `completed`.
-    const unsigned long long sched_to = mgpu::t119::prefetch_active()
+    unsigned long long sched_to = mgpu::t119::prefetch_active()
         ? mgpu::perf::sched_target(completed, s.consumed, s.cq_issued,
                                    s.copy_queue && s.cq_gated && s.cq != nullptr, s.finished)
         : completed;
+    // R343 (LateLatch=1): evaluate the late-latched frame if it has arrived and is at most ll_age frames
+    // older than the newest arrival; its copy is already on the copy queue. `completed` keeps the newest
+    // arrival for the overrun check. Key absent: ll_pending is always 0 and sched_to is untouched.
+    if (s.ll_on != 0u && s.ll_pending != 0ull)
+    {
+        const unsigned long long lp = s.ll_pending;
+        if (lp <= s.consumed) s.ll_pending = 0ull;              // overtaken; nothing to do
+        else if (lp <= completed)
+        {
+            s.ll_pending = 0ull;
+            if (completed - lp <= (unsigned long long)s.ll_age) { sched_to = lp; ++s.ll_hits; }
+            else ++s.ll_stale;                                   // its copy is wasted; take the newest
+        }
+        // else: latched speculatively and not arrived yet - keep it pending
+    }
     if (s.rw_at == 0ull)
     {
         s.rw_at = s.consumed;
@@ -24315,7 +25950,10 @@ void stream_poll()
     //
     // WHAT THIS DOES NOT CHANGE: which frame is evaluated, and which frame
     // reaches the screen. Both were already the newest and both still are.
-    if (s.consumed + 1 < sched_to)
+    // B1 has a real GPU0 NR answer for EVERY seal.  The legacy bulk pass
+    // consumes all but the newest seal without running their composition, so
+    // it must stay off for B1 even though CopyQueue/StageCopy are disabled.
+    if (!s.local_nr && s.consumed + 1 < sched_to)
     {
         const unsigned long long bulk_last = sched_to - 1;
         unsigned long long bfi[stream_state::RING] = {};
@@ -24468,7 +26106,7 @@ void stream_poll()
         // Off fg, or with the mode off, every line below is the old path.
         const bool mvec_fresh =
             (s.mvec_mode == 3 && s.mvec_bytes2 != 0 &&
-             s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u);
+             r331_mvec_in_slot(s, slot, f));   // R331: the tag when MVecSealValid=1, the live flag otherwise
         const bool fg_act  = mgpu::fgmap::act() && mgpu::fgmap::fg_active();
         // NR3b: the generated frame is the FIRST seal after an fg evaluate
         // (fg_map records it per slot at seal time), not the seal without a
@@ -24479,44 +26117,34 @@ void stream_poll()
         // NR3: evaluate only 1 generated frame in N; the rest keep the last
         // output on screen (the same path as a superseded frame below).
         const bool fg_thin = fg_gen && mgpu::fgmap::thin_this();
-        // [OURS] Fixed 1.5 cadence: NR, aligned hold, NR, repeating every three
-        // consumed frames. Evaluation intervals alternate between two and one frames,
-        // so two evaluates per three frames = 1.5 frames per evaluate on average.
-        // Motion risk, scene complexity and a missing alignment guide NEVER add
-        // an unscheduled NGX evaluate. If alignment is unavailable, the scheduled
-        // hold keeps the previous output until the next due evaluate.
-        const bool cadence15 = s.nr_cadence == 15u;
-        const bool hold_scheduled = cadence15 && s.nr_final != nullptr && (f % 3ull) == 1ull;
-        const bool cadence_due = !cadence15 || s.nr_final == nullptr || !hold_scheduled;
-        const bool nr_eligible = s.nr_ok && newest && s.neural && !fg_thin;
-        const bool run_nr = nr_eligible && cadence_due;
-        const bool run_align = nr_eligible && !run_nr && cadence15 && s.nr_final != nullptr && s.nrs_on &&
-                               mgpu::prism_x1::ab_enabled() && mgpu::prism_carry::ready();
-        if (mgpu::xessfg::active() && !run_nr && !run_align)
+        // [OURS] Cadence is independent of Passes. A held frame deliberately skips the whole
+        // unpack/evaluate block and leaves nr_final untouched, so the presenter reuses the last
+        // neural result. nr_final==nullptr forces the first evaluation after arming.
+        const unsigned cadence = (s.nr_cadence == 2u || s.nr_cadence == 4u) ? s.nr_cadence : 1u;
+        const bool cadence_due = cadence == 1u || s.nr_final == nullptr || s.nr_cadence_wait >= cadence - 1u;
+        // B1 produces one local NR answer for every frame on GPU0.  The GPU1
+        // consumer must not discard that answer merely because a newer seal has
+        // already arrived: doing so reintroduces cadence skipping into the
+        // every-frame chain.  Legacy cadence keeps its original newest-only rule.
+        const bool run_nr = s.nr_ok && (newest || s.local_nr) && s.neural && !fg_thin && cadence_due;
+        if (s.nr_ok && (newest || s.local_nr) && s.neural && !fg_thin)
         {
-            if (s.xess_inputs.color != nullptr)
+            if (run_nr) s.nr_cadence_wait = 0;
+            else
             {
-                static unsigned long long discarded = 0;
-                ++discarded;
-                if (discarded <= 3u || discarded % 120ull == 0ull)
+                ++s.nr_cadence_wait;
+                if (!s.nr_cadence_hold_said)
                 {
-                    char line[400];
-                    snprintf(line, sizeof line,
-                             "[MGPU][XESS-CLEAR] f=%llu discarded source=%llu: nr_ok=%d newest=%d neural=%d fg_thin=%d; total=%llu",
-                             f, s.xess_inputs.source_frame, s.nr_ok ? 1 : 0, newest ? 1 : 0,
-                             s.neural ? 1 : 0, fg_thin ? 1 : 0, discarded);
-                    mgpu::diag::warn(line);
+                    s.nr_cadence_hold_said = true;
+                    char cl[240];
+                    snprintf(cl, sizeof cl,
+                             "[MGPU][NRCADENCE] held f=%llu under every-%u-frames scheduling; previous neural output kept.",
+                             f, cadence);
+                    mgpu::diag::info(cl);
                 }
             }
-            s.xess_inputs = {};
-            s.xess_snapshot_qpc = {};
         }
-        if (run_align && !s.nr_cadence_hold_said)
-        {
-            s.nr_cadence_hold_said = true;
-            mgpu::diag::info("[MGPU][NRCADENCE] fixed 1.5-frame hold uses current-frame edit alignment; no motion-risk fallback to x1.");
-        }
-        if (!newest) ++s.nr_skipped;
+        if (!newest && !s.local_nr) ++s.nr_skipped;
         if (mgpu::t119::perf_active())
             mgpu::perf::job_begin(f, slot, completed, run_nr, newest, s.game_frames, s.slot_game_frame[slot]);   // R300e1
         if (run_nr && mgpu::t119::producer_active()) mgpu::pdiag::note_evaluated(f);   // R300g3
@@ -24552,7 +26180,32 @@ void stream_poll()
         // are the same fact.
         unsigned ii = 0;
         bool use_cq = false;
-        if (s.copy_queue && (run_nr || run_align) && s.cq != nullptr)
+        if (s.copy_queue && run_nr && s.cq != nullptr && s.ll_on != 0u)
+        {
+            // R343 (LateLatch=1, Dave's FIX6 half assignment): the half that already holds f (late-latched or
+            // prefetched), else the older of the two - never the half a pending latched copy of a NEWER frame is
+            // landing in. Frames between are never evaluated (newest-only), so they are not copied; no f+1
+            // speculation (the latch chooses the next frame). Key absent: the shipped block below, untouched.
+            ii = r343_half_of(s, f);
+            const bool have_f = (ii != 2u);
+            if (!have_f) ii = (s.half_frame[0] <= s.half_frame[1]) ? 0u : 1u;
+            if (mgpu::t119::perf_active()) mgpu::perf::note_cq_state(s.cq_issued >= f);
+            if (s.cq_issued + 1 < f) s.cq_issued = f - 1;
+            bool ok = true;
+            if (!have_f)
+            {
+                ok = stream_cq_submit(s, f, ii);
+                if (ok && f > s.cq_issued) s.cq_issued = f;
+            }
+            if (ok && completed > f && r343_half_of(s, f + 1ull) == 2u && stream_cq_submit(s, f + 1ull, 1u - ii))
+            {
+                if (f + 1ull > s.cq_issued) s.cq_issued = f + 1ull;
+                ++s.cq_ahead;
+            }
+            use_cq = (r343_half_of(s, f) == ii);
+            if (!use_cq) ++s.cq_fails;
+        }
+        else if (s.copy_queue && run_nr && s.cq != nullptr)
         {
             ii = (unsigned)(f & 1ull);
             // Never re-issue for a frame the overrun check already walked past.
@@ -24580,7 +26233,7 @@ void stream_poll()
             {
                 unsigned long long n = s.cq_issued + 1;
                 if (pf_on && n > f && n < arm_n) n = arm_n;   // T1.12: jump over frames that will not be evaluated
-                ok = stream_cq_submit(s, n);
+                ok = stream_cq_submit(s, n, (unsigned)(n & 1ull));   // R343: key absent, the half is the parity as before
                 if (ok)
                 {
                     s.cq_issued = n;
@@ -24591,6 +26244,21 @@ void stream_poll()
             }
             use_cq = (s.cq_issued >= f);
             if (!use_cq) ++s.cq_fails;
+        }
+        if (run_nr)   // R343 (FIX6): the half this evaluate reads; a latch issued during it targets the other. An inline unpack lands in ii too.
+        {
+            if (s.ll_on != 0u && !use_cq) s.half_frame[ii] = f;
+            s.eval_half = ii;
+        }
+        // R344 (RingEdgeProbe=1): the producer's distance past this frame at its copy decision, bucketed 0..7+;
+        // the lane misses are added to the same bucket below once depth_here / mvec_here are known.
+        unsigned re_b = 8u;
+        if (s.re_on != 0u && run_nr)
+        {
+            const unsigned long long pa = s.produced_a.load(std::memory_order_acquire);
+            const unsigned long long d = (pa > f) ? (pa - f) : 0ull;
+            re_b = (d >= 7ull) ? 7u : (unsigned)d;
+            ++s.re_hist[re_b];
         }
 
         HRESULT h = s.na->Reset();
@@ -24613,11 +26281,14 @@ void stream_poll()
             // [OURS] 2026-10-29: the input unpack is the TRANSPORT, not part of
             // the neural stage - with the panel's neural switch OFF it keeps
             // running so tex_in/tex_in_show stay the live game frame (that is
-            // what stream_present_source's !s.neural branch shows). CARRY holds
-            // also need this transport, with or without the copy queue. When the
-            // texture does not rest in COPY_DEST an inline OFF/alignment copy needs
-            // an explicit round-trip instead of relying on implicit promotion.
-            const bool copy_in = run_nr || run_align || !s.neural;
+            // what stream_present_source's !s.neural branch shows). use_cq is
+            // only ever true inside run_nr, so !use_cq here is the inline
+            // copy in both states. When the texture does not rest in
+            // COPY_DEST (copy-queue builds) the OFF copy needs an explicit
+            // round-trip: implicit promotion would leave it in COPY_DEST
+            // while tex_in_rest says COMMON, and the present path would
+            // record a transition from a state the resource is not in.
+            const bool copy_in = run_nr || !s.neural;
             if (copy_in && !use_cq)
             {
                 if (!run_nr && s.tex_in_rest != D3D12_RESOURCE_STATE_COPY_DEST)
@@ -24636,7 +26307,7 @@ void stream_poll()
                 ud.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                 ud.SubresourceIndex = 0;
                 s.nl->CopyTextureRegion(&ud, 0, 0, 0, &us, nullptr);
-                if (!run_nr && !run_align && s.tex_in_rest != D3D12_RESOURCE_STATE_COPY_DEST)
+                if (!run_nr && s.tex_in_rest != D3D12_RESOURCE_STATE_COPY_DEST)
                     barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_COPY_DEST, s.tex_in_rest);
             }
             if (run_nr)
@@ -24664,7 +26335,9 @@ void stream_poll()
                 // rather than reasoned about a second time.
                 const bool depth_here =
                     (s.depth_mode != 0 && s.tex_depth[ii] != nullptr &&
-                     s.depth_bytes != 0 && s.depth_slot_valid[slot] != 0u);
+                     s.depth_bytes != 0 && r331_depth_bound(s, slot, f, use_cq, ii));   // R331
+                if (s.seal_valid_on != 0u) s.r331_bind_depth[ii] = depth_here ? 1u : 0u;   // R331a: what seal_consume compares
+                if (re_b < 8u && !depth_here && s.depth_mode != 0 && s.tex_depth[ii] != nullptr && s.depth_bytes != 0) ++s.re_nodepth[re_b];   // R344
                 // R244. Read last frame's probe (its fence wait has passed), then
                 // record this frame's if it is one of the three.
                 if (s.dp_pending && s.dp_rb != nullptr)
@@ -24684,7 +26357,11 @@ void stream_poll()
                             else
                             {
                                 ++s.dp_disagree; cmp = "DISAGREES";
-                                if (!s.dp_written) { wrote = ui_ini_write("DepthInverted", pr.reversed); s.dp_written = wrote; }
+                                // R342c (C4): the rewrite needs TWO of the three probes to disagree (the R258 pattern,
+                                // "3 probes, 2 must agree"), not the first one alone - one histogram on a loading
+                                // screen or a menu rewrote the key for the next launch.
+                                if (!s.dp_written && s.dp_disagree >= 2u) { wrote = ui_ini_write("DepthInverted", pr.reversed); s.dp_written = wrote; }
+                                else if (!s.dp_written) cmp = "DISAGREES (1 of 3 - a second probe must agree before the key is rewritten, R342c)";
                             }
                         }
                         char dl[640];
@@ -25442,9 +27119,16 @@ void stream_poll()
                 // written the same way rather than reasoned about a third
                 // time. mvec_slot_valid is what makes a frame the bind hook
                 // missed unpack nothing and bind nothing.
+                // R338: on the non-cq path the latched source is resolved here (the cq path resolved it in
+                // stream_cq_submit and r331_mvec_bound reads what that copy carried). k = 0: slot, f.
+                unsigned r338_slot = slot; unsigned long long r338_f = f;
+                if (use_cq) { r338_slot = s.r338_slot_ii[ii]; r338_f = s.r338_f_ii[ii]; }   // R338a: what the copy queue decided for this frame
+                else { r338_mvec_source(s, slot, f, r338_slot, r338_f); s.r338_slot_ii[ii] = r338_slot; s.r338_f_ii[ii] = r338_f; }
                 const bool mvec_here =
                     (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-                     s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u);
+                     s.mvec_bytes2 != 0 && r331_mvec_bound(s, r338_slot, r338_f, use_cq, ii));   // R331; R338 source
+                if (s.seal_valid_on != 0u) s.r331_bind_mvec[ii] = mvec_here ? 1u : 0u;   // R331a
+                if (re_b < 8u && !mvec_here && s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr && s.mvec_bytes2 != 0) ++s.re_nomvec[re_b];   // R344
                 if (mvec_here)
                 {
                     if (!use_cq)
@@ -25453,7 +27137,7 @@ void stream_poll()
                         msu.pResource = s.nxfer;
                         msu.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
                         msu.PlacedFootprint = s.mvec_fp2;
-                        msu.PlacedFootprint.Offset = slot_off + s.mvec_off;
+                        msu.PlacedFootprint.Offset = (UINT64)r338_slot * s.slot_bytes + s.mvec_off;   // R338
                         mdu.pResource = s.tex_mvec_r[ii];
                         mdu.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
                         mdu.SubresourceIndex = 0;
@@ -25464,6 +27148,9 @@ void stream_poll()
                             use_cq ? D3D12_RESOURCE_STATE_COMMON
                                    : D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    // Reproduce the original POINT-sampled full-size field on
+                    // GPU 1; only the small source crossed the bus.
+                    mgpu::mvecex::expand(s.nl, ii, s.tex_mvec_r[ii]);
                 }
 
                 // ---- P8.0: the motion vector field ----
@@ -25676,7 +27363,6 @@ void stream_poll()
 
                 bool final_pass_ok = false;
                 bool prism_sync_written = false;
-                bool carry_eval_ok = false; // only a successful PX1 first pass may seed CARRY
                 // R216: the scale modes this frame. Off, or a frame they do not
                 // apply to (a calibration or Subrect extent, or whole with
                 // Passes=1): the chain below is unchanged.
@@ -25745,7 +27431,7 @@ void stream_poll()
                     mgpu::diag::warn("[MGPU][R217] ScaleMode=whole runs its own two passes - the "
                                      "pass count is not used while it is on. Said once.");
                 }
-                const unsigned npass = vr_wh ? 2u : s.passes;   // R217
+                const unsigned npass = s.local_nr ? 1u : (vr_wh ? 2u : s.passes);   // B1 is fixed x1 in this version
                 // R217: a frame where a scale mode turns on or off (the first
                 // frame, a calibration frame) resets every pass's history, so
                 // no pass blends a history built at another size.
@@ -25759,6 +27445,16 @@ void stream_poll()
                 const bool p1f_odd = (s.p1f_frame & 1ull) != 0ull;
                 const bool p2f_on = (s.p2f_mode != 0u && s.p2r_on && !s.sr_ready);   // R215
                 const bool p2f_odd = (s.p2f_frame & 1ull) != 0ull;
+                const bool ensemble_here = mgpu::ensemble::active() && npass == 3u &&
+                    !s.local_nr && !s.sr_ready && !vr_c && !vr_wh &&
+                    s.p1f_mode == 0u && !s.p2r_on && s.p2f_mode == 0u &&
+                    ew == s.width && eh == s.height &&
+                    !mgpu::psync::active() && !mgpu::pwarp::active() &&
+                    !mgpu::residual::active() && s.tex_in[ii] != nullptr;
+                bool ensemble_passes_ok = true;
+                bool ensemble_snapshot_ok = false;
+                ID3D12Resource *ensemble_output = nullptr;
+                if (ensemble_here) mgpu::ensemble::begin_frame();
                 const float mv_el_frame = mv_el;
                 s.ev_count = 0;
                 if (s.ev_ok) s.nl->EndQuery(s.evheap, D3D12_QUERY_TYPE_TIMESTAMP, 0);
@@ -25829,6 +27525,19 @@ void stream_poll()
                         ++s.cv_built;
                         vr_mark(s, 18u);
                     }
+                    // Live proof, not only a normal-exit total: a running game can
+                    // show whether late frames actually consume the chain or keep
+                    // falling back while the user is looking at the artefact.
+                    if (s.cv_late != 0ull && s.cv_late % 600ull == 0ull)
+                    {
+                        char cl[320];
+                        snprintf(cl, sizeof cl,
+                                 "[MGPU][R217][LIVE] f=%llu game=%llu late=%llu chained=%llu "
+                                 "this-frame=%d elapsed=%.0f | fallback far=%llu old=%llu slot=%llu",
+                                 f, gnow, s.cv_late, s.cv_built, cv_ran ? 1 : 0,
+                                 (double)mv_el_frame, s.cv_fb_far, s.cv_fb_old, s.cv_fb_slot);
+                        mgpu::diag::info(cl);
+                    }
                 }
                 const bool cv_nr_on = cv_ran && s.cv_nr != 0u;
                 // R300a1 / R300a7 (T1.19, any temporal key only). Keys absent: nothing is called and tdec / jout
@@ -25872,33 +27581,188 @@ void stream_poll()
                     jout = mgpu::tdiag::jitter_decide(ji);
                 }
                 // R323 (HistoryGate=1): one decision per consumed frame, every pass follows it.
+                // Yihuan's temporal path also clears history when that frame has no valid motion
+                // input. Native-DLSS titles need the same guard: a colour-only evaluate must not
+                // become the history anchor for the next three-pass chain.
                 bool gate_rst = false;
                 if (g_hist_gate.load(std::memory_order_relaxed) != 0)
                 {
                     const int gd = (int)s.slot_dlss[slot].load(std::memory_order_acquire);
                     const bool no_dlss = (gd == 0);   // -1: no table on this title, the gate cannot tell, history as before
-                    gate_rst = no_dlss || s.gate_break;
-                    if (no_dlss && !s.gate_break)
+                    const bool no_mvec = (s.mvec_mode == 3 && !mvec_here);
+                    const bool bad_history_input = no_dlss || no_mvec;
+                    gate_rst = bad_history_input || s.gate_break;
+                    if (bad_history_input && !s.gate_break)
                     {
                         ++s.gate_stretches; s.gate_since = f;
                         if (s.gate_stretches <= 3u)
                         {
-                            char gl[200];
-                            snprintf(gl, sizeof gl, "[MGPU][R323] no DLSS from the game at f=%llu: Reset=1 on every pass until it returns (stretch %u).", f, s.gate_stretches);
+                            char gl[240];
+                            snprintf(gl, sizeof gl, "[MGPU][R323] %s at f=%llu: Reset=1 on every pass until valid history input returns (stretch %u).",
+                                     no_mvec ? "no same-frame motion vectors" : "no DLSS from the game",
+                                     f, s.gate_stretches);
                             mgpu::diag::info(gl);
                         }
                     }
-                    else if (!no_dlss && s.gate_break && s.gate_stretches <= 3u)
+                    else if (!bad_history_input && s.gate_break && s.gate_stretches <= 3u)
                     {
-                        char gl[200];
-                        snprintf(gl, sizeof gl, "[MGPU][R323] DLSS is back at f=%llu after %llu frame(s): one more Reset=1, then history from the game.", f, f - s.gate_since);
+                        char gl[220];
+                        snprintf(gl, sizeof gl, "[MGPU][R323] valid history input is back at f=%llu after %llu frame(s): one more Reset=1, then temporal history resumes.", f, f - s.gate_since);
                         mgpu::diag::info(gl);
                     }
-                    s.gate_break = no_dlss;
+                    s.gate_break = bad_history_input;
                 }
-                for (unsigned pi = 0; pi < npass; ++pi)
+                if (!s.local_nr && s.nr_p1_recreate_req) r361_recreate_pass1(s);   // R361: before this frame's evaluates
+                if (!s.local_nr && s.nr_res_req_mask != 0u)                        // R364: the panel's Residual / Native buttons
                 {
-                    ID3D12Resource *src = (pi == 0)
+                    const unsigned m = s.nr_res_req_mask; s.nr_res_req_mask = 0u;
+                    for (unsigned i = 0; i < s.nr_built && i < stream_state::MAX_PASSES; ++i)
+                    {
+                        if (!(m & (1u << i))) continue;
+                        const bool want_res = (s.nr_res_want_mask & (1u << i)) != 0u;
+                        if (want_res == mgpu::residual::carries(i)) continue;
+                        char rl[400];
+                        if (mgpu::residual::set_pass_live(i, want_res, rl, sizeof rl))
+                        {
+                            mgpu::diag::info(rl);
+                            // the pass's feature must match its new extent: rebuild it with the hint it has
+                            r363_recreate_pass(s, i, r361_eff_preset(s, i, s.passes), want_res ? "panel: Residual" : "panel: Native", true);
+                        }
+                        else mgpu::diag::warn(rl);
+                    }
+                }
+                if (!s.local_nr && s.nr_recreate_mask != 0u)                       // R363: the panel's network buttons
+                {
+                    const unsigned m = s.nr_recreate_mask; s.nr_recreate_mask = 0u;
+                    for (unsigned i = 0; i < s.nr_built && i < stream_state::MAX_PASSES; ++i)
+                        if (m & (1u << i)) r363_recreate_pass(s, i, r361_eff_preset(s, i, s.passes), "panel");
+                }
+                if (!s.local_nr && !s.nrs_live && s.nrs_park_n != 0u) nrs_tick_retired(s);   // R361: free parked handles (NRScale ticks its own)
+                if (s.local_nr)
+                {
+                    unsigned long long answer_frame = 0ull, answer_generation = 0ull;
+                    unsigned answer_w = 0u, answer_h = 0u, answer_pass = 0u;
+                    sealed_local_nr_identity(s, f, slot, answer_frame, answer_generation,
+                                             answer_w, answer_h, answer_pass);
+                    const mgpu::b1::answer_status answer_status = mgpu::b1::classify_answer(
+                        s.local_nr_bytes, answer_frame, f, answer_generation, s.local_nr_generation);
+                    const bool answer = answer_status == mgpu::b1::answer_status::accept;
+                    if (answer)
+                    {
+                        ID3D12Resource *nr_final = nullptr;
+                        unsigned final_w = 0u, final_h = 0u, compose_pass = 0u;
+                        const unsigned active = (s.passes >= 1u && s.passes <= 3u) ? s.passes : 1u;
+                        bool nr_ok = false;
+                        if (answer_pass + 1u >= active)
+                        {
+                            // GPU0 has produced the final requested pass (P2 in the
+                            // Stellar Blade 4K chain). GPU1 only unpacks and composites.
+                            nrs_to(s, s.nrs_out, &s.nrs_out_state, D3D12_RESOURCE_STATE_COPY_DEST, true);
+                            D3D12_TEXTURE_COPY_LOCATION ns{}, nd{};
+                            ns.pResource = s.nxfer;
+                            ns.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                            ns.PlacedFootprint = s.local_nr_fp;
+                            ns.PlacedFootprint.Offset = slot_off + s.local_nr_off;
+                            ns.PlacedFootprint.Footprint.Width = answer_w;
+                            ns.PlacedFootprint.Footprint.Height = answer_h;
+                            nd.pResource = s.nrs_out;
+                            nd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            nd.SubresourceIndex = 0;
+                            const D3D12_BOX answer_box{0u, 0u, 0u, answer_w, answer_h, 1u};
+                            s.nl->CopyTextureRegion(&nd, 0, 0, 0, &ns, &answer_box);
+                            nrs_to(s, s.nrs_out, &s.nrs_out_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, true);
+                            ++s.local_nr_unpacks;
+                            nr_final = s.nrs_out;
+                            final_w = answer_w;
+                            final_h = answer_h;
+                            compose_pass = answer_pass;
+                            nr_ok = true;
+                        }
+                        else
+                            nr_ok = secondary_nr_record(s, f, slot_off, answer_w, answer_h, active,
+                                &nr_final, &final_w, &final_h, &compose_pass);
+                        if (nr_ok)
+                        {
+                            // Only the final pass is composited here. P1 arrived from
+                            // GPU0; GPU1 has already evaluated any requested P2/P3.
+                            const unsigned px1_reset_bit = 1u << compose_pass;
+                            if (s.local_nr_px1_reset_mask.fetch_and(~px1_reset_bit,
+                                    std::memory_order_acq_rel) & px1_reset_bit)
+                                mgpu::prism_x1m::reset_history(compose_pass);
+                            const bool native_answer = final_w >= s.width && final_h >= s.height;
+                            ID3D12Resource *low_proxy = native_answer ? s.tex_in[ii] : s.nrs_color;
+                            bool down_ok = native_answer;
+                            if (!native_answer)
+                            {
+                                nrs_to(s, s.nrs_color, &s.nrs_color_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, false);
+                                down_ok = mgpu::prism_x1m::down(
+                                    compose_pass, s.nl, (unsigned)(f & 7ull), s.tex_in[ii], s.nrs_color,
+                                    final_w, final_h);
+                                nrs_to(s, s.nrs_color, &s.nrs_color_state, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, false);
+                            }
+                            mgpu::prism_x1m::set_intensity(compose_pass, s.intensity[compose_pass]);
+                            if (down_ok)
+                            {
+                                final_pass_ok = mgpu::prism_x1m::compose(
+                                    compose_pass, s.nl, (unsigned)(f & 7ull),
+                                    s.tex_in[ii], s.tex_in[ii], low_proxy, nr_final, s.tex_out,
+                                    final_w, final_h,
+                                    nullptr, false, MgpuPrismMotion{});
+                            }
+                            // NR outputs are UAV between frames. Compose reads in
+                            // command order before this transition is executed.
+                            barrier(s.nl, nr_final, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        }
+                        if (s.ev_ok && s.ev_count < stream_state::EV_MAX)
+                        {
+                            s.ev_role[s.ev_count] = 18u;
+                            s.nl->EndQuery(s.evheap, D3D12_QUERY_TYPE_TIMESTAMP, ++s.ev_count);
+                        }
+                        if (final_pass_ok)
+                        {
+                            ++s.nr_evals;
+                            if (mgpu::pfinish::active() && mgpu::pfinish::look() != 0u)
+                                mgpu::pfinish::apply(s.nl, ii, s.tex_out, s.tex_in[ii], true);
+                        }
+                        if (s.local_nr_unpacks <= 4ull || s.local_nr_unpacks % 120ull == 0ull)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][B1-SPLIT] GPU1 f=%llu slot=%u P1=%ux%u final=P%u NR=%ux%u PX1=%d",
+                                     f, slot, answer_w, answer_h, compose_pass + 1u, final_w, final_h, final_pass_ok ? 1 : 0);
+                            mgpu::diag::info(line);
+                        }
+                    }
+                    if (!final_pass_ok)
+                    {
+                        // A missing, old or rejected answer must never be reused.
+                        // Present this slot's native colour and reset PX1 history.
+                        barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+                        s.nl->CopyResource(s.tex_out, s.tex_in[ii]);
+                        barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        barrier(s.nl, s.tex_out, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        final_pass_ok = true;
+                        ++s.local_nr_fallbacks;
+                        mgpu::prism_x1m::reset_history(answer ? answer_pass : 0u);
+                        if (s.local_nr_fallbacks <= 4ull || s.local_nr_fallbacks % 120ull == 0ull)
+                        {
+                            snprintf(line, sizeof line,
+                                     "[MGPU][B1] GPU1 f=%llu slot=%u current-native fallback: reason=%s tag=%llu expected=%llu generation=%llu/%llu",
+                                     f, slot, mgpu::b1::status_name(answer_status), answer_frame, f,
+                                     answer_generation, s.local_nr_generation);
+                            mgpu::diag::warn(line);
+                        }
+                    }
+                }
+                for (unsigned pi = 0; pi < npass && !s.local_nr; ++pi)
+                {
+                    if (s.nr_handle[pi] == nullptr) break;   // R361: only after a failed recreate (nr_ok is already false for the next frame)
+                    ID3D12Resource *src = (pi == 0 || ensemble_here)
                                             ? s.tex_in[ii]
                                             : ((pi % 2u == 1u) ? s.tex_out : s.tex_pong);
                     ID3D12Resource *dst = (pi % 2u == 0u) ? s.tex_out : s.tex_pong;
@@ -25955,7 +27819,7 @@ void stream_poll()
                     const UINT rw0  = p2r ? s.p2r_w : (vr_box ? s.vr_w : ew);
                     const UINT rh0  = p2r ? s.p2r_h : (vr_box ? s.vr_h : eh);
 
-                    if (pi > 0)
+                    if (pi > 0 && !ensemble_here)
                         barrier(s.nl, src, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
@@ -26063,6 +27927,40 @@ void stream_poll()
                     // R309: stepped aside - the zero field (tex_mvec) through the synthetic branch below,
                     // fresh vectors or not. Exactly what MVec=1 with MVecDX=MVecDY=0 binds.
                     const bool r309_zero = r311e_zero && s.r309_zero_ready && s.mvec_mode == 3;   // R311e: zero until R280's verdict, or stepped aside
+                    // Native DLSS can allocate its vector target at the display extent while
+                    // writing only the render-sized corner. NR receives the game's UPSCALED
+                    // output, so both parts of that contract matter here: bind only the corner
+                    // the game declared, and convert render-pixel displacement to native pixels.
+                    // The later NRS block applies work/native as before; the product is therefore
+                    // work/render, not work/native. FG keeps receiving the untouched source.
+                    bool native_mv_contract = false;
+                    bool native_mv_subrect = false;
+                    unsigned native_mv_x = 0u, native_mv_y = 0u;
+                    unsigned native_mv_w = 0u, native_mv_h = 0u;
+                    float native_mv_kx = 1.0f, native_mv_ky = 1.0f;
+                    if (!cv_nr_on)
+                    {
+                        mgpu::calibrator::table nct{};
+                        const unsigned long long pub = s.mvec_pub_handle.load(std::memory_order_relaxed);
+                        if (mgpu::calibrator::read(nct) &&
+                            (nct.have & (mgpu::calibrator::KEY_SUBRECTS |
+                                         mgpu::calibrator::KEY_DISPLAY_EXT)) ==
+                                (mgpu::calibrator::KEY_SUBRECTS | mgpu::calibrator::KEY_DISPLAY_EXT) &&
+                            ((nct.have & mgpu::calibrator::KEY_MVEC) == 0u || pub == 0ull || nct.mvec == pub) &&
+                            nct.display_w == s.width && nct.display_h == s.height &&
+                            nct.sub_w >= 64u && nct.sub_h >= 64u &&
+                            nct.mvec_x + nct.sub_w <= s.mvec_w && nct.mvec_y + nct.sub_h <= s.mvec_h)
+                        {
+                            native_mv_contract = true;
+                            native_mv_x = nct.mvec_x; native_mv_y = nct.mvec_y;
+                            native_mv_w = nct.sub_w; native_mv_h = nct.sub_h;
+                            native_mv_kx = (float)s.width / (float)nct.sub_w;
+                            native_mv_ky = (float)s.height / (float)nct.sub_h;
+                            native_mv_subrect = !mgpu::mvecex::active() &&
+                                (nct.mvec_x != 0u || nct.mvec_y != 0u ||
+                                 nct.sub_w != s.mvec_w || nct.sub_h != s.mvec_h);
+                        }
+                    }
                     if (!r309_zero && s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                         s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u &&
                         tdec.bind_mvec)   // R300a1: false only with TemporalRequireTuple=1 on an incoherent tuple
@@ -26070,18 +27968,29 @@ void stream_poll()
                         // R217: the chained field on a late frame, in place of
                         // R87's multiply - not for a strip's own count.
                         const bool cv_here = cv_nr_on && !own_el;
-                        s.nr_params->Set("DLSSNR.MVec", cv_here ? s.cv_out : s.tex_mvec_r[ii]);
+                        const bool mvex_here = !cv_here && mgpu::mvecex::active() && mgpu::mvecex::output(ii) != nullptr;
+                        const unsigned bind_mw = mvex_here ? s.width : s.mvec_w;
+                        const unsigned bind_mh = mvex_here ? s.height : s.mvec_h;
+                        const bool use_native_subrect = native_mv_subrect && !mvex_here;
+                        const unsigned mv_sx = use_native_subrect ? native_mv_x : 0u;
+                        const unsigned mv_sy = use_native_subrect ? native_mv_y : 0u;
+                        const unsigned mv_sw = use_native_subrect ? native_mv_w : bind_mw;
+                        const unsigned mv_sh = use_native_subrect ? native_mv_h : bind_mh;
+                        s.nr_params->Set("DLSSNR.MVec", cv_here ? s.cv_out :
+                                         (mvex_here ? mgpu::mvecex::output(ii) : s.tex_mvec_r[ii]));
                         // R87: scaled by the frames that actually elapsed. With
                         // a consumer that never falls behind this multiplies by
                         // 1.0 and the evaluate is byte-identical to R83's.
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
+                        const float nr_scale_x = s.mvec_scale_x * (cv_here ? 1.0f : native_mv_kx);
+                        const float nr_scale_y = s.mvec_scale_y * (cv_here ? 1.0f : native_mv_ky);
                         // D2.0 NR2: one presented step of a rendered frame's
                         // motion while frame generation is active (fg_frac is
                         // 1.0 otherwise). With a thinned frame before this one
                         // mv_el is 2 and the product is one rendered step.
                         const float mv_k = cv_here ? 1.0f : ((t119_temporal && !own_el) ? tdec.mv_k : mv_el) * fg_frac;   // R217 / R300a1: tdec.mv_k == mv_el unless TemporalMV=single
-                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleX", nr_scale_x * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", nr_scale_y * mv_k);
                         if (jout.apply)   // R300a7 (JitterSlot=1 only): the SLOT delta replaces R104's for this evaluate
                         {
                             s.nr_params->Set("DLSSNR.MVecOffsetX", jout.ox);
@@ -26091,19 +28000,37 @@ void stream_poll()
                             if (jout.sync) mgpu::calibrator::sync_jitter_state();   // JitterFallback=sync|zero only
                         }
                         else
-                            mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
-                        // R212: the region, scaled to the vectors' own size.
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
-                            ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
-                            ? (unsigned int)(((unsigned long long)rby * s.mvec_h) / s.height) : 0u);
-                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", p2r_in
-                            ? (unsigned int)(((unsigned long long)rw * s.mvec_w) / s.width)
-                            : (unsigned int)s.mvec_w);
-                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", p2r_in
-                            ? (unsigned int)(((unsigned long long)rh * s.mvec_h) / s.height)
-                            : (unsigned int)s.mvec_h);
-                        if (pi == 0 && sk == 0) ++s.mvec_bound;
+                            mgpu::calibrator::apply_jitter_offset(s.nr_params, nr_scale_x, nr_scale_y);   // R104
+                        // R212: the region, scaled to the resource actually bound.
+                        // A declared native-DLSS corner is already in that resource's pixels;
+                        // do not run it through the foveation ratio a second time.
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", use_native_subrect ? mv_sx : (p2r_in
+                            ? (unsigned int)(((unsigned long long)rbx * bind_mw) / s.width) : 0u));
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", use_native_subrect ? mv_sy : (p2r_in
+                            ? (unsigned int)(((unsigned long long)rby * bind_mh) / s.height) : 0u));
+                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", use_native_subrect ? mv_sw : (p2r_in
+                            ? (unsigned int)(((unsigned long long)rw * bind_mw) / s.width)
+                            : bind_mw));
+                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", use_native_subrect ? mv_sh : (p2r_in
+                            ? (unsigned int)(((unsigned long long)rh * bind_mh) / s.height)
+                            : bind_mh));
+                        if (pi == 0 && sk == 0)
+                        {
+                            ++s.mvec_bound;
+                            static unsigned said_w = 0u, said_h = 0u;
+                            if (native_mv_contract && (said_w != native_mv_w || said_h != native_mv_h))
+                            {
+                                said_w = native_mv_w; said_h = native_mv_h;
+                                char nvl[360];
+                                snprintf(nvl, sizeof nvl,
+                                         "[MGPU][NRMV] native-DLSS vector contract: valid %ux%u at %u,%u in %ux%u; "
+                                         "NR colour %ux%u, render->native scale %.6f/%.6f (before elapsed and per-pass NRS). "
+                                         "The raw FG input is unchanged.",
+                                         native_mv_w, native_mv_h, native_mv_x, native_mv_y, s.mvec_w, s.mvec_h,
+                                         s.width, s.height, (double)native_mv_kx, (double)native_mv_ky);
+                                mgpu::diag::info(nvl);
+                            }
+                        }
                     }
                     else if (!r309_zero && s.mvec_mode == 3 && fg_act && s.tex_mvec_keep != nullptr &&
                              s.mvec_keep_f != 0ull &&
@@ -26121,20 +28048,22 @@ void stream_poll()
                         // through to R61's unset below.
                         s.nr_params->Set("DLSSNR.MVec", s.tex_mvec_keep);
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
+                        const float nr_scale_x = s.mvec_scale_x * native_mv_kx;
+                        const float nr_scale_y = s.mvec_scale_y * native_mv_ky;
                         const float mv_k = mv_el * fg_frac;
-                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
-                        mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
-                            ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
-                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
-                            ? (unsigned int)(((unsigned long long)rby * s.mvec_h) / s.height) : 0u);
-                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", p2r_in
+                        s.nr_params->Set("DLSSNR.MVecScaleX", nr_scale_x * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", nr_scale_y * mv_k);
+                        mgpu::calibrator::apply_jitter_offset(s.nr_params, nr_scale_x, nr_scale_y);   // R104
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", native_mv_subrect ? native_mv_x : (p2r_in
+                            ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u));
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", native_mv_subrect ? native_mv_y : (p2r_in
+                            ? (unsigned int)(((unsigned long long)rby * s.mvec_h) / s.height) : 0u));
+                        s.nr_params->Set("DLSSNR.MVecSubrectWidth", native_mv_subrect ? native_mv_w : (p2r_in
                             ? (unsigned int)(((unsigned long long)rw * s.mvec_w) / s.width)
-                            : (unsigned int)s.mvec_w);
-                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", p2r_in
+                            : (unsigned int)s.mvec_w));
+                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", native_mv_subrect ? native_mv_h : (p2r_in
                             ? (unsigned int)(((unsigned long long)rh * s.mvec_h) / s.height)
-                            : (unsigned int)s.mvec_h);
+                            : (unsigned int)s.mvec_h));
                         if (pi == 0 && sk == 0) { ++s.mvec_bound; mgpu::fgmap::on_reuse(); }
                     }
                     else if (!r309_zero && s.mvec_mode == 3)
@@ -26184,7 +28113,7 @@ void stream_poll()
                     // from the unpack: it is three loads, and it cannot be
                     // wrong about a scope.
                     if (s.depth_mode == 1 && s.tex_depth[ii] != nullptr &&
-                        s.depth_slot_valid[slot] != 0u)
+                        r331_depth_bound(s, slot, f, use_cq, ii))   // R331
                     {
                         s.nr_params->Set("DLSSNR.Depth", s.tex_depth[ii]);
                         // R212: the region, scaled to the depth's own size.
@@ -26235,6 +28164,11 @@ void stream_poll()
                         if (s.set_is_float[si]) s.nr_params->Set(s.set_key[si], s.set_f[si]);
                         else                    s.nr_params->Set(s.set_key[si], s.set_u[si]);
                     }
+                    // Independent NVIDIA automatic face/skin-region control on every pass.
+                    // It deliberately follows generic Set.* and Tuning so neither can replace
+                    // the user's face-mask value or switch the mask off. Zero keeps full-frame NR.
+                    s.nr_params->Set("DLSSNR.SkinStructureStrength", s.face_mask_strength);
+                    s.nr_params->Set("DLSSNR.UseAutoMask", 1u);
                     // RESET ON THE FIRST FRAME ONLY, PER HANDLE. Every probe
                     // before the stream set Reset=1 on every evaluate, because
                     // each was an independent experiment and history between
@@ -26255,14 +28189,30 @@ void stream_poll()
                     if (s.pass_reset == 2) rst = 1u;
                     else if (s.pass_reset == 1 && pi > 0) rst = 1u;
                     if (pi == 0u && mgpu::nr16::take_reset()) rst = 1u;   // R208
+                    if (pi == 0u && s.nr_p1_reset_next) { rst = 1u; s.nr_p1_reset_next = false; }   // R361
+                    if (s.nr_reset_mask & (1u << pi)) { rst = 1u; s.nr_reset_mask &= ~(1u << pi); }   // R363
                     if (p1f_here && s.p1f_fresh[fidx]) rst = 1u;           // R214
                     if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
                     if (tdec.reset) rst = 1u;   // R300a1: TemporalResetK, off unless set
                     if (gate_rst) rst = 1u;     // R323: no history across frames the game's DLSS did not evaluate
+                    if (pi == 1u && s.r332_p2_reset) { rst = 1u; s.r332_p2_reset = false;   // R332 (E12)
+                        mgpu::diag::info("[MGPU][R332] Pass2Reset: live x1 -> x2, pass 2's first evaluate runs with "
+                                         "DLSSNR.Reset=1 (its history predates the switch)."); }
+                    // NGX and PX1 must cross the same discontinuity together:
+                    // recreation, native/reduced switches and history gates all
+                    // invalidate this pass's confidence image, not the other passes'.
+                    if (rst && pi < mgpu::prism_x1m::kMaxPasses)
+                        mgpu::prism_x1m::reset_history(pi);
                     s.nr_params->Set("DLSSNR.Reset", rst);
                     // [OURS] NRS: a feature rebuilt by a live scale change has no history;
                     // the first evaluate on it must discard whatever the module still has.
-                    if (s.nrs_reset_next) { s.nr_params->Set("DLSSNR.Reset", 1u); s.nrs_reset_next = false; }
+                    if (s.nrs_reset_next)
+                    {
+                        s.nr_params->Set("DLSSNR.Reset", 1u);
+                        s.nrs_reset_next = false;
+                        if (pi < mgpu::prism_x1m::kMaxPasses)
+                            mgpu::prism_x1m::reset_history(pi);
+                    }
 
                     const bool p2f = p2r && s.p2r_feature_region;   // R212
                     if (p2f)
@@ -26279,12 +28229,9 @@ void stream_poll()
                     // untouched - those are exactly the cases whose extents this
                     // code does not own, and guessing there would be how a working
                     // feature gets broken.
-                    // At 100% PSYNC keeps the accepted native NGX path: NRS is armed
-                    // so its slider is live, but its downsample/resolve pair is bypassed.
-                    // The normal live-resize consumer sits inside if (nrs_here), so the
-                    // 100% -> below-100% transition needs this small entry consumer;
-                    // subsequent changes use the original block below.
-                    if (s.nrs_on && s.nrs_live && mgpu::psync::active() && s.nrs_scale >= 0.999f &&
+                    // R377: per-pass extents have exactly one owner. The legacy global
+                    // native->reduced transition must never resize their shared scratch.
+                    if (s.nrs_pw[0] == 0u && s.nrs_on && s.nrs_live && mgpu::psync::active() && s.nrs_scale >= 0.999f &&
                         s.nrs_stage_scale > 0.05f && s.nrs_stage_scale < 0.999f &&
                         pi == 0u && sk == 0u && !p2f && !p1f_here && !vr_c && !vr_wh && !nr16_on &&
                         ew == s.width && eh == s.height)
@@ -26332,25 +28279,141 @@ void stream_poll()
                             }
                         }
                     }
-                    bool nrs_here = s.nrs_on && pi == 0u && sk == 0u && !p2f && !p1f_here &&
+                    // R376: staged per-pass scales must also flush while EVERY pass is native.
+                    // The old call lived inside `if (nrs_here)`: after a single pass entered
+                    // 100% native, lowering its slider only wrote the ini and staged a value,
+                    // but no NRS pass remained that could ever flush it. Apply before the
+                    // nrs_here decision so native -> custom updates the mask on this frame.
+                    if (s.nrs_on && s.nrs_live) nrs_flush_staged_scales(s);
+                    bool nrs_here = s.nrs_on && ((s.nrs_pass_mask >> pi) & 1u) && sk == 0u && !p2f && !p1f_here &&   // R354 / R367
                                     !vr_c && !vr_wh && !nr16_on &&
                                     ew == s.width && eh == s.height &&
                                     !(mgpu::psync::active() && s.nrs_scale >= 0.999f) &&
                                     s.nrs_color != nullptr && s.nrs_out != nullptr;
+                    // R374: a pass the mask says should take NRS but the shape
+                    // guards refused - one line per pass, saying WHICH guard. This
+                    // is the instrument for "第3遍只能原生": the next run answers
+                    // it from the log instead of a guessing session.
+                    if (((s.nrs_pass_mask >> pi) & 1u) && !nrs_here)
+                    {
+                        static unsigned r374_said = 0u;
+                        if (pi < 31u && !(r374_said & (1u << pi)))
+                        {
+                            r374_said |= (1u << pi);
+                            char dln[360];
+                            snprintf(dln, sizeof dln, "[MGPU][R374] pass %u in the NRS mask but refused: "
+                                     "nrs_on=%d sk=%u p2f=%d p1f=%d vr_c=%d vr_wh=%d nr16=%d ew/eh=%ux%u "
+                                     "native=%ux%u psync_gate=%d nrs_color=%p nrs_out=%p",
+                                     pi + 1u, (int)s.nrs_on, (unsigned)sk, (int)p2f, (int)p1f_here,
+                                     (int)vr_c, (int)vr_wh, (int)nr16_on, ew, eh, s.width, s.height,
+                                     (int)(mgpu::psync::active() && s.nrs_scale >= 0.999f),
+                                     (void *)s.nrs_color, (void *)s.nrs_out);
+                            mgpu::diag::warn(dln);
+                        }
+                    }
+                    // R370: this pass's own work extent (falls back to the global nrs_w/h).
+                    // Declared here, before both nrs_here blocks that use it.
+                    const unsigned nrs_pwi = s.nrs_pw[pi] ? s.nrs_pw[pi] : s.nrs_w;
+                    const unsigned nrs_phi = s.nrs_ph[pi] ? s.nrs_ph[pi] : s.nrs_h;
+                    // R377: validate the ACTUAL allocations, not only the arm-time max.
+                    // A short scratch must fall back to this pass's native evaluate;
+                    // dispatching an oversized subrect is undefined and can hang the GPU.
+                    if (nrs_here)
+                    {
+                        const D3D12_RESOURCE_DESC cd = s.nrs_color->GetDesc();
+                        const D3D12_RESOURCE_DESC od = s.nrs_out->GetDesc();
+                        if (cd.Width < nrs_pwi || cd.Height < nrs_phi ||
+                            od.Width < nrs_pwi || od.Height < nrs_phi)
+                        {
+                            static unsigned r377_said = 0u;
+                            if (pi < 31u && !(r377_said & (1u << pi)))
+                            {
+                                r377_said |= 1u << pi;
+                                char gl[360];
+                                snprintf(gl, sizeof gl,
+                                         "[MGPU][R377] pass %u scratch too small: need %ux%u, color=%llux%u, output=%llux%u; "
+                                         "NRS rejected for this pass, native evaluate used.",
+                                         pi + 1u, nrs_pwi, nrs_phi,
+                                         (unsigned long long)cd.Width, cd.Height,
+                                         (unsigned long long)od.Width, od.Height);
+                                mgpu::diag::error(gl);
+                            }
+                            nrs_here = false;
+                            s.nr_params->Set("DLSSNR.Reset", 1u);
+                            if (pi < mgpu::prism_x1m::kMaxPasses)
+                                mgpu::prism_x1m::reset_history(pi);
+                        }
+                    }
+                    // Exactly one component owns the visible strength. PX1 gets the
+                    // panel value and NGX stays neutral; original NRS fallback keeps
+                    // the old NGX<=2 + residual compensation instead.
+                    float nrs_inten_mult = 1.0f;
                     ID3D12Resource *nrs_anchor = nullptr;
                     float nrs_mvx0 = 1.0f, nrs_mvy0 = 1.0f;
                     bool x1_frame = false;
+                    bool x1_written = false;
                     if (nrs_here)
                     {
-                        nrs_anchor = nr_color;   // the untouched native frame: the 1:1 anchor
+                        nrs_anchor = nr_color;   // the untouched native frame: the 1:1 anchor (pass N: pass N-1's output)
+                        if (s.nrs_all || s.nrs_pass_mask != 1u)   // R354: one line per pass, once - proves the stack took the path
+                        {
+                            static unsigned r354_seen = 0u;
+                            if (pi < 32u && (r354_seen & (1u << pi)) == 0u)
+                            {
+                                r354_seen |= (1u << pi);
+                                char nl[200];
+                                snprintf(nl, sizeof nl, "[MGPU][R354] NRScale pass %u/%u work=%ux%u (per-pass scale %.3f, N01950's R421)",
+                                         pi + 1u, s.passes, nrs_pwi, nrs_phi, (double)s.nrs_pscale[pi]);
+                                mgpu::diag::info(nl);
+                            }
+                        }
                         nrs_to(s, s.nrs_color, &s.nrs_color_state,
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, false);
-                        if (mgpu::prism_x1::ab_enabled())
-                            x1_frame = mgpu::prism_x1::down(s.nl, (unsigned)(s.nr_evals & 7ull),
-                                                             nrs_anchor, s.nrs_color);
-                        if (!x1_frame)
-                            nrs_dispatch_down(s, nrs_anchor);
-                        vr_mark(s, x1_frame ? 19u : 22u);
+                        if (pi < mgpu::prism_x1m::kMaxPasses && mgpu::prism_x1m::ab_enabled(pi))
+                        {
+                            mgpu::prism_x1m::set_intensity(pi, s.intensity[pi]);
+                            x1_frame = mgpu::prism_x1m::down(
+                                pi, s.nl, (unsigned)(s.nr_evals & 7ull), nrs_anchor,
+                                s.nrs_color, nrs_pwi, nrs_phi);
+                        }
+                        if (x1_frame)
+                        {
+                            // PX1's Compose owns 0..300%; do not pre-amplify in NGX.
+                            s.nr_params->Set("DLSSNR.Intensity", 1.0f);
+                        }
+                        else
+                        {
+                            nrs_dispatch_down(s, nrs_anchor, pi);   // original NRS fallback
+                            if (s.nrs_mode == 0u)
+                            {
+                                // Direct mode: 100% is the unmodified network output. The
+                                // Resolve, not NGX, owns the visible 0..300% edit multiplier;
+                                // otherwise >=100% is clamped by the direct shader's lerp.
+                                nrs_inten_mult = s.intensity[pi];
+                                s.nr_params->Set("DLSSNR.Intensity", 1.0f);
+                            }
+                            else if (s.intensity[pi] > 2.0f)
+                            {
+                                nrs_inten_mult = s.intensity[pi] * 0.5f;
+                                s.nr_params->Set("DLSSNR.Intensity", 2.0f);
+                            }
+                            else
+                            {
+                                s.nr_params->Set("DLSSNR.Intensity", s.intensity[pi]);
+                            }
+                            static unsigned r371_said = 0u;
+                            if (pi < 31u && !(r371_said & (1u << pi)))
+                            {
+                                r371_said |= 1u << pi;
+                                char il[240];
+                                snprintf(il, sizeof il,
+                                         "[MGPU][R371] pass %u fallback: visible intensity %.2f, NGX %.2f, residual x%.2f",
+                                         pi + 1u, (double)s.intensity[pi],
+                                         (double)(s.nrs_mode == 0u ? 1.0f : std::min(s.intensity[pi], 2.0f)),
+                                         (double)nrs_inten_mult);
+                                mgpu::diag::info(il);
+                            }
+                        }
                         // THE WRITE IS NOT VISIBLE UNTIL THIS BARRIER SAYS IT IS. The
                         // snippet reads the colour as an SRV on its own schedule; with
                         // the resource still declared as a UAV it read the allocation's
@@ -26369,18 +28432,18 @@ void stream_poll()
                         // frame - and the screen shows the game's own picture with the
                         // power down, which is precisely what the 22:42 run looked
                         // like. Found 2026-10-11 from that symptom.
-                        s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.nrs_w);
-                        s.nr_params->Set("DLSSNR.Height", (unsigned int)s.nrs_h);
+                        s.nr_params->Set("DLSSNR.Width",  (unsigned int)nrs_pwi);
+                        s.nr_params->Set("DLSSNR.Height", (unsigned int)nrs_phi);
                         s.nr_params->Set("DLSSNR.Color", s.nrs_color);
                         s.nr_params->Set("DLSSNR.Output", s.nrs_out);
                         s.nr_params->Set("DLSSNR.ColorSubrectBaseX", 0u);
                         s.nr_params->Set("DLSSNR.ColorSubrectBaseY", 0u);
-                        s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)s.nrs_w);
-                        s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)s.nrs_h);
+                        s.nr_params->Set("DLSSNR.ColorSubrectWidth",  (unsigned int)nrs_pwi);
+                        s.nr_params->Set("DLSSNR.ColorSubrectHeight", (unsigned int)nrs_phi);
                         s.nr_params->Set("DLSSNR.OutputSubrectBaseX", 0u);
                         s.nr_params->Set("DLSSNR.OutputSubrectBaseY", 0u);
-                        s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)s.nrs_w);
-                        s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)s.nrs_h);
+                        s.nr_params->Set("DLSSNR.OutputSubrectWidth",  (unsigned int)nrs_pwi);
+                        s.nr_params->Set("DLSSNR.OutputSubrectHeight", (unsigned int)nrs_phi);
                         // THE MOTION VECTORS ARE IN NATIVE PIXELS; THE NETWORK IS NOT.
                         // The proxy multiplies whatever the caller set by work/native
                         // (proxy_main.cpp:1731 and :1868) and this port was missing it.
@@ -26393,8 +28456,8 @@ void stream_poll()
                         // difference: there was nothing on screen to see.
                         (void)s.nr_params->Get("DLSSNR.MVecScaleX", &nrs_mvx0);
                         (void)s.nr_params->Get("DLSSNR.MVecScaleY", &nrs_mvy0);
-                        s.nr_params->Set("DLSSNR.MVecScaleX", nrs_mvx0 * ((float)s.nrs_w / (float)s.width));
-                        s.nr_params->Set("DLSSNR.MVecScaleY", nrs_mvy0 * ((float)s.nrs_h / (float)s.height));
+                        s.nr_params->Set("DLSSNR.MVecScaleX", nrs_mvx0 * ((float)nrs_pwi / (float)s.width));
+                        s.nr_params->Set("DLSSNR.MVecScaleY", nrs_mvy0 * ((float)nrs_phi / (float)s.height));
                     }
 
                     // NRS instrument: milliseconds per evaluate at a known work
@@ -26408,10 +28471,12 @@ void stream_poll()
                     // R316: the residual pass module, same plain-full-frame shape as nrs_here, on
                     // ITS pass. Never both: the module stays off when NRScale is set. Off: one
                     // relaxed load.
-                    const bool rsd_here = mgpu::residual::active() && pi == mgpu::residual::pass() &&
+                    // R332: carries(pi) - with NRS=1 pass 2 may carry as well (its anchor is
+                    // pass 1's resolved native output, which is src here).
+                    const bool rsd_here = mgpu::residual::carries(pi) &&
                                           sk == 0u && !p2f && !p1f_here && !vr_c && !vr_wh && !nr16_on &&
                                           ew == s.width && eh == s.height && !s.nrs_on;
-                    if (rsd_here) mgpu::residual::before(s.nl, ii, s.nr_params, nr_color);
+                    if (rsd_here) mgpu::residual::before(s.nl, pi, ii, s.nr_params, nr_color);
 
                     const NVSDK_NGX_Result er =
                         s.nr_eval(s.nl, ngx_h, s.nr_params, nullptr);
@@ -26429,11 +28494,17 @@ void stream_poll()
                             ++s.nrs_ev_n;
                             s.nrs_ev_fresh = true;
                         }
-                        {   // the snippet wrote the work-sized output as a UAV
-                            D3D12_RESOURCE_BARRIER ub{};
-                            ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
-                            ub.UAV.pResource = nr_output;
-                            s.nl->ResourceBarrier(1, &ub);
+                        {   // R375: the resource the snippet JUST WROTE as a UAV is nrs_out,
+                            // not nr_output - the pre-fix barrier named nr_output, so the
+                            // resolve's first SRV read of nrs_out had no write flush and
+                            // could composite the previous frame's small output: one more
+                            // source of stale/old content in the NRS picture.
+                            D3D12_RESOURCE_BARRIER ub[2]{};
+                            ub[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                            ub[0].UAV.pResource = s.nrs_out;
+                            ub[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                            ub[1].UAV.pResource = nr_output;
+                            s.nl->ResourceBarrier(2, ub);
                         }
                         nrs_to(s, s.nrs_color, &s.nrs_color_state,
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, false);
@@ -26484,11 +28555,11 @@ void stream_poll()
                                      "depth=%d mode=%u gain=%.2f sharp=%.2f color=%.2f work=%ux%u",
                                      (nr_color == nr_output) ? 1 : 0,
                                      (nrs_anchor == nr_output) ? 1 : 0,
-                                     (double)(nrs_mvx0 * ((float)s.nrs_w / (float)s.width)),
-                                     (double)(nrs_mvy0 * ((float)s.nrs_h / (float)s.height)),
+                                     (double)(nrs_mvx0 * ((float)nrs_pwi / (float)s.width)),
+                                     (double)(nrs_mvy0 * ((float)nrs_phi / (float)s.height)),
                                      (nrs_depth != nullptr) ? 1 : 0, s.nrs_mode,
                                      (double)s.nrs_gain, (double)s.nrs_sharpness,
-                                     (double)s.nrs_color_strength, s.nrs_w, s.nrs_h);
+                                     (double)s.nrs_color_strength, nrs_pwi, nrs_phi);
                             mgpu::diag::info(nrl);
                         }
                         // The proxy skips its resolve when the model call failed
@@ -26497,26 +28568,49 @@ void stream_poll()
                         // and compositing a stale delta smears the previous frame in.
                         if (er == NVSDK_NGX_Result_Success)
                         {
-                            bool x1_written = false;
                             if (x1_frame)
-                                x1_written = mgpu::prism_x1::compose(
-                                    s.nl, (unsigned)(s.nr_evals & 7ull),
-                                    nrs_anchor, s.nrs_color, s.nrs_out, nr_output,
-                                    [](void *ctx, unsigned role) {
-                                        vr_mark(*static_cast<stream_state *>(ctx), role);
-                                    },
-                                    &s);
-                            carry_eval_ok = x1_written;
+                            {
+                                // Residuals still accumulate on the preceding pass's output,
+                                // but character detection always reads this seal's original
+                                // native game frame. Per-pass network scales remain independent.
+                                ID3D12Resource *px1_mask_base = nrs_anchor;
+                                if (ii < stream_state::RING && s.tex_in[ii] != nullptr)
+                                    px1_mask_base = s.tex_in[ii];
+                                // Current-frame motion only modulates PX1's spatial de-speckle
+                                // margin. PX1 receives no usable temporal residual history.
+                                MgpuPrismMotion px1_motion{};
+                                (void)s.nr_params->Get("DLSSNR.MVec", &px1_motion.resource);
+                                (void)s.nr_params->Get("DLSSNR.MVecScaleX", &px1_motion.scale_x);
+                                (void)s.nr_params->Get("DLSSNR.MVecScaleY", &px1_motion.scale_y);
+                                (void)s.nr_params->Get("DLSSNR.MVecSubrectBaseX", &px1_motion.base_x);
+                                (void)s.nr_params->Get("DLSSNR.MVecSubrectBaseY", &px1_motion.base_y);
+                                (void)s.nr_params->Get("DLSSNR.MVecSubrectWidth", &px1_motion.width);
+                                (void)s.nr_params->Get("DLSSNR.MVecSubrectHeight", &px1_motion.height);
+                                x1_written = mgpu::prism_x1m::compose(
+                                    pi, s.nl, (unsigned)(s.nr_evals & 7ull), nrs_anchor, px1_mask_base,
+                                    s.nrs_color, s.nrs_out, nr_output, nrs_pwi, nrs_phi,
+                                    nrs_depth, false, px1_motion);
+                            }
+                            if (x1_written)
+                            {
+                                static unsigned px1_strength_said = 0u;
+                                if (pi < 31u && !(px1_strength_said & (1u << pi)))
+                                {
+                                    px1_strength_said |= 1u << pi;
+                                    char sl[240];
+                                    snprintf(sl, sizeof sl,
+                                             "[MGPU][PX1][P%u] visible=%.2f NGX=1.00 residual=PX1 only; current-frame Compose succeeded.",
+                                             pi + 1u, (double)s.intensity[pi]);
+                                    mgpu::diag::info(sl);
+                                }
+                            }
                             if (!x1_written)
                             {
-                                if (mgpu::prism_x1::ab_enabled() &&
-                                    (s.nr_evals < 4ull || s.nr_evals % 600ull == 0ull))
-                                    mgpu::diag::warn("[MGPU][PX1] this evaluate used the original NRS fallback, not PX1.");
-                                nrs_dispatch_res(s, nrs_anchor, nr_output, nrs_depth);
-                                vr_mark(s, 23u);
+                                nrs_dispatch_res(s, nrs_anchor, nr_output, nrs_depth, pi, nrs_inten_mult);
+                                nrs_post_pass(s, nrs_anchor, nr_output, pi, 0.0f);
+                                if (x1_frame && (s.nr_evals < 4ull || s.nr_evals % 600ull == 0ull))
+                                    mgpu::diag::warn("[MGPU][PX1] Compose rejected this pass; original NRS fallback used.");
                             }
-                            else if (mgpu::pfinish::active() && mgpu::pfinish::look() != 0u)
-                                mgpu::pfinish::apply(s.nl, ii, nr_output, nrs_anchor, true);
                         }
                         nrs_to(s, s.nrs_out, &s.nrs_out_state,
                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS, true);
@@ -26560,6 +28654,7 @@ void stream_poll()
                         // possible: the driver only has to rewrite mgpu.ini.
                         if (s.nrs_live)
                         {
+                            nrs_flush_staged_scales(s);   // R375: apply debounced per-pass scale drags
                             // Free what the fence has passed EVERY frame, not every 240: the
                             // operator dragged the slider and the rig bogged down, and the reason
                             // is memory - each rebuild parks an old feature plus two scratch
@@ -26570,9 +28665,10 @@ void stream_poll()
                             // Two sources, one path. The panel/hotkey STAGE is checked every
                             // frame so the UI feels instant; the ini is read every 240
                             // evaluates so a sweep driver only has to rewrite mgpu.ini.
+                            const bool per_pass_extents = s.nrs_pw[0] != 0u;   // R377: single resize owner
                             float want = -1.0f;
                             bool from_ini = false;
-                            if (s.nrs_stage_scale > 0.05f)
+                            if (!per_pass_extents && s.nrs_stage_scale > 0.05f)
                             {
                                 // DEBOUNCE, and this is the fix for "dragging it many times makes
                                 // everything slow". Every step of a drag used to be a full rebuild;
@@ -26605,9 +28701,14 @@ void stream_poll()
                                 s.nrs_sharpness      = ini_read_float("NRSharpness", s.nrs_sharpness);
                                 s.nrs_color_strength = ini_read_float("NRColorStrength", s.nrs_color_strength);
                                 s.nrs_mode           = (unsigned)ini_read_float("NRMode", (float)s.nrs_mode);
-                                want = ini_read_float("NRScale", s.nrs_scale);
-                                if (want > s.nrs_cap_scale) { mgpu::diag::warn("[MGPU][OURS][NRS] NRScale is above NRScaleCap - clamped (the feature is built at the cap; see the arm)."); want = s.nrs_cap_scale; }
-                                from_ini = true;
+                                // Keep live tuning refresh, but NRScale is NOT a second
+                                // resize owner when NRScale1/2/3 own the work extents.
+                                if (!per_pass_extents)
+                                {
+                                    want = ini_read_float("NRScale", s.nrs_scale);
+                                    if (want > s.nrs_cap_scale) { mgpu::diag::warn("[MGPU][OURS][NRS] NRScale is above NRScaleCap - clamped (the feature is built at the cap; see the arm)."); want = s.nrs_cap_scale; }
+                                    from_ini = true;
+                                }
                             }
                             // A staged change is written back to the ini so the panel and the
                             // ini cannot fight each other on the next tick, and so the
@@ -26617,7 +28718,7 @@ void stream_poll()
                             // waiting on the fence. Forcing a free without the fence is exactly
                             // what froze the stream on 2026-10-12 00:31, so the rebuild simply
                             // waits a frame - the tick above drains the list in two or three.
-                            if (s.nrs_park_n < 2u && want > 0.05f && want <= 2.0f && fabsf(want - s.nrs_scale) > 0.005f)
+                            if (!per_pass_extents && s.nrs_park_n < 2u && want > 0.05f && want <= 2.0f && fabsf(want - s.nrs_scale) > 0.005f)
                             {
                                 unsigned nw = (unsigned)((double)s.width  * (double)want + 0.5);
                                 unsigned nh = (unsigned)((double)s.height * (double)want + 0.5);
@@ -26655,8 +28756,39 @@ void stream_poll()
                             mgpu::diag::info(nsl);
                         }
                     }
+                    // R375: alpha=1 on EVERY native pass output, unconditionally.
+                    // Standalone harness proof (2026-11-14, nrs_test against the vendored
+                    // Resolve_Shader.h): the resolve propagates the ANCHOR's alpha into
+                    // the composite, and the anchor here is the game's frame, whose
+                    // R10G10B10A2 alpha is 0. NGX's own native-path output alpha on this
+                    // 2-bit chain is likewise not 1. The DComp visual then blends the
+                    // frozen game frame through wherever old and new viewpoints differ -
+                    // the "ghost". R372 patched only NRS passes and R373 only when
+                    // intensity>2.0, so the FINAL native pass (NRScale3=1.0) presented
+                    // alpha<1 every single frame. This one runs on all of them.
+                    // boost still carries the >200% slider remainder: out = anchor +
+                    // (out-anchor) * boost, boost = intensity-1 (stronger than R373's
+                    // intensity/2 so the 200-300% range is actually visible).
+                    if (!nrs_here && er == NVSDK_NGX_Result_Success &&
+                        sk == 0u && !p2f && !p1f_here && !vr_c && !vr_wh && !nr16_on &&
+                        ew == s.width && eh == s.height && !rsd_here &&
+                        nr_output != nullptr)
+                    {
+                        const float boost = (s.intensity[pi] > 2.0f && nr_color != nullptr && nr_color != nr_output)
+                                                ? s.intensity[pi] - 1.0f : 0.0f;
+                        static unsigned r375_said = 0u;
+                        if (pi < 31u && !(r375_said & (1u << pi)))
+                        {
+                            r375_said |= 1u << pi;
+                            char bl[220];
+                            snprintf(bl, sizeof bl, "[MGPU][R375] pass %u: native output alpha forced to 1 every frame%s",
+                                     pi + 1u, boost > 0.0f ? "; intensity boost on residual" : "");
+                            mgpu::diag::info(bl);
+                        }
+                        nrs_post_pass(s, boost > 0.0f ? nr_color : nullptr, nr_output, pi, boost);
+                    }
                     if (rsd_here)   // R316: resolve into dst, then the caller's bindings back
-                        mgpu::residual::after(s.nl, ii, s.nr_params, nr_color, nr_output,
+                        mgpu::residual::after(s.nl, pi, ii, s.nr_params, nr_color, nr_output,
                                               er == NVSDK_NGX_Result_Success, nr_color, nr_output,
                                               s.width, s.height, rbx, rby, rw, rh);
                     // PSYNC: both passes consume this seal, but pass 2's NR input is
@@ -26691,11 +28823,29 @@ void stream_poll()
                             mgpu::pfinish::apply(s.nl, ii, psync_dst, psync_base, true);
                     }
                     // The old non-PSYNC finish path keeps its original guard + cap.
-                    else if (mgpu::pfinish::active() && !rsd_here && pi + 1u >= npass &&
+                    // R373: the !s.nrs_on exclusion is gone - under NRS the last pass
+                    // output is the native-size composite (alpha already forced to 1
+                    // by the R372 post pass), so the grade can run on it exactly as
+                    // it did on the native path. Without this the custom palette
+                    // silently died the moment any pass took a sub-native scale.
+                    else if (!ensemble_here && mgpu::pfinish::active() && !rsd_here && pi + 1u >= npass &&
                              er == NVSDK_NGX_Result_Success &&
                              sk == 0u && !p2f && !p1f_here && !vr_c && !vr_wh && !nr16_on &&
-                             ew == s.width && eh == s.height && !s.nrs_on)
-                        mgpu::pfinish::apply(s.nl, ii, nr_output, nr_color, false);
+                             ew == s.width && eh == s.height)
+                    {
+                        // PX1 protects chroma/grain inside each residual. The FINAL
+                        // character mask must compare against the original game frame,
+                        // not nr_color: on pass 2/3 nr_color is the preceding NEURAL
+                        // output, so guarding against it had no visible effect.
+                        ID3D12Resource *finish_original = nr_color;
+                        if (!s.sr_ready && ii < stream_state::RING && s.tex_in[ii] != nullptr)
+                            finish_original = s.tex_in[ii];
+                        mgpu::pfinish::apply(s.nl, ii, nr_output, finish_original, false);
+                    }
+                    // Preserve P1 before P3 reuses tex_out. This is a same-frame
+                    // snapshot only; NGX still owns each pass's temporal history.
+                    if (ensemble_here && pi == 0u && er == NVSDK_NGX_Result_Success)
+                        ensemble_snapshot_ok = mgpu::ensemble::capture_first(s.nl, nr_output);
                     if (p2f)
                     {
                         s.nr_params->Set("DLSSNR.Width",  (unsigned int)s.width);
@@ -26719,6 +28869,7 @@ void stream_poll()
                     }
                     if (er != NVSDK_NGX_Result_Success)
                     {
+                        ensemble_passes_ok = false;
                         ++s.nr_fails;
                         if (s.nr_fails <= 3)
                         {
@@ -26741,7 +28892,7 @@ void stream_poll()
                     // UNORDERED_ACCESS at the end of the list, because that is
                     // the state the next frame - and stream_present_source -
                     // both assume.
-                    if (pi > 0)
+                    if (pi > 0 && !ensemble_here)
                         barrier(s.nl, src, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
@@ -26760,8 +28911,60 @@ void stream_poll()
                         vr_mark(s, 12u);
                     }
                 }
+                if (ensemble_here)
+                {
+                    if (ensemble_passes_ok && final_pass_ok && ensemble_snapshot_ok)
+                        ensemble_output = mgpu::ensemble::compose(
+                            s.nl, ii, s.tex_in[ii], s.tex_pong, s.tex_out);
+                    if (ensemble_output != nullptr)
+                    {
+                        // Face mask, HDR guard and the custom Look run exactly once,
+                        // on the fused picture, against this seal's original frame.
+                        if (mgpu::pfinish::active())
+                            mgpu::pfinish::apply(s.nl, ii, ensemble_output, s.tex_in[ii], false);
+                    }
+                    else
+                    {
+                        final_pass_ok = false;
+                        mgpu::diag::error("[MGPU][ENSEMBLE] incomplete three-pass frame; previous valid output retained.");
+                    }
+                }
                 if (p1f_on) ++s.p1f_frame;   // R214
                 if (p2f_on && s.passes > 1u) ++s.p2f_frame;   // R215
+                // R332 (E16): the weak-GPU line. Every 10 s window: NR evaluates/s against the game's
+                // frames/s (s.produced). At x1 with a full first pass, three windows in a row with NR
+                // below 45/s AND below half the game rate (and the game above 20 fps, so not a loading
+                // screen) print ONE line pointing at NRS=1. Log only; WeakGpuWarn=0 silences it.
+                if (s.weak_warn_on != 0u && !s.e16_said)
+                {
+                    LARGE_INTEGER e16_now{}, e16_fq{};
+                    QueryPerformanceCounter(&e16_now); QueryPerformanceFrequency(&e16_fq);
+                    if (s.e16_t0.QuadPart == 0) { s.e16_t0 = e16_now; s.e16_ev0 = s.nr_evals; s.e16_prod0 = s.produced; }
+                    else if (e16_fq.QuadPart > 0 &&
+                             (double)(e16_now.QuadPart - s.e16_t0.QuadPart) / (double)e16_fq.QuadPart >= 10.0)
+                    {
+                        const double dt = (double)(e16_now.QuadPart - s.e16_t0.QuadPart) / (double)e16_fq.QuadPart;
+                        const double nr_s = (double)(s.nr_evals - s.e16_ev0) / dt;
+                        const double game_s = (double)(s.produced - s.e16_prod0) / dt;
+                        const bool full_x1 = (s.passes == 1u) && !mgpu::residual::carries(0u) && !s.nrs_on;
+                        if (full_x1 && game_s > 20.0 && nr_s < 45.0 && nr_s < 0.5 * game_s) ++s.e16_slow_windows;
+                        else s.e16_slow_windows = 0u;
+                        if (s.e16_slow_windows >= 3u)
+                        {
+                            s.e16_said = true;
+                            char e16l[520];
+                            snprintf(e16l, sizeof e16l,
+                                     "[MGPU][R332] WEAK GPU 1 FOR THIS SIZE: over the last 30 s the neural card evaluated %.0f "
+                                     "frames/s against %.0f game frames/s at x1 with a full first pass (%ux%u). Every other "
+                                     "frame reuses the last neural output. NRS=1 in mgpu.ini runs the first pass as our residual "
+                                     "at the work extent (0.75 x native by default) and is the 0.5.0 path for this case; "
+                                     "WeakGpuWarn=0 silences this line.",
+                                     nr_s, game_s, s.width, s.height);
+                            mgpu::diag::warn(e16l);
+                        }
+                        s.e16_t0 = e16_now; s.e16_ev0 = s.nr_evals; s.e16_prod0 = s.produced;
+                    }
+                }
                 // R216: crop - the box to the full frame (vr_full), by a
                 // stretch or by DLSS SR. Only when the last pass wrote.
                 bool vr_done = false;
@@ -27017,20 +29220,48 @@ void stream_poll()
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
                 }
 
-                if (cv_ran)   // R217: back to its resting state
-                    barrier(s.nl, s.cv_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                // cv_out stays readable through PWARP; its resting state is restored below.
                 ID3D12Resource *const vr_keep = s.nr_final;   // R216
                 if (final_pass_ok)
                 {
                     // C2-SR writes the display-extent result into tex_out
                     // whatever the pass parity did at R, so the presenter takes
                     // tex_out directly rather than the ping-pong winner.
-                    s.nr_final = prism_sync_written
-                                   ? ((npass == 1u) ? s.tex_pong : s.psync_out)
-                                   : (s.sr_ready
-                                        ? s.tex_out
-                                        : ((npass % 2u == 1u) ? s.tex_out : s.tex_pong));   // R217: npass
+                    s.nr_final = ensemble_output != nullptr
+                                   ? ensemble_output
+                                   : (prism_sync_written
+                                        ? ((npass == 1u) ? s.tex_pong : s.psync_out)
+                                        : (s.sr_ready
+                                             ? s.tex_out
+                                             : ((npass % 2u == 1u) ? s.tex_out : s.tex_pong)));   // R217: npass
+                    // Yihuan SkinGuard: character pixels keep pass 1; the world
+                    // keeps the final pass. Ensemble output is already final and
+                    // must not be overwritten by this separate composition path.
+                    {
+                        const bool sg_gate = s.passes >= 2u && !ensemble_here &&
+                            !prism_sync_written && !s.sr_ready && !vr_c && !vr_wh &&
+                            s.p1f_mode == 0u && !s.p2r_on && s.p2f_mode == 0u &&
+                            ew == s.width && eh == s.height && npass == s.passes &&
+                            !mgpu::residual::active() && s.tex_in[ii] != nullptr;
+                        static bool sg_gate_logged = false;
+                        if (mgpu::skinguard::active() && sg_gate &&
+                            mgpu::skinguard::compose(s.nl, ii, s.tex_in[ii],
+                                                     (npass % 2u == 1u) ? s.tex_pong : s.tex_out,
+                                                     (npass % 2u == 1u) ? s.tex_out : s.tex_pong,
+                                                     s.width, s.height, s.tex_in_rest))
+                            s.nr_final = (npass % 2u == 1u) ? s.tex_pong : s.tex_out;
+                        else if (mgpu::skinguard::active() && !sg_gate && !sg_gate_logged)
+                        {
+                            sg_gate_logged = true;
+                            snprintf(line, sizeof line,
+                                     "[MGPU][SG] gate REFUSED: passes=%u psync=%d sr=%d vr_c=%d vr_wh=%d "
+                                     "p1f=%u p2r=%d p2f=%u ew=%u eh=%u w=%u h=%u npass=%u",
+                                     (unsigned)s.passes, (int)prism_sync_written, (int)s.sr_ready,
+                                     (int)vr_c, (int)vr_wh, (unsigned)s.p1f_mode, (int)s.p2r_on,
+                                     (unsigned)s.p2f_mode, ew, eh, s.width, s.height, npass);
+                            mgpu::diag::info(line);
+                        }
+                    }
                     // R216: crop shows vr_full. If SR did not write it this
                     // frame, the previous frame stays on screen.
                     if (vr_c)
@@ -27052,19 +29283,39 @@ void stream_poll()
                     }
                 }
 
-                // CARRY: bake the exact edit that reached the presenter, after the
-                // last pass and before the ordinary liveness read. No second NGX
-                // result is invented here; unsupported shapes invalidate history.
-                bool carry_baked = false;
-                const bool carry_shape = cadence15 && carry_eval_ok && final_pass_ok &&
-                                         !prism_sync_written && !s.sr_ready && !vr_c && !vr_wh &&
-                                         depth_here && s.tex_depth[ii] != nullptr &&
-                                         (s.nr_final == s.tex_out || s.nr_final == s.tex_pong);
-                if (carry_shape && mgpu::prism_carry::active())
-                    carry_baked = mgpu::prism_carry::bake(s.nl, (unsigned)(f & 7ull),
-                                                          s.tex_in[ii], s.nr_final, s.tex_depth[ii]);
-                if (mgpu::prism_carry::active() && !carry_baked)
-                    mgpu::prism_carry::reset();
+                // PWARP: display the previous evaluation's edit on THIS frame's
+                // game colour. The current neural answer is captured by the module
+                // for the next frame and never reads the reprojected output as history.
+                if (mgpu::pwarp::active())
+                {
+                    const bool gate = final_pass_ok && !s.local_nr && !s.sr_ready &&
+                        !vr_c && !vr_wh && s.p1f_mode == 0u && !s.p2r_on && s.p2f_mode == 0u &&
+                        ew == s.width && eh == s.height && s.nr_final != nullptr;
+                    ID3D12Resource *wm = nullptr;
+                    float wsx = s.mvec_scale_x, wsy = s.mvec_scale_y;
+                    if (gate && mvec_here)
+                    {
+                        if (cv_ran)
+                        {
+                            wm = s.cv_out;
+                            wsx = wsy = 1.0f; // cv_chain already emits full-size pixels
+                        }
+                        else if (mv_el_frame <= 1.5f)
+                            wm = s.tex_mvec_r[ii];
+                    }
+                    if (wm != nullptr)
+                    {
+                        ID3D12Resource *const warped = mgpu::pwarp::apply(
+                            s.nl, ii, s.tex_in[ii], s.nr_final, wm, wsx, wsy,
+                            depth_here ? s.tex_depth[ii] : nullptr, s.depth_inverted != 0);
+                        if (warped != nullptr) s.nr_final = warped;
+                    }
+                    else
+                        mgpu::pwarp::invalidate();
+                }
+                if (cv_ran)   // R217: restore only after PWARP has sampled the chain
+                    barrier(s.nl, s.cv_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 3);
 
@@ -27080,7 +29331,7 @@ void stream_poll()
                     nrs_probe_issue(s, ii, s.nr_final);
                 }
 
-                if (!s.profile)
+                if (!s.profile && !s.local_nr)
                 {
                 // P6.0: sample the LAST pass's output, not tex_out. With
                 // Passes=1 nr_final IS tex_out; with an even pass count it is
@@ -27100,8 +29351,42 @@ void stream_poll()
                 sd.PlacedFootprint = s.nr_fp;
                 D3D12_BOX box{ 0, 0, 0, 64, 4, 1 };
                 s.nl->CopyTextureRegion(&sd, 0, 0, 0, &ss, &box);
+                if (s.sc_on != 0u && s.sc_read != nullptr)   // R338: the centre 64x64 of the output, same list, no wait
+                {
+                    const D3D12_RESOURCE_DESC fd = fin->GetDesc();
+                    const UINT fw = (UINT)fd.Width, fh = fd.Height;
+                    const UINT ox = (fw > 64u) ? (fw / 2u - 32u) : 0u, oy = (fh > 64u) ? (fh / 2u - 32u) : 0u;
+                    D3D12_TEXTURE_COPY_LOCATION od{};
+                    od.pResource = s.sc_read; od.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; od.PlacedFootprint = s.sc_fp_out;
+                    D3D12_BOX ob{ ox, oy, 0, ox + 64u, oy + 64u, 1 };
+                    s.nl->CopyTextureRegion(&od, 0, 0, 0, &ss, &ob);
+                }
                 barrier(s.nl, fin, D3D12_RESOURCE_STATE_COPY_SOURCE,
                         D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                if (s.sc_on != 0u && s.sc_read != nullptr)   // R338: the centre 64x64 of the input (tex_in is NON_PIXEL_SHADER_RESOURCE here)
+                {
+                    const D3D12_RESOURCE_DESC idsc = s.tex_in[ii]->GetDesc();
+                    const UINT iw = (UINT)idsc.Width, ih = idsc.Height;
+                    const UINT ix = (iw > 64u) ? (iw / 2u - 32u) : 0u, iy = (ih > 64u) ? (ih / 2u - 32u) : 0u;
+                    barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE);
+                    D3D12_TEXTURE_COPY_LOCATION is{}, id{};
+                    is.pResource = s.tex_in[ii]; is.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; is.SubresourceIndex = 0;
+                    id.pResource = s.sc_read; id.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; id.PlacedFootprint = s.sc_fp_in;
+                    D3D12_BOX ib{ ix, iy, 0, ix + 64u, iy + 64u, 1 };
+                    s.nl->CopyTextureRegion(&id, 0, 0, 0, &is, &ib);
+                    barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                }
+                }
+                // FG sees ONLY the completed final composite. MV/depth are the
+                // official stream textures, still NON_PIXEL_SHADER_RESOURCE here.
+                if (final_pass_ok && s.nr_final != nullptr)
+                {
+                    mgpu::fg::record(s.nl, s.nr_final,
+                                     mvec_here ? s.tex_mvec_r[ii] : nullptr,
+                                     depth_here ? s.tex_depth[ii] : nullptr,
+                                     mv_el_frame, gnow);
+                    if (s.native_last_bound == gnow)
+                        s.native_last_output = gnow;
                 }
                 // Back to the mode's resting state - COPY_DEST on the shipped
                 // path, COMMON with the copy queue on, so the copy queue can
@@ -27109,20 +29394,14 @@ void stream_poll()
                 barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         s.tex_in_rest);
 
-                // XeSS reads depth while it is still NON_PIXEL_SHADER_RESOURCE.
-                // The returned resized depth and this frame's MV share one grid.
-                stream_capture_xess(s, f, ii, final_pass_ok, depth_here, mvec_here);
-
                 // T1b: depth has the same lifecycle and therefore the same
                 // resting state - tex_in_rest is COPY_DEST on the shipped path
                 // and COMMON with the copy queue on, and depth is written by
                 // whichever of the two wrote tex_in.
                 if (s.depth_mode != 0 && s.tex_depth[ii] != nullptr &&
-                    s.depth_slot_valid[slot] != 0u)
+                    r331_depth_bound(s, slot, f, use_cq, ii))   // R331
                     barrier(s.nl, s.tex_depth[ii],
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, s.tex_in_rest);
-
-                if (run_nr) dynamic15_record(s, f, slot, ii);
 
                 // R78: and MVec, same lifecycle, same resting state. THE
                 // CONDITION MUST MATCH THE UNPACK'S EXACTLY - a frame that was
@@ -27133,7 +29412,7 @@ void stream_poll()
                 // has a standing note about; it is written the same way as
                 // depth's so the two cannot drift apart.
                 if (s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-                    s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u)
+                    s.mvec_bytes2 != 0 && r331_mvec_bound(s, s.r338_slot_ii[ii], s.r338_f_ii[ii], use_cq, ii))   // R331; R338a: the same pair as the forward gate
                 {
                     if (fg_act && s.tex_mvec_keep != nullptr)
                     {
@@ -27165,85 +29444,6 @@ void stream_poll()
 
                 if (s.ts_ok) s.nl->EndQuery(s.tsheap, D3D12_QUERY_TYPE_TIMESTAMP, 4);
             }
-            else if (run_align)
-            {
-                // A cadence hold with a valid bake is NOT a neural evaluation.
-                // Unpack this frame's three inputs and move only the edit field.
-                barrier(s.nl, s.tex_in[ii],
-                        use_cq ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST,
-                        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                const bool depth_now = s.depth_mode != 0 && s.tex_depth[ii] != nullptr &&
-                                       s.depth_bytes != 0 && s.depth_slot_valid[slot] != 0u;
-                if (depth_now)
-                {
-                    if (!use_cq)
-                    {
-                        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-                        src.pResource = s.nxfer;
-                        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                        src.PlacedFootprint = s.depth_fp;
-                        src.PlacedFootprint.Offset = slot_off + s.depth_off;
-                        dst.pResource = s.tex_depth[ii];
-                        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                        dst.SubresourceIndex = 0;
-                        s.nl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                        ++s.depth_unpacks;
-                    }
-                    barrier(s.nl, s.tex_depth[ii],
-                            use_cq ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                }
-                const bool mvec_now = s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
-                                      s.mvec_bytes2 != 0 &&
-                                      s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u;
-                if (mvec_now)
-                {
-                    if (!use_cq)
-                    {
-                        D3D12_TEXTURE_COPY_LOCATION src{}, dst{};
-                        src.pResource = s.nxfer;
-                        src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-                        src.PlacedFootprint = s.mvec_fp2;
-                        src.PlacedFootprint.Offset = slot_off + s.mvec_off;
-                        dst.pResource = s.tex_mvec_r[ii];
-                        dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-                        dst.SubresourceIndex = 0;
-                        s.nl->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-                        ++s.mvec_unpacks;
-                    }
-                    barrier(s.nl, s.tex_mvec_r[ii],
-                            use_cq ? D3D12_RESOURCE_STATE_COMMON : D3D12_RESOURCE_STATE_COPY_DEST,
-                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-                }
-
-                s.tex_in_show = s.tex_in[ii];
-                ID3D12Resource *aligned_out = nullptr;
-                if (s.nr_final == s.tex_out) aligned_out = s.tex_pong;
-                else if (s.nr_final == s.tex_pong) aligned_out = s.tex_out;
-                bool aligned = false;
-                if (depth_now && mvec_now && aligned_out != nullptr)
-                    aligned = mgpu::prism_carry::align(s.nl, (unsigned)(f & 7ull),
-                                                       s.tex_in[ii], s.tex_depth[ii], s.tex_mvec_r[ii],
-                                                       aligned_out, s.mvec_scale_x, s.mvec_scale_y);
-                if (aligned) s.nr_final = aligned_out;
-                else
-                {
-                    mgpu::prism_carry::note_fallback();
-                    mgpu::prism_carry::reset();
-                }
-                // A held frame must supply the same current f's colour/depth/MV,
-                // not reuse the previous evaluation's inputs with a new colour.
-                stream_capture_xess(s, f, ii, aligned, depth_now, mvec_now);
-
-                barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                        s.tex_in_rest);
-                if (depth_now)
-                    barrier(s.nl, s.tex_depth[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            s.tex_in_rest);
-                if (mvec_now)
-                    barrier(s.nl, s.tex_mvec_r[ii], D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            s.tex_in_rest);
-            }
             else if (copy_in)
             {
                 // [OURS] neural OFF: the transport copy above just refreshed
@@ -27271,12 +29471,27 @@ void stream_poll()
             // this side of it.
             if (mgpu::t119::perf_active()) mgpu::perf::job_recorded();   // R300e1
             if (use_cq && s.cqf != nullptr) (void)s.nq->Wait(s.cqf, (UINT64)f);
-            if (SUCCEEDED(h))
+            ID3D12CommandList *const ls[1] = { s.nl };
+            s.nq->ExecuteCommandLists(1, ls);
+            ++s.nf_value;
+            h = s.nq->Signal(s.nf, s.nf_value);
+            if (s.local_nr && s.local_nr_consumed_n != nullptr)
             {
-                ID3D12CommandList *const ls[1] = { s.nl };
-                s.nq->ExecuteCommandLists(1, ls);
-                ++s.nf_value;
-                h = s.nq->Signal(s.nf, s.nf_value);
+                // Same queue, after every read of nxfer for frame f. GPU0 may
+                // reuse this slot only when this value becomes visible.
+                const HRESULT ch = s.nq->Signal(s.local_nr_consumed_n, (UINT64)f);
+                if (FAILED(ch))
+                {
+                    // Keep h tied to nf: the already submitted neural work must
+                    // still be drained even when the separate ownership signal
+                    // fails. The failed signal is fatal to slot reuse, not a
+                    // reason to skip recycling this command list.
+                    ++s.local_nr_backpressure_failures;
+                    snprintf(line, sizeof line,
+                             "[MGPU][B1] consumed-fence Signal failed f=%llu hr=0x%08X",
+                             f, (unsigned)ch);
+                    mgpu::diag::error(line);
+                }
             }
             if (mgpu::t119::perf_active()) mgpu::perf::job_exec(use_cq);   // R300e1
             if (SUCCEEDED(h))
@@ -27295,9 +29510,15 @@ void stream_poll()
                 // overrun condition and the check at the top of the next
                 // iteration names it. Being lapped is a fact about our speed;
                 // blocking the game to avoid it never was.
-                lk.unlock();
-                const DWORD wr = WaitForSingleObject(s.nev, 5000);
-                lk.lock();
+                DWORD wr;
+                if (s.ll_on != 0u && run_nr && use_cq && s.cq != nullptr)
+                    wr = r343_wait_and_latch(s, lk, f);   // R343: the same wait, with the next frame's copy latched near its end
+                else
+                {
+                    lk.unlock();
+                    wr = WaitForSingleObject(s.nev, 5000);
+                    lk.lock();
+                }
                 if (mgpu::t119::perf_active()) mgpu::perf::job_done();   // R300e1
                 if (wr != WAIT_OBJECT_0)
                 {
@@ -27323,7 +29544,6 @@ void stream_poll()
         if (run_nr) ++s.nr_evaluated;
         // D1: one checker, two callers. See seal_consume.
         seal_consume(s, f, slot, run_nr, use_cq, ii);
-        dynamic15_read(s, f);
         s.consumed = f;
         if (mgpu::t119::perf_active()) { mgpu::perf::job_end(s.produced); mgpu::perf::periodic(s.consumed); }   // R300e1
     }
@@ -27384,6 +29604,18 @@ void stream_poll()
                                   "this ran clean and proves nothing about the checker)" : "",
                  SEAL_VERSION);
         mgpu::diag::info(line);
+        if (s.local_nr)
+        {
+            snprintf(line, sizeof line,
+                     "[MGPU][B1] ring ownership summary: queue waits=%llu failures=%llu gated-through=%llu "
+                     "CPU waits=%llu failures=%llu gated-through=%llu last-consumed=%llu",
+                     s.local_nr_backpressure_waits, s.local_nr_backpressure_failures,
+                     s.local_nr_gated_through, s.local_nr_cpu_waits, s.local_nr_cpu_failures,
+                     s.local_nr_cpu_gated_through,
+                     (s.local_nr_consumed_n != nullptr)
+                         ? (unsigned long long)s.local_nr_consumed_n->GetCompletedValue() : 0ull);
+            mgpu::diag::info(line);
+        }
         {
             // The rate ratio, out of quantities this consumer can observe, plus
             // the proof that every slot was used. A ring whose hits are not
@@ -27648,9 +29880,7 @@ void stream_poll()
                     "pass 2 centre", "pass 2 strip L", "pass 2 strip R",     // R215
                     "shrink", "pass 1 small", "stretch", "pass 1 crop", "pass 2 crop",
                     "cut box", "SR window", "SR cut",                         // R216
-                    "chain",                                                  // R217
-                    "PX1 down", "PX1 GuidedFit", "PX1 Compose",
-                    "NRS down", "NRS residual" };
+                    "chain / B1 final GuidedFit+PX1" };                       // R217 / B1
                 char el[2000];
                 int w = snprintf(el, sizeof el,
                                  "[MGPU][R214] PER-EVALUATE GPU TIME on GPU 1, ms (each from the "
@@ -27930,6 +30160,9 @@ void stream_poll()
                               "non-zero one names its own failure and they have different "
                               "causes. Do not average them into a verdict.");
         }
+        lk.unlock();          // R341a (F4): the pacing thread's present_frame takes s.cs; join it with the lock released
+        mgpu::fg::stop();
+        lk.lock();
         stream_release();
     }
 

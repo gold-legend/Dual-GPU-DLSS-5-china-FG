@@ -123,10 +123,15 @@ const char kWrapSuffix[] =
     // works on the guarded neural result). gamma wrap: display code -> scene-ish
     // linear, grade, back - the single-card author graded the game's linear frame.
     "  float3 r = n;\n"
+    // The vendored look kernel expects its caller to provide the CURRENT pixel.
+    // Leaving these at their defaults made grain a whole-frame brightness random
+    // variable (black fog), and made every pixel use the centre for the vignette.
+    "  LkUv = (float2(id.xy) + 0.5) / float2(gW, gH);\n"
+    "  LkPx = id.xy;\n"
     "  if (gGamma > 0.0) r = pow(max(r, 0.0), gGamma);\n"
     "  r = LookApply(r, float3(0.0, 0.0, 0.0), gLook, 1.0);\n"
     "  if (gGamma > 0.0) r = pow(max(r, 0.0), 1.0 / gGamma);\n"
-    "  gOut[id.xy] = float4(max(r, 0.0), gOut[id.xy].a);\n"
+    "  gOut[id.xy] = float4(max(r, 0.0), 1.0);\n"
     "}\n";
 
 typedef HRESULT (WINAPI *pfn_d3dcompile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,

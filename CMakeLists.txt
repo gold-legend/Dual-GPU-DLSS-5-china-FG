@@ -11,7 +11,7 @@ cmake_minimum_required(VERSION 3.21)
 
 project(mgpu_bridge C CXX)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Source list follows the closed manifest (P0_RECORD.md, section 01):
@@ -55,6 +55,8 @@ add_library(mgpu_bridge SHARED
     # gpu1_context hands it D3D12 objects. OFF unless NRInput16=4 is in
     # mgpu.ini: no texture, no kernel, no extra pass.
     src/nr16.cpp
+    # Optional lossless low-resolution motion transport, expanded on GPU 1.
+    src/mvec_expand.cpp
     # R316: the residual pass module (private test). No gpu1_context type;
     # gpu1_context hands it D3D12 objects and the NGX parameter block. OFF
     # unless ResidualPass=1|2 is in mgpu.ini: no texture, no kernel, no extra pass.
@@ -63,29 +65,17 @@ add_library(mgpu_bridge SHARED
     # output. Own keys (Finish=1), self-contained like residual: no gpu1_context type, no
     # ReShade type; gpu1_context hands it D3D12 objects. OFF unless Finish=1 is in mgpu.ini.
     src/prism_finish.cpp
+    # Yihuan SkinGuard: independent pass-1/final-pass character composition.
+    src/skinguard.cpp
     # PSYNC: same-frame neural edit extraction and reconstruction on GPU 1.
     src/prism_sync.cpp
-    # PX1: synchronous guided reconstruction on evaluated frames (cadence 1 or 2).
-    src/prism_x1.cpp
-    # CARRY: optional Follow/Carry/Sample/Fill edit alignment on held frames.
-    src/prism_carry.cpp
-    # XESS-FG: optional Intel frame-generation proxy on GPU 1's present chain.
-    # Dynamically loaded; XeSSFG=0 leaves the native MGPU path unchanged.
-    src/xess_fg.cpp
-    # Depth to the MV grid required by XeSS-FG; allocated only when FG is active.
-    src/xess_depth.cpp
-    # Same-size temporal colour and full-resolution AMD Optical Flow for XeSS-FG.
-    src/amd_of.cpp
-    # Actual DXGI maximum-frame-latency control; UI 0/1/2 excludes the current frame.
-    src/present_queue.cpp
-    # Official AMD FidelityFX SDK sources (generated shader permutations are local).
-    third_party/amd_fidelityfx/Kits/FidelityFX/api/internal/ffx_assert.cpp
-    third_party/amd_fidelityfx/Kits/FidelityFX/api/internal/ffx_message.cpp
-    third_party/amd_fidelityfx/Kits/FidelityFX/api/internal/ffx_object_management.cpp
-    third_party/amd_fidelityfx/Kits/FidelityFX/backend/dx12/ffx_backends_dx12.cpp
-    third_party/amd_fidelityfx/Kits/FidelityFX/backend/dx12/ffx_dx12.cpp
-    third_party/amd_fidelityfx/Kits/FidelityFX/framegeneration/fsr3/internal/ffx_opticalflow.cpp
-    third_party/amd_fidelityfx/Kits/FidelityFX/framegeneration/fsr3/internal/ffx_opticalflow_shaderblobs.cpp
+    # PWARP: late-frame edit reprojection onto the latest game colour (PrismWarp=1).
+    src/prism_warp.cpp
+    # PX1: three independent current-frame GuidedFit/Compose instances. The
+    # multi-pass wrapper includes prism_x1.cpp with isolated state per pass.
+    src/prism_x1_multi.cpp
+    # Three-pass same-original ensemble: independent NGX histories, memoryless robust composite.
+    src/prism_ensemble.cpp
     # POVERLAY (2026-10-29): the standalone in-game panel - a port of prism-core 1.5.1's
     # overlay. Its own D3D12 + DirectWrite rendering on the game's queue at present, MinHook
     # input neutralisation. Not a ReShade-UI panel: it draws on the swap chain's back buffer
@@ -97,6 +87,15 @@ add_library(mgpu_bridge SHARED
     third_party/minhook/src/hook.c
     third_party/minhook/src/trampoline.c
     third_party/minhook/src/hde/hde64.c
+    # 0.5.0: GPU 0 staging (StageCopy). fg_gpu1 / chain_colour_space are compiled
+    # (worker/gpu1_context call into them unconditionally) but the FEATURES stay
+    # off per user scope: no FrameGen row in the panel, FrameGen=0, no
+    # ChainColorSpace key - both are inert at runtime.
+    src/gpu0_stage.cpp
+    src/chain_colour_space.cpp
+    src/fg_gpu1.cpp
+    # 0.6.0 display refresh reading for DLSS FG's optional Dynamic gate.
+    src/fg_instr.cpp
     # D1 (0.3.0 R&D): the discovery calibrator. OFF unless Discovery=1 in
     # mgpu.ini. Holds no ReShade type and no gpu1_context type.
     src/discovery.cpp
@@ -141,17 +140,12 @@ add_library(mgpu_bridge SHARED
     src/producer_gpu_timers.cpp   # R300h: GPU 0 timestamps (Gpu0Timers)
 )
 
-set(MGPU_FFX_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/amd_fidelityfx/Kits/FidelityFX")
+target_sources(mgpu_bridge PRIVATE src/native_input.cpp src/native_pixels.cpp src/native_gpu1.cpp)
+
 target_include_directories(mgpu_bridge PRIVATE
     "ext/reshade/include"
     "third_party/minhook/include"
-    "third_party/intel_xess"
-    "${MGPU_FFX_ROOT}/api/include"
-    "${MGPU_FFX_ROOT}/api/internal"
-    "${MGPU_FFX_ROOT}/backend/dx12"
-    "${MGPU_FFX_ROOT}/framegeneration/fsr3/include"
-    "${MGPU_FFX_ROOT}/framegeneration/fsr3/internal"
-    "${CMAKE_CURRENT_SOURCE_DIR}/generated/ffx_opticalflow"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mgpu_native_input/include"
 )
 
 # ---------------------------------------------------------------------------
@@ -294,6 +288,8 @@ if(MGPU_BUILD_TESTS)
     )
     add_test(NAME mgpu_adapter_selection_test
              COMMAND mgpu_adapter_selection_test)
+    add_executable(mgpu_fg_pace_test tests/fg_pace_test.cpp)
+    add_test(NAME mgpu_fg_pace_test COMMAND mgpu_fg_pace_test)
     # T1.19 (Dom): the instruments' state machines, off-device
     add_executable(mgpu_temporal_diag_test tests/temporal_diag_test.cpp src/temporal_diag.cpp)
     add_test(NAME mgpu_temporal_diag_test COMMAND mgpu_temporal_diag_test)
@@ -303,4 +299,27 @@ if(MGPU_BUILD_TESTS)
     add_test(NAME mgpu_feature_diag_test COMMAND mgpu_feature_diag_test)
     add_executable(mgpu_producer_diag_test tests/producer_diag_test.cpp src/producer_diag.cpp)
     add_test(NAME mgpu_producer_diag_test COMMAND mgpu_producer_diag_test)
+    add_executable(mgpu_b1_contract_test tests/b1_contract_test.cpp)
+    target_include_directories(mgpu_b1_contract_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_b1_contract_test COMMAND mgpu_b1_contract_test)
+    add_executable(mgpu_mvec_admission_test tests/mvec_admission_test.cpp)
+    target_include_directories(mgpu_mvec_admission_test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    add_test(NAME mgpu_mvec_admission_test COMMAND mgpu_mvec_admission_test)
+    add_executable(mgpu_native_input_test tests/native_input_test.cpp src/native_input.cpp)
+    target_include_directories(mgpu_native_input_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mgpu_native_input/include")
+    target_compile_definitions(mgpu_native_input_test PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR MGPU_NATIVE_INPUT_TEST)
+    target_link_libraries(mgpu_native_input_test PRIVATE d3d12)
+    add_test(NAME mgpu_native_input_test COMMAND mgpu_native_input_test)
+    add_executable(mgpu_native_pixels_test
+        tests/native_pixels_test.cpp src/native_pixels.cpp src/native_input.cpp)
+    target_include_directories(mgpu_native_pixels_test PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mgpu_native_input/include")
+    target_compile_definitions(mgpu_native_pixels_test PRIVATE
+        WIN32_LEAN_AND_MEAN NOMINMAX _DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR)
+    target_link_libraries(mgpu_native_pixels_test PRIVATE d3d12)
+    add_test(NAME mgpu_native_pixels_test COMMAND mgpu_native_pixels_test)
 endif()

@@ -24,4 +24,7 @@ void on_present(void *queue_native, void *sc_native);
 
 // True once the panel has armed itself on a swap chain (diagnostics).
 bool running();
+// The independent neural window reads this to route mouse input: the panel
+// owns the cursor while open; otherwise clicks pass through to the game.
+bool panel_open();
 } // namespace mgpu::poverlay

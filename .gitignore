@@ -1,0 +1,21 @@
+# Build outputs and downloaded SDK headers
+build*/
+ext/ngx/
+
+# Runtime and local configuration
+*.addon64
+*.addon32
+*.dll
+*.exe
+*.log
+*.dmp
+mgpu.ini
+mgpu_panel.ini
+ReShade.ini
+ReShadePreset.ini
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vs/
+.vscode/

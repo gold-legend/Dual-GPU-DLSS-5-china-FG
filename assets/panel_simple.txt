@@ -20,8 +20,7 @@ panel.title      | MGPU 神经渲染 | 神经卡负责降噪，渲染卡负责�
 model.style      | 画风         | A/B/C 三套预置强度风格，最直观，建议先试这一项。
 model.tone       | 明暗         | 0–2，整体明暗/色调的强度。
 model.structure  | 结构         | 0–2，结构纹理的强度；过高会显脏。
-model.skin       | 皮肤         | 0–2，单独控制皮肤区域。
-model.mask       | 自动遮罩     | 自动识别皮肤区域再应用强度，一般配合"皮肤"用。
+model.skin       | 人脸遮罩     | 默认 0.30，范围 0–1。独立调节 NVIDIA 自动人脸/皮肤区域的结构处理，与角色守护无关；0 仍保留整帧神经画面。
 
 ==== 神经渲染 ====
 
@@ -45,6 +44,14 @@ finish.on        | 神经调色     | prism-core 1.5.1 的调色 + 角色守护�
 finish.look      | 色彩         | 默认 / 高还原 / 高饱和 / 低饱和 / 浓烈，实时。
 finish.guard     | 角色守护     | 0–1，压住神经结果在肤色和高饱和颜色上的改动，实时。
 
+==== 每一遍的网络与分辨率 ====
+
+pass1.network    | 第一遍网络   | Light-FP8 = 小网络，更快（FPS+）；Full-FP8 = 大网络，更慢（FPS-）。【重启】
+pass1.resolution | 第一遍分辨率 | 残差神经 = 神经卡在较低分辨率运行，再把细节叠回原生画面，更快（FPS+）；原生 = 全分辨率完整一遍，更慢（FPS-）。【重启】
+pass2.network    | 第二遍网络   | x2 时生效。最后一遍用 Full-FP8，可以消除"结构"调高时的闪烁。【重启】
+pass2.resolution | 第二遍分辨率 | x2 时生效。【重启】
+pass.best        | 默认         | 最佳画质-性能：第一遍和最后一遍都用 Full-FP8 + 残差神经。【重启】
+
 #==== 视图 ====
 
 # view           | 视图         | output = 看神经结果；input = 看喂给模型的原始帧；split = 左右对比（可拖分割线）。
@@ -55,6 +62,7 @@ finish.guard     | 角色守护     | 0–1，压住神经结果在肤色和高�
 
 fg.mode          | 帧生成       | 修正向量（修正生成帧的向量）/ 修正+抽帧（每 N 帧只评估 1 张）。实时，可能不稳。
 fg.keep          | 生成帧窗口   | 修正+抽帧 时"每 N 帧保留 1 张"的 N，2–8。实时。
+#fg.gpu1          | 神经卡帧生成 | 实验性，默认关闭：由神经卡生成中间帧（DLSS 帧生成）。【重启】（本分支不编译 FrameGen，行停用）
 
 #==== 诊断（一般不用动）====
 
@@ -95,5 +103,10 @@ ui.fg_keep_hint     | 每 N 帧保留 1 张
 ui.medium           | 中等
 ui.light            | 轻量
 ui.full             | 完整
+ui.light_fp8        | Light-FP8  FPS+
+ui.full_fp8         | Full-FP8  FPS-
+ui.residual_neural  | 残差神经  FPS+
+ui.native           | 原生  FPS-
+ui.best_qp          | 最佳画质-性能
 ui.advanced         | 高级  >>
 ui.reload           | 重新加载

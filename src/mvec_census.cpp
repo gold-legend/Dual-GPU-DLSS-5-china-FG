@@ -53,6 +53,9 @@ namespace
         bool alive = true;
     };
     std::vector<rt_entry> g_rt;
+    // Diagnostic-only four-channel G-buffer candidates. These NEVER feed the
+    // two-channel tap: their contents, channels and units are not yet known.
+    std::vector<rt_entry> g_observe_rt;
     const size_t RT_CAP = 256;
 
     bool two_channel(reshade::api::format f)
@@ -68,6 +71,14 @@ namespace
         }
     }
 
+    bool observed_four_channel(unsigned f)
+    {
+        // DXGI_FORMAT: RGBA32, RGBA16, RGB10A2 and RGBA8 families. ReShade's
+        // texture format values match DXGI here (also used by R280/R307).
+        return (f >= 1u && f <= 4u) || (f >= 9u && f <= 14u) ||
+               f == 23u || f == 24u || f == 27u || f == 28u || (f >= 30u && f <= 32u);
+    }
+
     const char *fmt_name(unsigned f)
     {
         using reshade::api::format;
@@ -80,7 +91,13 @@ namespace
         case format::r16g16_uint:     return "R16G16_UINT";
         case format::r32g32_typeless: return "R32G32_TYPELESS";
         case format::r32g32_float:    return "R32G32_FLOAT";
-        default: return "?";
+        case format::r32g32b32a32_typeless: return "R32G32B32A32_TYPELESS";
+        case format::r32g32b32a32_float:    return "R32G32B32A32_FLOAT";
+        case format::r16g16b16a16_typeless: return "R16G16B16A16_TYPELESS";
+        case format::r16g16b16a16_float:    return "R16G16B16A16_FLOAT";
+        case format::r16g16b16a16_unorm:    return "R16G16B16A16_UNORM";
+        case format::r16g16b16a16_snorm:    return "R16G16B16A16_SNORM";
+        default: return "other four-channel format";
         }
     }
 
@@ -161,17 +178,25 @@ namespace
                           reshade::api::resource res)
     {
         if (desc.type != reshade::api::resource_type::texture_2d) return;
-        if (!two_channel(desc.texture.format)) return;
+        const bool two = two_channel(desc.texture.format);
+        const bool observe = !two && g_report.load(std::memory_order_relaxed) &&
+                             observed_four_channel(static_cast<unsigned>(desc.texture.format));
+        if (!two && !observe) return;
         if ((desc.usage & reshade::api::resource_usage::render_target) == 0) return;
         if (!screen_sized(desc.texture.width, desc.texture.height)) return;
         std::lock_guard<std::mutex> lk(g_cs);
-        if (g_rt.size() >= RT_CAP) return;
+        std::vector<rt_entry> &table = two ? g_rt : g_observe_rt;
+        if (table.size() >= RT_CAP) return;
         rt_entry e; e.handle = res.handle; e.w = desc.texture.width; e.h = desc.texture.height;
         e.fmt = (unsigned)desc.texture.format; e.created_frame = g_frame;
-        g_rt.push_back(e);
-        char l[300];
-        snprintf(l, sizeof l, "[MGPU][R253][RT] created: 0x%016llX %ux%u %s (render target, two-channel, screen-sized) at game frame %llu",
-                 e.handle, e.w, e.h, fmt_name(e.fmt), g_frame);
+        table.push_back(e);
+        char l[420];
+        if (two)
+            snprintf(l, sizeof l, "[MGPU][R253][RT] created: 0x%016llX %ux%u %s (render target, two-channel, screen-sized) at game frame %llu",
+                     e.handle, e.w, e.h, fmt_name(e.fmt), g_frame);
+        else
+            snprintf(l, sizeof l, "[MGPU][R253][GB] created: 0x%016llX %ux%u fmt=%u (%s), samples=%u at game frame %llu. OBSERVE ONLY - not a tap candidate.",
+                     e.handle, e.w, e.h, e.fmt, fmt_name(e.fmt), desc.texture.samples, g_frame);
         mgpu::diag::info(l);
     }
 
@@ -179,8 +204,20 @@ namespace
     {
         std::lock_guard<std::mutex> lk(g_cs);
         for (auto &e : g_rt) if (e.handle == res.handle && e.alive) { e.alive = false; }
+        for (auto &e : g_observe_rt) if (e.handle == res.handle && e.alive) { e.alive = false; }
         for (size_t i = 0; i < g_cb.size(); ++i)
             if (g_cb[i].handle == res.handle) { g_cb.erase(g_cb.begin() + (ptrdiff_t)i); break; }
+    }
+
+    void note_bind(rt_entry &e, unsigned seq)
+    {
+        ++e.binds;
+        if (e.last_frame != g_frame)
+        {
+            e.last_frame = g_frame; ++e.frames_bound;
+            if (seq < e.first_seq_min) e.first_seq_min = seq;
+            if (seq > e.first_seq_max) e.first_seq_max = seq;
+        }
     }
 
     void on_bind_rts(reshade::api::command_list *cmd, uint32_t count, const reshade::api::resource_view *rtvs,
@@ -191,22 +228,15 @@ namespace
         if (dev == nullptr) return;
         std::lock_guard<std::mutex> lk(g_cs);
         const unsigned seq = g_bind_seq++;
-        if (g_rt.empty()) return;
+        if (g_rt.empty() && g_observe_rt.empty()) return;
         for (uint32_t i = 0; i < count; ++i)
         {
             if (rtvs[i].handle == 0) continue;
             const reshade::api::resource r = dev->get_resource_from_view(rtvs[i]);
             for (auto &e : g_rt)
-            {
-                if (e.handle != r.handle || !e.alive) continue;
-                ++e.binds;
-                if (e.last_frame != g_frame)
-                {
-                    e.last_frame = g_frame; ++e.frames_bound;
-                    if (seq < e.first_seq_min) e.first_seq_min = seq;
-                    if (seq > e.first_seq_max) e.first_seq_max = seq;
-                }
-            }
+                if (e.handle == r.handle && e.alive) note_bind(e, seq);
+            for (auto &e : g_observe_rt)
+                if (e.handle == r.handle && e.alive) note_bind(e, seq);
         }
     }
 
@@ -242,14 +272,14 @@ namespace
 
     void report(unsigned long long f)
     {
-        std::vector<rt_entry> rt; std::vector<cb_entry> cb;
+        std::vector<rt_entry> rt, observed; std::vector<cb_entry> cb;
         {
             std::lock_guard<std::mutex> lk(g_cs);
-            rt = g_rt; cb = g_cb;
+            rt = g_rt; observed = g_observe_rt; cb = g_cb;
         }
-        char l[420];
-        snprintf(l, sizeof l, "[MGPU][R253] CENSUS at game frame %llu | screen %ux%u | two-channel screen-sized render targets seen: %zu | CPU-written buffers seen: %zu",
-                 f, g_w, g_h, rt.size(), cb.size());
+        char l[520];
+        snprintf(l, sizeof l, "[MGPU][R253] CENSUS at game frame %llu | screen %ux%u | two-channel screen-sized render targets seen: %zu | four-channel G-buffer candidates (OBSERVE ONLY): %zu | CPU-written buffers seen: %zu",
+                 f, g_w, g_h, rt.size(), observed.size(), cb.size());
         mgpu::diag::info(l);
         for (const auto &e : rt)
         {
@@ -257,6 +287,16 @@ namespace
                      "[MGPU][R253][RT] 0x%016llX %ux%u %s %s | binds=%llu frames_bound=%llu of %llu since creation | "
                      "first bind position in frame: min=%u max=%u",
                      e.handle, e.w, e.h, fmt_name(e.fmt), e.alive ? "alive" : "DESTROYED",
+                     e.binds, e.frames_bound, (f > e.created_frame) ? (f - e.created_frame) : 0ull,
+                     e.first_seq_min == 0xFFFFFFFFu ? 0u : e.first_seq_min, e.first_seq_max);
+            mgpu::diag::info(l);
+        }
+        for (const auto &e : observed)
+        {
+            snprintf(l, sizeof l,
+                     "[MGPU][R253][GB] 0x%016llX %ux%u fmt=%u (%s) %s | binds=%llu frames_bound=%llu of %llu since creation | "
+                     "first bind position in frame: min=%u max=%u. OBSERVE ONLY - XY is not yet validated as motion.",
+                     e.handle, e.w, e.h, e.fmt, fmt_name(e.fmt), e.alive ? "alive" : "DESTROYED",
                      e.binds, e.frames_bound, (f > e.created_frame) ? (f - e.created_frame) : 0ull,
                      e.first_seq_min == 0xFFFFFFFFu ? 0u : e.first_seq_min, e.first_seq_max);
             mgpu::diag::info(l);

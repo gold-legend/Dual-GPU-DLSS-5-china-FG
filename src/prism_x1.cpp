@@ -7,9 +7,17 @@
 // changes network extent and same-frame reconstruction on evaluated frames.
 // Cadence 1 or fixed 15 is supported; held frames reuse output and are not new evaluations.
 
+#ifndef PRISM_X1_NAMESPACE
+#define PRISM_X1_NAMESPACE prism_x1
+#endif
+#ifndef PRISM_X1_PASS_ID
+#define PRISM_X1_PASS_ID "1"
+#endif
+
 #include "prism_x1.hpp"
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,10 +27,11 @@
 #include "diag.hpp"
 #include "mgpu_ini_parser.hpp"
 
-namespace mgpu::prism_x1
+namespace mgpu::PRISM_X1_NAMESPACE
 {
 namespace
 {
+constexpr const char *kPassId = PRISM_X1_PASS_ID;
 std::atomic<bool> g_active{false};
 std::atomic<bool> g_ab_enabled{true};
 ID3D12Device *g_dev = nullptr;
@@ -30,46 +39,65 @@ ID3D12RootSignature *g_rs = nullptr;
 ID3D12PipelineState *g_down = nullptr;
 ID3D12PipelineState *g_fit = nullptr;
 ID3D12PipelineState *g_compose = nullptr;
+ID3D12PipelineState *g_capture = nullptr;
 ID3D12DescriptorHeap *g_heap = nullptr;
 ID3D12Resource *g_a = nullptr;
 ID3D12Resource *g_b = nullptr;
+ID3D12Resource *g_history = nullptr;
 UINT g_inc = 0;
 unsigned g_w = 0, g_h = 0;
 DXGI_FORMAT g_fmt = DXGI_FORMAT_UNKNOWN;
 std::atomic<float> g_intensity{1.0f};
 std::atomic<float> g_guard{1.0f};
 float g_detail = 0.85f;
-unsigned long long g_downs = 0, g_applies = 0;
+unsigned long long g_downs = 0, g_applies = 0, g_limit_frames = 0;
+bool g_history_valid = false;
+bool g_limit_residual = false;
+bool g_depth_valid = false;
+bool g_motion_valid = false;
+MgpuPrismMotion g_motion{};
+DXGI_FORMAT g_motion_fmt = DXGI_FORMAT_UNKNOWN;
 
-// Eight recording slots, each with three DISJOINT five-descriptor tables.
-// The root signature maps SRV t0..t2 to slots 0..2 and UAV u0..u1 to slots
-// 3..4. A descriptor is read when the GPU executes, not when the CPU records.
+// Eight recording slots, each with four DISJOINT ten-descriptor tables.
+// The root signature maps SRV t0..t7 to slots 0..7 and UAV u0..u1 to slots
+// 8..9. A descriptor is read when the GPU executes, not when the CPU records.
 constexpr UINT RING = 8;
 constexpr UINT DOWN_BASE = 0;
-constexpr UINT FIT_BASE = 5;
-constexpr UINT COMPOSE_BASE = 10;
-constexpr UINT SLOTS = 15;
-static_assert(FIT_BASE - DOWN_BASE == 5 && COMPOSE_BASE - FIT_BASE == 5 &&
-              SLOTS - COMPOSE_BASE == 5, "PX1 descriptor tables must not overlap");
+constexpr UINT FIT_BASE = 10;
+constexpr UINT COMPOSE_BASE = 20;
+constexpr UINT CAPTURE_BASE = 30;
+constexpr UINT SLOTS = 40;
+static_assert(FIT_BASE - DOWN_BASE == 10 && COMPOSE_BASE - FIT_BASE == 10 &&
+              CAPTURE_BASE - COMPOSE_BASE == 10 && SLOTS - CAPTURE_BASE == 10,
+              "PX1 descriptor tables must not overlap");
 
 struct consts_t
 {
     unsigned w, h, lw, lh;
     float intensity, guard, detail, scale_x, scale_y;
-    unsigned pad0, pad1, pad2;
+    unsigned motion_valid, history_valid, depth_valid;
+    float motion_scale_x, motion_scale_y;
+    unsigned motion_x, motion_y, motion_w, motion_h;
 };
-static_assert(sizeof(consts_t) == 48, "12 root constants");
+static_assert(sizeof(consts_t) == 72, "18 root constants");
 
 const char kShaders[] = R"(
 cbuffer C : register(b0)
 {
   uint gW; uint gH; uint gLW; uint gLH;
   float gIntensity; float gGuard; float gDetail;
-  float gScaleX; float gScaleY; uint gPad0; uint gPad1; uint gPad2;
+  float gScaleX; float gScaleY; uint gMotionValid; uint gHistoryValid; uint gDepthValid;
+  float gMotionScaleX; float gMotionScaleY;
+  uint gMotionX; uint gMotionY; uint gMotionW; uint gMotionH;
 };
 Texture2D<float4> gBase : register(t0);
 Texture2D<float4> gOther : register(t1);
 Texture2D<float4> gGuide : register(t2);
+Texture2D<float4> gSmallInput : register(t3);
+Texture2D<float4> gSmallOutput : register(t4);
+Texture2D<float4> gHistory : register(t5);
+Texture2D<float4> gMotion : register(t6);
+Texture2D<float4> gMaskBase : register(t7);
 RWTexture2D<float4> gOut0 : register(u0);
 RWTexture2D<float4> gOut1 : register(u1);
 
@@ -89,6 +117,10 @@ float Smooth(float a, float b, float x)
   const float t = saturate((x - a) / (b - a));
   return t * t * (3.0 - 2.0 * t);
 }
+
+// Motion only selects the strength of the same-frame spatial filter below.
+// No previous-frame colour or residual participates in reconstruction.
+float CurrentMotionTexels(int2 q);
 
 // Prism Down: bilinear filtering in linear light, not point sampling of
 // display-code values. gOther is the small network's output in later passes.
@@ -118,6 +150,53 @@ void CS_Down(uint3 id : SV_DispatchThreadID)
 static const float kGfRef = -2.5;
 static const float kGfEps = 0.01;
 groupshared float4 gfIE[576];
+groupshared float2 gfEL[576]; // x: original residual luma, y: usable neighbour
+// Same-frame de-speckle adapted from FreshEditTiled in the community DLSS-NR
+// v1.3.0 cache shader (Skynizz/optiscaler-dlss5). Only an isolated residual
+// luminance excursion is bounded by its eight neighbours. Current-frame motion
+// tightens only the margin; every colour tap still comes from this evaluation.
+// The neighbour readback remains unmodified, so filtering has no traversal bias.
+float3 ClampResidualSpeck(float3 e, uint i, float motionTexels)
+{
+  float lo = 1e9, hi = -1e9;
+  float samples[8];
+  [unroll] for (int s = 0; s < 8; ++s) samples[s] = 1e9;
+  uint count = 0;
+  [unroll] for (int k = 0; k < 9; ++k)
+  {
+    if (k == 4) continue;
+    const int n = int(i) + (k / 3 - 1) * 24 + (k % 3 - 1);
+    const float2 neighbour = gfEL[n];
+    if (neighbour.y > 0.5)
+    {
+      lo = min(lo, neighbour.x);
+      hi = max(hi, neighbour.x);
+      samples[count++] = neighbour.x;
+    }
+  }
+  if (hi < lo) return e;
+  [unroll] for (int a = 1; a < 8; ++a)
+  {
+    const float v = samples[a];
+    int b = a - 1;
+    while (b >= 0 && samples[b] > v)
+    {
+      samples[b + 1] = samples[b];
+      --b;
+    }
+    samples[b + 1] = v;
+  }
+  const float median = 0.5 * (samples[(count - 1u) / 2u] + samples[count / 2u]);
+  const float motion = Smooth(0.25, 2.0, motionTexels);
+  // Static pixels retain the original extrema test. At full motion both bounds
+  // converge to the same-frame median, suppressing coherent temporal shimmer.
+  lo = lerp(lo, median, motion);
+  hi = lerp(hi, median, motion);
+  const float margin = lerp(0.10, 0.04, motion);
+  const float y = Luma(e);
+  const float limited = clamp(y, lo - margin, hi + margin);
+  return e + (limited - y); // preserve residual chroma, as the community does
+}
 groupshared float3 gfSA[400], gfSB[400];
 [numthreads(16, 16, 1)]
 void CS_GuidedFit(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
@@ -131,6 +210,22 @@ void CS_GuidedFit(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
     const float3 n = Dec(gOther.Load(int3(q, 0)).rgb);
     const float3 e = clamp(log2(max(n, 1.0 / 512.0) / max(p, 1.0 / 512.0)), -3.0, 3.0);
     gfIE[i] = float4(log2(max(Luma(p), 1e-4)) - kGfRef, e);
+    // A black neural answer beside a lit input is an invalid neighbour, not
+    // evidence that can drag a whole window dark. The centre keeps old behavior.
+    const float py = Luma(p), ny = Luma(n);
+    const float valid = py > 8.0 / 512.0 && ny < 0.05 * py ? 0.0 : 1.0;
+    gfEL[i] = float2(Luma(e), valid);
+  }
+  GroupMemoryBarrierWithGroupSync();
+
+  // The one-cell outer ring is guidance only; every other tile cell has all
+  // eight neighbours available, including the cells used by the fit below.
+  for (uint i = gi; i < 576; i += 256)
+  {
+    const uint x = i % 24, y = i / 24;
+    if (x == 0 || y == 0 || x == 23 || y == 23) continue;
+    const int2 q = clamp(org + int2(x, y), int2(0, 0), last);
+    gfIE[i].yzw = ClampResidualSpeck(gfIE[i].yzw, i, CurrentMotionTexels(q));
   }
   GroupMemoryBarrierWithGroupSync();
 
@@ -168,34 +263,56 @@ void CS_GuidedFit(uint3 gid : SV_GroupID, uint gi : SV_GroupIndex)
       A += gfSA[c]; B += gfSB[c];
     }
   }
-  gOut0[px] = float4(A / 25.0, 0.0);
+  const float3 centerE = gfIE[(t.y + 2) * 24 + t.x + 2].yzw;
+  gOut0[px] = float4(A / 25.0, Luma(centerE));
   gOut1[px] = float4(B / 25.0, 0.0);
 }
 
-float3 LowBilinear(Texture2D<float4> tex, float2 f)
+float4 LowBilinear(Texture2D<float4> tex, float2 f)
 {
   const int2 last = int2(gLW, gLH) - 1, b = int2(floor(f));
   const float2 a = f - float2(b);
-  float3 v = 0.0;
+  float4 v = 0.0;
   [unroll] for (int j = 0; j <= 1; ++j)
   {
     [unroll] for (int i = 0; i <= 1; ++i)
     {
       const int2 q = clamp(b + int2(i, j), int2(0, 0), last);
-      v += tex.Load(int3(q, 0)).rgb *
+      v += tex.Load(int3(q, 0)) *
            ((i ? a.x : 1.0 - a.x) * (j ? a.y : 1.0 - a.y));
     }
   }
   return v;
 }
 
-float3 GuardEdit(float3 pd, float3 p, float3 e)
+// Read only this frame's vector magnitude in PX1 low-resolution texels.
+// There is deliberately no previous coordinate and no history sample here.
+float CurrentMotionTexels(int2 q)
+{
+  if (gMotionValid == 0) return 0.0;
+  const float2 f = float2(q);
+  const float2 motionF = (f + 0.5) * float2(gMotionW, gMotionH) /
+                         float2(gLW, gLH) + float2(gMotionX, gMotionY) - 0.5;
+  const int2 motionMin = int2(gMotionX, gMotionY);
+  const int2 motionMax = int2(gMotionX + gMotionW - 1, gMotionY + gMotionH - 1);
+  const int2 mq = clamp(int2(floor(motionF + 0.5)), motionMin, motionMax);
+  const float2 mv = gMotion.Load(int3(mq, 0)).xy;
+  if (!(abs(mv.x) < 4096.0 && abs(mv.y) < 4096.0)) return 0.0;
+  return length(mv * float2(gMotionScaleX, gMotionScaleY));
+}
+
+float SkinMask(float3 pd, float3 p)
 {
   const float3 d = pd * 255.0;
   const float cb = 128.0 - 0.168736 * d.r - 0.331264 * d.g + 0.5 * d.b;
   const float cr = 128.0 + 0.5 * d.r - 0.418688 * d.g - 0.081312 * d.b;
   const float2 q = float2((cb - 107.0) / 22.0, (cr - 150.0) / 18.0);
-  const float skin = exp(-dot(q, q)) * Smooth(0.02, 0.06, Luma(p));
+  return exp(-dot(q, q)) * Smooth(0.02, 0.06, Luma(p));
+}
+
+float3 GuardEdit(float3 pd, float3 p, float3 e)
+{
+  const float skin = SkinMask(pd, p);
   const float mx = max(p.r, max(p.g, p.b));
   const float mn = min(p.r, min(p.g, p.b));
   const float w = max(skin * 0.8,
@@ -205,8 +322,37 @@ float3 GuardEdit(float3 pd, float3 p, float3 e)
   return y + kept + (clamp(kept, -0.08, 0.08) - kept) * w;
 }
 
-// Compose uses the CURRENT native input, with bilinear A/B sampling exactly
-// as Prism UpGuided. No History, Motion, Depth, Steady or Carry is referenced.
+// Asymmetric display-referred tone residual. The neural network contributes
+// luminance structure only; the current game pixel remains the colour anchor.
+// Shadows retain a soft floor instead of clipping to black, while highlights
+// use a continuous shoulder instead of MGPU's hard 2.5x / 2.0 clamp.
+float ToneResidual(float origY, float editY)
+{
+  const float shadow = 1.0 - Smooth(0.035, 0.32, origY);
+  if (editY < 0.0)
+  {
+    // Dark protection is part of the tone pipeline, not the character-guard
+    // slider. Never amplify neural darkening; retain 30% luma in deep shadow.
+    const float minY = origY * lerp(0.05, 0.30, shadow);
+    return max(editY, minY - origY);
+  }
+  const float bright = Smooth(0.45, 0.90, origY);
+  const float headroom = max((0.20 + origY * 1.60) * lerp(1.0, 0.65, bright), 1e-4);
+  const float lifted = editY * gIntensity;
+  return lifted / (1.0 + lifted / headroom);
+}
+
+// Temporal stability comes from the residual deadband above. A second,
+// frame-varying rejection multiplier after that limiter reintroduced exposure
+// pumping, so composition no longer applies this conflicting rejection gate.
+float LocalHistoryKeep(float2 f, uint2 nativeId)
+{
+  return 1.0;
+}
+
+// Compose keeps stable Prism outside skin. Skin uses the actual low-resolution
+// neural residual for realism, game chroma for colour, and native-rate grain
+// restored after intensity so 300% cannot amplify the grain itself.
 [numthreads(16, 16, 1)]
 void CS_Compose(uint3 id : SV_DispatchThreadID)
 {
@@ -214,15 +360,92 @@ void CS_Compose(uint3 id : SV_DispatchThreadID)
   const float4 baseSample = gBase[id.xy];
   const float3 baseCode = max(baseSample.rgb, 0.0);
   const float3 base = Dec(baseCode);
+  // Detection is native-resolution and always uses the same-seal game frame.
+  // gBase may be the preceding neural pass; network scales never resize this mask.
+  const float3 maskCode = max(gMaskBase[id.xy].rgb, 0.0);
+  const float3 maskBase = Dec(maskCode);
   const float yFull = log2(max(Luma(base), 1e-4));
   const float2 f = (float2(id.xy) + 0.5) * float2(gScaleX, gScaleY) - 0.5;
-  float3 e = clamp(LowBilinear(gOther, f) * (yFull - kGfRef) +
-                   LowBilinear(gGuide, f), -3.0, 3.0) * gIntensity;
-  e = GuardEdit(baseCode, base, e);
-  if (all(abs(e) <= 1e-8))
-    gOut0[id.xy] = baseSample; // exact zero-edit identity
-  else
-    gOut0[id.xy] = float4(Enc(base * exp2(e)), baseSample.a);
+  // Reject only locally stale residual, never the current game colour and never
+  // the whole frame. Stable pixels retain the complete neural edit.
+  const float historyKeep = LocalHistoryKeep(f, id.xy);
+  float3 rawEdit = clamp(LowBilinear(gOther, f) * (yFull - kGfRef) +
+                         LowBilinear(gGuide, f), -3.0, 3.0) * historyKeep;
+  float3 e = rawEdit * gIntensity;
+  // Negative-luma protection is always active. The character-guard slider is
+  // reserved for chroma anti-roughness and cannot reintroduce crushed blacks.
+  if (gIntensity > 1.0)
+  {
+    const float amplifiedY = Luma(e);
+    if (amplifiedY < 0.0)
+      e += Luma(rawEdit) - amplifiedY;
+  }
+  e = GuardEdit(maskCode, maskBase, e);
+  float3 result = Enc(base * exp2(e));
+  // The panel contract is 0%=off, 100%=full character protection. Gate the
+  // complete skin branch as well as GuardEdit; previously 0% still ran the
+  // MGPU skin residual and native high-frequency recovery.
+  const float skin = saturate(SkinMask(maskCode, maskBase) * gGuard);
+  if (skin > 1e-4)
+  {
+    const float3 smallInput = LowBilinear(gSmallInput, f);
+    const float3 smallOutput = LowBilinear(gSmallOutput, f);
+    float editY = Luma(smallOutput - smallInput);
+    editY *= historyKeep;
+    const float origY = Luma(baseCode);
+    const float3 lumaDir = lerp(float3(1.0, 1.0, 1.0),
+                                baseCode / (origY + 1e-5), saturate(origY * 50.0));
+    const float targetY = max(origY + ToneResidual(origY, editY), 0.0);
+    const float3 mgpuCode = lumaDir * targetY;
+    // Convert only to run the established anti-roughness guard; the residual
+    // itself remains display-referred and is never reconstructed from A/B.
+    float3 mgpuEdit = clamp(log2(max(Dec(mgpuCode), 1.0 / 512.0) /
+                                 max(base, 1.0 / 512.0)), -3.0, 3.0);
+    mgpuEdit = GuardEdit(maskCode, maskBase, mgpuEdit);
+    const float3 mgpuGuarded = Enc(base * exp2(mgpuEdit));
+    result = lerp(result, mgpuGuarded, skin);
+
+    // MGPU 0.4's adaptive native high-frequency recovery, at the original
+    // NRSharpness=0.50. It is applied once, after both residual and intensity.
+    const int2 last = int2(gW, gH) - 1;
+    const int2 p = int2(id.xy);
+    const float3 cE = gBase.Load(int3(min(p.x + 1, last.x), p.y, 0)).rgb;
+    const float3 cW = gBase.Load(int3(max(p.x - 1, 0), p.y, 0)).rgb;
+    const float3 cS = gBase.Load(int3(p.x, min(p.y + 1, last.y), 0)).rgb;
+    const float3 cN = gBase.Load(int3(p.x, max(p.y - 1, 0), 0)).rgb;
+    const float lE = Luma(cE), lW = Luma(cW), lS = Luma(cS), lN = Luma(cN);
+    const float lM = Luma(baseCode);
+    const float minL = min(lM, min(min(lE, lW), min(lS, lN)));
+    const float maxL = max(lM, max(max(lE, lW), max(lS, lN)));
+    const float range = maxL - minL;
+    if (range > 1e-5)
+    {
+      const float3 crossAvg = (cE + cW + cS + cN) * 0.25;
+      const float3 highFreq = baseCode - crossAvg;
+      const float adaptiveScale = saturate(1.0 - range / (maxL + 1e-4));
+      const float w = 0.5 * (0.2 + 0.8 * adaptiveScale) * skin;
+      result = max(result + highFreq * w, 0.0);
+    }
+  }
+  // The DComp visual must never blend a stale game frame through neural output.
+  gOut0[id.xy] = float4(result, 1.0);
+}
+
+// Save the current low-resolution input and residual luma for next frame's
+// local confidence test and temporal clamp. This is metadata, not NGX history.
+// With optional depth enabled, alpha keeps its original depth role.
+[numthreads(16, 16, 1)]
+void CS_Capture(uint3 id : SV_DispatchThreadID)
+{
+  if (id.x >= gLW || id.y >= gLH) return;
+  float alpha = gSmallInput[id.xy].a;
+  if (gDepthValid != 0)
+  {
+    const float2 f = (float2(id.xy) + 0.5) / float2(gScaleX, gScaleY);
+    const int2 q = clamp(int2(f), int2(0, 0), int2(gW, gH) - 1);
+    alpha = gOther[q].r;
+  }
+  gOut0[id.xy] = float4(gBase[id.xy].rgb, alpha);
 }
 )";
 
@@ -240,6 +463,7 @@ void release_all()
     g_active.store(false, std::memory_order_relaxed);
     g_ab_enabled.store(true, std::memory_order_relaxed);
     IUnknown *u;
+    u = g_capture; rel(u); g_capture = nullptr;
     u = g_compose; rel(u); g_compose = nullptr;
     u = g_fit; rel(u); g_fit = nullptr;
     u = g_down; rel(u); g_down = nullptr;
@@ -247,9 +471,16 @@ void release_all()
     u = g_heap; rel(u); g_heap = nullptr;
     u = g_a; rel(u); g_a = nullptr;
     u = g_b; rel(u); g_b = nullptr;
+    u = g_history; rel(u); g_history = nullptr;
     g_dev = nullptr;
     g_w = g_h = 0;
-    g_downs = g_applies = 0;
+    g_downs = g_applies = g_limit_frames = 0;
+    g_history_valid = false;
+    g_limit_residual = false;
+    g_depth_valid = false;
+    g_motion_valid = false;
+    g_motion = MgpuPrismMotion{};
+    g_motion_fmt = DXGI_FORMAT_UNKNOWN;
 }
 
 bool ini_path(wchar_t *path, size_t n)
@@ -304,10 +535,12 @@ bool read_keys()
     const char *cadence = mgpu::config::find(buf.data(), got, "NRCadence");
     const int pass_count = passes != nullptr ? atoi(passes) : 1;
     const int cadence_count = cadence != nullptr ? atoi(cadence) : 1;
-    if ((pass_count != 1 && pass_count != 2) ||
-        (cadence_count != 1 && cadence_count != 15))
+    const char *chain = mgpu::config::find(buf.data(), got, "ChainWarp");
+    const bool chain4 = cadence_count == 4 && chain != nullptr && atoi(chain) == 1;
+    if ((pass_count < 1 || pass_count > 3) ||
+        (cadence_count != 1 && cadence_count != 2 && !chain4))
     {
-        mgpu::diag::error("[MGPU][PX1] requires Passes=1 or 2 and NRCadence=1 or 15 (fixed 1.5-frame average); reduced path stays OFF.");
+        mgpu::diag::error("[MGPU][PX1] requires Passes=1, 2 or 3 and NRCadence=1, 2 (paired hold), or 4 with ChainWarp=1; the retired 1.5 mode stays OFF.");
         return false;
     }
     const char *sync = mgpu::config::find(buf.data(), got, "PrismSync");
@@ -341,6 +574,18 @@ DXGI_FORMAT view_format(DXGI_FORMAT f)
     }
 }
 
+DXGI_FORMAT motion_view_format(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R16G16_FLOAT:
+    case DXGI_FORMAT_R32G32_FLOAT: return f;
+    case DXGI_FORMAT_R16G16_TYPELESS: return DXGI_FORMAT_R16G16_FLOAT;
+    case DXGI_FORMAT_R32G32_TYPELESS: return DXGI_FORMAT_R32G32_FLOAT;
+    default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
 bool build()
 {
     HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
@@ -354,16 +599,16 @@ bool build()
 
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-    ranges[0].NumDescriptors = 3;
+    ranges[0].NumDescriptors = 8;
     ranges[0].BaseShaderRegister = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
     ranges[1].NumDescriptors = 2;
     ranges[1].BaseShaderRegister = 0;
-    ranges[1].OffsetInDescriptorsFromTableStart = 3;
+    ranges[1].OffsetInDescriptorsFromTableStart = 8;
     D3D12_ROOT_PARAMETER rp[2] = {};
     rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
     rp[0].Constants.ShaderRegister = 0;
-    rp[0].Constants.Num32BitValues = 12;
+    rp[0].Constants.Num32BitValues = 18;
     rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
     rp[1].DescriptorTable.NumDescriptorRanges = 2;
     rp[1].DescriptorTable.pDescriptorRanges = ranges;
@@ -385,9 +630,9 @@ bool build()
         return false;
     }
 
-    const char *entries[3] = {"CS_Down", "CS_GuidedFit", "CS_Compose"};
-    ID3D12PipelineState **targets[3] = {&g_down, &g_fit, &g_compose};
-    for (unsigned pass = 0; pass < 3; ++pass)
+    const char *entries[4] = {"CS_Down", "CS_GuidedFit", "CS_Compose", "CS_Capture"};
+    ID3D12PipelineState **targets[4] = {&g_down, &g_fit, &g_compose, &g_capture};
+    for (unsigned pass = 0; pass < 4; ++pass)
     {
         ID3DBlob *cs = nullptr;
         hr = compile(kShaders, sizeof(kShaders) - 1u, "prism_x1", nullptr, nullptr,
@@ -438,6 +683,10 @@ bool build()
         hr = g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
                                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
                                             IID_PPV_ARGS(&g_b));
+    if (SUCCEEDED(hr))
+        hr = g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+                                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+                                            IID_PPV_ARGS(&g_history));
     if (FAILED(hr)) return false;
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
@@ -490,17 +739,27 @@ bool valid_texture(ID3D12Resource *r, unsigned w, unsigned h)
            d.Width >= w && d.Height >= h && w != 0 && h != 0;
 }
 
-void constants(ID3D12GraphicsCommandList *cl, ID3D12Resource *low_proxy)
+void constants(ID3D12GraphicsCommandList *cl, unsigned low_width, unsigned low_height)
 {
-    const D3D12_RESOURCE_DESC d = low_proxy->GetDesc();
     consts_t c{};
-    c.w = g_w; c.h = g_h; c.lw = (unsigned)d.Width; c.lh = d.Height;
+    c.w = g_w; c.h = g_h; c.lw = low_width; c.lh = low_height;
     c.intensity = g_intensity.load(std::memory_order_relaxed);
     c.guard = g_guard.load(std::memory_order_relaxed);
     c.detail = g_detail;
-    c.scale_x = (float)d.Width / (float)g_w;
-    c.scale_y = (float)d.Height / (float)g_h;
-    cl->SetComputeRoot32BitConstants(0, 12, &c, 0);
+    c.scale_x = (float)low_width / (float)g_w;
+    c.scale_y = (float)low_height / (float)g_h;
+    c.motion_valid = g_motion_valid ? 1u : 0u;
+    // Hard contract: temporal residual history is disabled. Motion is used only
+    // to select this frame's spatial de-speckle margin, never to fetch old data.
+    c.history_valid = 0u;
+    c.depth_valid = g_depth_valid ? 1u : 0u;
+    c.motion_scale_x = g_motion.scale_x;
+    c.motion_scale_y = g_motion.scale_y;
+    c.motion_x = g_motion.base_x;
+    c.motion_y = g_motion.base_y;
+    c.motion_w = g_motion.width;
+    c.motion_h = g_motion.height;
+    cl->SetComputeRoot32BitConstants(0, 18, &c, 0);
 }
 
 void barrier_to(ID3D12GraphicsCommandList *cl, ID3D12Resource *r,
@@ -519,8 +778,10 @@ void barrier_to(ID3D12GraphicsCommandList *cl, ID3D12Resource *r,
 bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt,
          unsigned low_width, unsigned low_height)
 {
+    // Equal extents are valid for the GPU0-native-NR isolation path: Down is
+    // bypassed by the caller, while GuidedFit/Compose simply use scale 1.0.
     if (dev == nullptr || width == 0 || height == 0 || low_width == 0 || low_height == 0 ||
-        low_width >= width || low_height >= height || !read_keys())
+        low_width > width || low_height > height || !read_keys())
         return false;
     release_all();
     g_dev = dev;
@@ -534,10 +795,10 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt,
     g_active.store(true, std::memory_order_relaxed);
     char line[400];
     snprintf(line, sizeof line,
-             "[MGPU][PX1] reduced same-frame Prism ON: native=%ux%u low=%ux%u fmt=%d "
-             "intensity=%.2f guard=%.2f detail=%.2f; Down+GuidedFit+Compose on evaluated frames; "
-             "held frames reuse the previous neural output; no temporal edit transport/FG.",
-             g_w, g_h, low_width, low_height, (int)g_fmt,
+             "[MGPU][PX1][P%s] reduced same-frame Prism ON: native=%ux%u low=%ux%u fmt=%d "
+             "intensity=%.2f guard=%.2f detail=%.2f; current-frame Down+GuidedFit+Compose; "
+             "motion-adaptive same-frame de-speckle; temporal residual history disabled; no old-colour composition/FG.",
+             kPassId, g_w, g_h, low_width, low_height, (int)g_fmt,
              (double)g_intensity.load(std::memory_order_relaxed),
              (double)g_guard.load(std::memory_order_relaxed), (double)g_detail);
     mgpu::diag::info(line);
@@ -559,6 +820,7 @@ bool toggle_ab()
     if (!active()) return false;
     const bool enabled = !g_ab_enabled.load(std::memory_order_relaxed);
     g_ab_enabled.store(enabled, std::memory_order_relaxed);
+    g_history_valid = false;
     mgpu::diag::warn(enabled
         ? "[MGPU][PX1][AB] PX1 enabled: reduced Down + GuidedFit + Compose on the next recorded frame."
         : "[MGPU][PX1][AB] Original NRS enabled: the original Down + residual resolve runs instead; transport and depth are unchanged.");
@@ -566,56 +828,96 @@ bool toggle_ab()
 }
 
 bool down(ID3D12GraphicsCommandList *cl, unsigned parity,
-          ID3D12Resource *base, ID3D12Resource *low_proxy)
+          ID3D12Resource *base, ID3D12Resource *low_proxy,
+          unsigned low_width, unsigned low_height)
 {
     if (!ab_enabled() || cl == nullptr || !valid_texture(base, g_w, g_h) ||
-        !valid_texture(low_proxy, 1, 1) || base == low_proxy)
+        !valid_texture(low_proxy, low_width, low_height) || base == low_proxy)
         return false;
-    const D3D12_RESOURCE_DESC d = low_proxy->GetDesc();
-    if (d.Width >= g_w || d.Height >= g_h) return false;
+    if (low_width >= g_w || low_height >= g_h) return false;
 
     ID3D12DescriptorHeap *heaps[1] = {g_heap};
     cl->SetDescriptorHeaps(1, heaps);
     cl->SetComputeRootSignature(g_rs);
-    constants(cl, low_proxy);
+    constants(cl, low_width, low_height);
     write_srv(cpu_slot(parity, DOWN_BASE), base, g_fmt);
     write_srv(cpu_slot(parity, DOWN_BASE + 1), base, g_fmt);       // t1 unused by Down
     write_srv(cpu_slot(parity, DOWN_BASE + 2), base, g_fmt);       // t2 unused by Down
-    write_uav(cpu_slot(parity, DOWN_BASE + 3), low_proxy, g_fmt); // root-table u0
-    write_uav(cpu_slot(parity, DOWN_BASE + 4), low_proxy, g_fmt); // u1 unused by Down
+    write_srv(cpu_slot(parity, DOWN_BASE + 3), base, g_fmt);       // t3 unused by Down
+    write_srv(cpu_slot(parity, DOWN_BASE + 4), base, g_fmt);       // t4 unused by Down
+    write_srv(cpu_slot(parity, DOWN_BASE + 5), base, g_fmt);       // t5 unused by Down
+    write_srv(cpu_slot(parity, DOWN_BASE + 6), base, g_fmt);       // t6 unused by Down
+    write_srv(cpu_slot(parity, DOWN_BASE + 7), base, g_fmt);       // t7 unused by Down
+    write_uav(cpu_slot(parity, DOWN_BASE + 8), low_proxy, g_fmt); // root-table u0
+    write_uav(cpu_slot(parity, DOWN_BASE + 9), low_proxy, g_fmt); // u1 unused by Down
     cl->SetPipelineState(g_down);
     cl->SetComputeRootDescriptorTable(1, gpu_slot(parity, DOWN_BASE));
-    cl->Dispatch(((unsigned)d.Width + 15u) / 16u, (d.Height + 15u) / 16u, 1u);
+    cl->Dispatch((low_width + 15u) / 16u, (low_height + 15u) / 16u, 1u);
     ++g_downs;
     return true;
 }
 
 bool compose(ID3D12GraphicsCommandList *cl, unsigned parity,
-             ID3D12Resource *base, ID3D12Resource *low_proxy,
-             ID3D12Resource *low_neural, ID3D12Resource *out,
+             ID3D12Resource *base, ID3D12Resource *mask_base,
+             ID3D12Resource *low_proxy, ID3D12Resource *low_neural, ID3D12Resource *out,
+             unsigned low_width, unsigned low_height,
+             ID3D12Resource *depth, bool limit_residual,
+             const MgpuPrismMotion &motion,
              mark_callback mark, void *mark_context)
 {
+    // Same-frame de-speckle and motion-aligned residual clamping are complementary.
+    // History never supplies colour; invalid motion or a disocclusion is identity.
+    g_limit_residual = false;
+    (void)limit_residual;
     if (!ab_enabled() || cl == nullptr || !valid_texture(base, g_w, g_h) ||
-        !valid_texture(out, g_w, g_h) || low_proxy == nullptr || low_neural == nullptr ||
-        base == out || low_proxy == low_neural)
+        !valid_texture(mask_base, g_w, g_h) || !valid_texture(out, g_w, g_h) ||
+        !valid_texture(low_proxy, low_width, low_height) ||
+        !valid_texture(low_neural, low_width, low_height) ||
+        base == out || low_proxy == low_neural ||
+        low_width > g_w || low_height > g_h)
         return false;
-    const D3D12_RESOURCE_DESC p = low_proxy->GetDesc();
-    const D3D12_RESOURCE_DESC n = low_neural->GetDesc();
-    if (p.Width != n.Width || p.Height != n.Height || p.Width >= g_w || p.Height >= g_h)
-        return false;
+    g_depth_valid = false;
+    if (valid_texture(depth, g_w, g_h))
+    {
+        const D3D12_RESOURCE_DESC dd = depth->GetDesc();
+        g_depth_valid = (dd.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0 &&
+            (dd.Format == DXGI_FORMAT_R32_FLOAT || dd.Format == DXGI_FORMAT_D32_FLOAT ||
+             dd.Format == DXGI_FORMAT_R32_TYPELESS);
+    }
+    g_motion = motion;
+    g_motion_valid = false;
+    g_motion_fmt = DXGI_FORMAT_UNKNOWN;
+    if (motion.resource != nullptr && motion.width != 0u && motion.height != 0u &&
+        std::isfinite(motion.scale_x) && std::isfinite(motion.scale_y))
+    {
+        const D3D12_RESOURCE_DESC md = motion.resource->GetDesc();
+        const unsigned long long motion_right = (unsigned long long)motion.base_x + motion.width;
+        const unsigned long long motion_bottom = (unsigned long long)motion.base_y + motion.height;
+        g_motion_fmt = motion_view_format(md.Format);
+        g_motion_valid = md.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            (md.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0 &&
+            md.Width >= motion_right && md.Height >= motion_bottom &&
+            g_motion_fmt != DXGI_FORMAT_UNKNOWN;
+    }
 
     ID3D12DescriptorHeap *heaps[1] = {g_heap};
     cl->SetDescriptorHeaps(1, heaps);
     cl->SetComputeRootSignature(g_rs);
-    constants(cl, low_proxy);
+    constants(cl, low_width, low_height);
     write_srv(cpu_slot(parity, FIT_BASE), low_proxy, g_fmt);
     write_srv(cpu_slot(parity, FIT_BASE + 1), low_neural, g_fmt);
-    write_srv(cpu_slot(parity, FIT_BASE + 2), low_proxy, g_fmt); // t2 unused by GuidedFit
-    write_uav(cpu_slot(parity, FIT_BASE + 3), g_a, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    write_uav(cpu_slot(parity, FIT_BASE + 4), g_b, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    write_srv(cpu_slot(parity, FIT_BASE + 2), low_proxy, g_fmt);   // t2 unused by GuidedFit
+    write_srv(cpu_slot(parity, FIT_BASE + 3), low_proxy, g_fmt);   // t3 unused by GuidedFit
+    write_srv(cpu_slot(parity, FIT_BASE + 4), low_neural, g_fmt);  // t4 unused by GuidedFit
+    write_srv(cpu_slot(parity, FIT_BASE + 5), g_history, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    write_srv(cpu_slot(parity, FIT_BASE + 6), g_motion_valid ? motion.resource : low_proxy,
+              g_motion_valid ? g_motion_fmt : g_fmt);
+    write_srv(cpu_slot(parity, FIT_BASE + 7), mask_base, g_fmt); // t7 unused by GuidedFit
+    write_uav(cpu_slot(parity, FIT_BASE + 8), g_a, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    write_uav(cpu_slot(parity, FIT_BASE + 9), g_b, DXGI_FORMAT_R16G16B16A16_FLOAT);
     cl->SetPipelineState(g_fit);
     cl->SetComputeRootDescriptorTable(1, gpu_slot(parity, FIT_BASE));
-    cl->Dispatch(((unsigned)p.Width + 15u) / 16u, (p.Height + 15u) / 16u, 1u);
+    cl->Dispatch((low_width + 15u) / 16u, (low_height + 15u) / 16u, 1u);
     if (mark != nullptr) mark(mark_context, 20u); // PX1 GuidedFit ends
 
     D3D12_RESOURCE_BARRIER barriers[2] = {};
@@ -632,8 +934,14 @@ bool compose(ID3D12GraphicsCommandList *cl, unsigned parity,
     write_srv(cpu_slot(parity, COMPOSE_BASE), base, g_fmt);
     write_srv(cpu_slot(parity, COMPOSE_BASE + 1), g_a, DXGI_FORMAT_R16G16B16A16_FLOAT);
     write_srv(cpu_slot(parity, COMPOSE_BASE + 2), g_b, DXGI_FORMAT_R16G16B16A16_FLOAT);
-    write_uav(cpu_slot(parity, COMPOSE_BASE + 3), out, g_fmt); // root-table u0
-    write_uav(cpu_slot(parity, COMPOSE_BASE + 4), out, g_fmt); // u1 unused by Compose
+    write_srv(cpu_slot(parity, COMPOSE_BASE + 3), low_proxy, g_fmt);
+    write_srv(cpu_slot(parity, COMPOSE_BASE + 4), low_neural, g_fmt);
+    write_srv(cpu_slot(parity, COMPOSE_BASE + 5), g_history, DXGI_FORMAT_R16G16B16A16_FLOAT);
+    write_srv(cpu_slot(parity, COMPOSE_BASE + 6), g_motion_valid ? motion.resource : base,
+              g_motion_valid ? g_motion_fmt : g_fmt);
+    write_srv(cpu_slot(parity, COMPOSE_BASE + 7), mask_base, g_fmt);
+    write_uav(cpu_slot(parity, COMPOSE_BASE + 8), out, g_fmt); // root-table u0
+    write_uav(cpu_slot(parity, COMPOSE_BASE + 9), out, g_fmt); // u1 unused by Compose
     cl->SetPipelineState(g_compose);
     cl->SetComputeRootDescriptorTable(1, gpu_slot(parity, COMPOSE_BASE));
     cl->Dispatch((g_w + 15u) / 16u, (g_h + 15u) / 16u, 1u);
@@ -648,6 +956,67 @@ bool compose(ID3D12GraphicsCommandList *cl, unsigned parity,
     ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
     ub.UAV.pResource = out;
     cl->ResourceBarrier(1, &ub);
+
+    const bool had_history = g_history_valid && limit_residual;
+    if (!limit_residual)
+    {
+        const bool had_local_history = g_history_valid;
+        barrier_to(cl, g_history, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        constants(cl, low_width, low_height);
+        write_srv(cpu_slot(parity, CAPTURE_BASE), low_proxy, g_fmt);
+        write_srv(cpu_slot(parity, CAPTURE_BASE + 1), g_depth_valid ? depth : low_proxy,
+                  g_depth_valid ? DXGI_FORMAT_R32_FLOAT : g_fmt);
+        write_srv(cpu_slot(parity, CAPTURE_BASE + 2), low_proxy, g_fmt);
+        write_srv(cpu_slot(parity, CAPTURE_BASE + 3), g_a, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        write_srv(cpu_slot(parity, CAPTURE_BASE + 4), low_proxy, g_fmt);
+        write_srv(cpu_slot(parity, CAPTURE_BASE + 5), low_proxy, g_fmt);
+        write_srv(cpu_slot(parity, CAPTURE_BASE + 6), low_proxy, g_fmt);
+        write_srv(cpu_slot(parity, CAPTURE_BASE + 7), mask_base, g_fmt);
+        write_uav(cpu_slot(parity, CAPTURE_BASE + 8), g_history, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        write_uav(cpu_slot(parity, CAPTURE_BASE + 9), g_history, DXGI_FORMAT_R16G16B16A16_FLOAT);
+        cl->SetPipelineState(g_capture);
+        cl->SetComputeRootDescriptorTable(1, gpu_slot(parity, CAPTURE_BASE));
+        cl->Dispatch((low_width + 15u) / 16u, (low_height + 15u) / 16u, 1u);
+        barrier_to(cl, g_history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_history_valid = true;
+        if (had_local_history && ++g_limit_frames == 1ull)
+        {
+            char line[440];
+            if (g_motion_valid)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][PX1][P%s] motion-adaptive SAME-FRAME de-speckle active: valid=%ux%u at %u,%u "
+                         "scale=%.6f/%.6f; margin=0.10 static -> 0.04 moving log2; temporal residual history disabled.",
+                         kPassId, g_motion.width, g_motion.height, g_motion.base_x, g_motion.base_y,
+                         (double)g_motion.scale_x, (double)g_motion.scale_y);
+            }
+            else
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][PX1][P%s] same-frame de-speckle active with static margin=0.10 log2; "
+                         "no valid current-frame motion; temporal residual history disabled.",
+                         kPassId);
+            }
+            mgpu::diag::info(line);
+        }
+    }
+    else
+    {
+        barrier_to(cl, g_a, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                   D3D12_RESOURCE_STATE_COPY_SOURCE);
+        barrier_to(cl, g_history, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                   D3D12_RESOURCE_STATE_COPY_DEST);
+        cl->CopyResource(g_history, g_a);
+        barrier_to(cl, g_a, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        barrier_to(cl, g_history, D3D12_RESOURCE_STATE_COPY_DEST,
+                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        g_history_valid = true;
+        if (had_history && ++g_limit_frames == 1ull)
+            mgpu::diag::info("[MGPU][PX1] X1 residual jump limiter active: cap=+/-0.12 log2, scene-cut threshold=0.75; 300% intensity unchanged.");
+    }
     if (mark != nullptr) mark(mark_context, 21u); // PX1 Compose ends
 
     ++g_applies;
@@ -655,8 +1024,8 @@ bool compose(ID3D12GraphicsCommandList *cl, unsigned parity,
     {
         char line[240];
         snprintf(line, sizeof line,
-                 "[MGPU][PX1] current-frame GuidedFit+Compose applied=%llu low=%ux%u native=%ux%u.",
-                 g_applies, (unsigned)p.Width, p.Height, g_w, g_h);
+                 "[MGPU][PX1][P%s] current-frame GuidedFit+Compose applied=%llu low=%ux%u native=%ux%u.",
+                 kPassId, g_applies, low_width, low_height, g_w, g_h);
         mgpu::diag::info(line);
     }
     return true;
@@ -684,6 +1053,11 @@ void set_guard(float value)
 float guard()
 {
     return g_guard.load(std::memory_order_relaxed);
+}
+
+void reset_history()
+{
+    g_history_valid = false;
 }
 
 void release()

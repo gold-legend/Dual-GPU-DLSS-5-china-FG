@@ -8,6 +8,7 @@
 #pragma once
 
 #include <windows.h>
+#include <d3d12.h>   // R341: ID3D12Resource / D3D12_RESOURCE_STATES / ID3D12Fence in the present hooks below
 
 #include "adapter.hpp"
 
@@ -174,9 +175,24 @@ namespace mgpu::gpu1
     // silent - the caller stops presenting after the first.
     bool present_frame(float r, float g, float b);
 
+    // R341 (FrameGen=4). The pacing thread's three hooks into the present path; nothing on the
+    // shipped path changes when they are unused.
+    //   present_override: for the CALLING thread, the source present_frame shows instead of
+    //   nr_final (nullptr = back to normal). Thread-local.
+    //   present_fence_addref: the present chain's fence, AddRef'd (nullptr = no chain).
+    //   present_last_fence_value: the fence value the calling thread's last present_frame
+    //   signalled (0 = none / failed before the signal). Thread-local.
+    void present_override(ID3D12Resource *src, D3D12_RESOURCE_STATES rest);
+    ID3D12Fence *present_fence_addref();
+    unsigned long long present_last_fence_value();
+
     // Any thread (takes this file's lock). True when the present chain
     // exists.
     bool has_present_chain();
+    // The present chain's native pointer, or null (identity comparisons only -
+    // e.g. the POV panel recognising the DComp composition chain, which has no
+    // visible window but is what reaches the display on a D3D11 title).
+    void *present_chain_native();
 
     // ---- P1.0: the NGX probe ----
     //
@@ -423,6 +439,7 @@ int mvec_tap_live();   // R278b: tap mode the first-launch learning turned on (0
 void set_mvec_neighbours(int cur, int next_same, int next_class);   // R278f: from probe, via dllmain
 int mvec_candidate_request();   // R278f: the learning's live switch (-1 = none)
 bool stream_producing();   // R278f-r: the stream has sealed a frame (lock-free)
+bool stream_armed();       // read by the DX11 producer to gate a chain-rebuild resize (armed slot cannot resize)
 bool ngx_probe_at_start();                  // NgxProbeAtStart=1 (default 0: deferred)
 void note_game_d3d12();                     // R282: dllmain, the LUID-proved D3D12 game chain
 bool ngx_probe_scene_hold_decide(char *why, size_t n);   // R282: once; true = hold the probe for the game's scene
@@ -481,15 +498,20 @@ struct ui_state
     // ui_read() fails the build if the two ever disagree, because this header
     // cannot see the constant and a silently smaller array would truncate the
     // copy rather than error.
+    // R350: max_passes is what THIS session built (2 unless Passes=3 / 4 in the
+    // ini); the array is the capacity.
     unsigned passes = 1, max_passes = 2;
-    // [OURS] Neural evaluation cadence: 1 or fixed 15 (two per three frames; no x1 fallback).
+    // [OURS] Neural evaluation cadence, independent of the pass count: 1, 2 or 4.
     unsigned nr_cadence = 1;
-    float intensity[2] = {};
+    float intensity[4] = {};
     // P7.9: the guide's tuning parameters. tuning_on false = none of them are
     // set, which is what every published measurement ran under.
     bool  tuning_on = false, auto_mask = false;
     float tone_strength = 1.0f, structure_strength = 1.0f, skin_strength = 1.0f,
           style = 0.0f;
+    // Independent NVIDIA automatic face/skin-region structure strength (0..1).
+    // This is NOT the separate character-guard composition control.
+    float face_mask_strength = 0.30f;
     // P8.0: 0 = off (no DLSSNR.MVec bound - the control arm and what every
     // published measurement ran under), 1 = a synthetic constant field.
     int   mvec_mode = 0;
@@ -511,7 +533,6 @@ struct ui_state
     double fps_produced = 0.0;   // the GAME's frame rate, from the seal counter
     double fps_consumed = 0.0;   // transport consumption, INCLUDING held cadence frames
     double fps_evaluated = 0.0;  // completed neural-work frames only; excludes held frames
-    double fps_overrun = 0.0;    // producer frames that overwrote an unread ring slot / second
     // T1.17 (Dom; PanelStats=1 only, zero otherwise): derived figures for the panel.
     double bus_requested_mib_s = 0.0; // slot bytes x game frames / s (payload-equivalent, not a PCIe counter)
     double bus_consumed_mib_s = 0.0;  // slot bytes x GPU 1 consumed fps
@@ -532,25 +553,15 @@ struct ui_state
     unsigned nrs_work_w = 0, nrs_work_h = 0, nrs_native_w = 0, nrs_native_h = 0;
     float  nrs_gain = 1.0f, nrs_sharpness = 0.0f, nrs_color = 1.0f;
     unsigned nrs_mode = 1;
+    // R370: per-pass resolution (the panel's P1..P3 sliders). pscale[i] == 0 = that
+    // pass follows the global nrs_scale; pw/ph are that pass's work extents.
+    float    nrs_pscale[4] = {};
+    unsigned nrs_pw[4] = {}, nrs_ph[4] = {};
     double nrs_probe_d = -1.0;                            // last mean|composite-native|
     unsigned long long nrs_rebuilds = 0;
     double since_rebuild_ms = -1.0;
     unsigned present_n = 0;
     double present_fps = 0.0, present_p50_ms = 0.0, present_p99_ms = 0.0, present_low1_ms = 0.0;
-
-    // Optional XeSS-FG output. present_fps remains the application's Present cadence;
-    // xess_output_fps is counted from Intel's own framesPresented status. They are not interchangeable.
-    bool xess_requested = false, xess_active = false, xess_generating = false;
-    unsigned xess_last_frames_presented = 0;
-    int xess_frame_result = 0, xess_last_error = 0;
-    double xess_output_fps = 0.0;
-    unsigned long long xess_application_presents = 0, xess_generated_frames = 0;
-    float temporal_strength = 0.70f;
-    bool temporal_motion_adaptive = true;
-    int middle_frame = 1; // 0 previous, 1 latest + FG, 2 latest native.
-    // Extra display queue depth; -1 means the requested limit was not applied.
-    int present_queue = 0, present_queue_applied = -1;
-    bool present_queue_waitable = false;
 
     // GPU 1's own timestamps on GPU 1's own queue. gpu1_eval_ms SPANS EVERY
     // PASS and, when SR is up, it also contains the reduce and the upscale -
@@ -633,6 +644,15 @@ struct ui_state
     // restart line. n16_ini_ok false until the neural stage has read it.
     bool     n16_ini_ok = false, n16_ini_on = false;
     float    n16_ini_power = 2.2f;
+    // R352: what THIS session is running, for the panel's "Running now" readout. nr_preset_pass is
+    // the hint the arm WROTE per pass (0 default / 1 big / 2 small; what the DLL built is in its own
+    // log). nr_dll_version is the snippet's file version ("-" until the arm read it). stage_on and
+    // fg_on are the modules' own relaxed loads (StageCopy UP, FrameGen=4 on).
+    int      nr_preset_pass[4] = {};
+    bool     nr_preset_any = false;
+    char     nr_dll_version[24] = "-";
+    bool     stage_on = false, fg_on = false;
+    unsigned nrs_pass_mask = 0u;   // R367: on N01950's path, which passes run NRScale (bit per pass)
 };
 void ui_read(ui_state &out);
 
@@ -650,11 +670,13 @@ void ui_nrs_set(int which, float v);
 // only a count change - nothing is created or destroyed, and it takes effect on
 // the next consumed frame. Clamped to 1..max_passes.
 void ui_set_passes(unsigned n);
-// [OURS] Run every frame, or three times per four consumed frames (13), with
-// no adaptive fallback to x1. Independent of Passes; retired 2/4/15 are not accepted.
+// [OURS] Run the network every 1, 2 or 4 consumed frames, independent of Passes.
 void ui_set_cadence(unsigned n);
+void ui_set_network(unsigned pass, int hint);   // R363: rebuild that pass live on the given network (0 default / 1 big / 2 small)
+void ui_set_resolution(unsigned pass, bool residual);   // R364: Residual (our residual on that pass) / Native (a full pass), live
+void ui_set_scale(unsigned pass, float scale);   // R370: per-pass NRScale (0.05..1.0), live on N01950's path
 
-// pass_1based == 0 sets every pass; otherwise that one. Clamped 0.0..2.0.
+// pass_1based == 0 sets every pass; otherwise that one. Clamped 0.0..3.0.
 void ui_set_intensity(unsigned pass_1based, float v);
 // R300n: PanelPersist=1 only - writes the value to mgpu.ini once (the panel calls it when the
 // slider is released), with no lock held. No-op without PanelPersist=1.
@@ -681,6 +703,10 @@ void ui_set_tuning(bool on);
 
 // which: 0 tone, 1 structure, 2 skin, 3 style, 4 auto-mask (0.0/1.0).
 void ui_set_tuning_value(int which, float v);
+
+// NVIDIA automatic face/skin-region control, independent of character guard.
+// Live on every pass and persisted as FaceMaskStrength, never SkinStrength.
+void ui_set_face_mask_strength(float v);
 
 // P8.0. The motion vector field handed to DLSS-NR.
 //
@@ -711,6 +737,10 @@ void ui_set_mvec_value(int which, float v);
 // Turn the neural stage off without tearing it down - the handles stay alive so
 // it can come back without a 400 ms CreateFeature stall.
 void ui_set_neural(bool on);
+
+// The present worker must bypass FG's sole-presenter handoff while NR is off.
+// Otherwise FG waits for neural submissions that intentionally no longer exist.
+bool stream_neural_enabled();
 
 // P7.4. The present mode, live: 0 neural output, 1 the frame handed TO the
 // model, 2 SPLIT - both halves of the SAME frame side by side, input left,
@@ -801,6 +831,9 @@ void ui_ini_read_crop(unsigned &mode, bool &crop_auto);
 // R219-2. A decimal key, written with two decimals by the same line-anchored
 // writer as ui_ini_write.
 bool ui_ini_write_float(const char *key, float value);
+// R370: the float reader for the panel's per-pass resolution sliders (NRScale1/2/3).
+// Absent or junk = dflt. Reads the file itself, like the other ui_ini readers.
+float ui_ini_read_float(const char *key, float dflt);
 // T1.19 (Dom, T1.17): a word value, same writer. Used only by PanelPersist=1.
 bool ui_ini_write_word(const char *key, const char *value);
 void ui_ini_read_word(const char *key, char *out, size_t n);   // R311: a short word value from the file, empty when absent
@@ -954,6 +987,9 @@ void stream_note_real_vectors();
 // consumer reads a slot whose copy has not landed and the SEAL checker says so
 // on the first frame - bad_magic or a contract mismatch, loudly, not silently.
 void stream_on_present(void *cmd_queue);
+// SignalAt=2: signal the just-submitted frame without taking the stream lock.
+void stream_on_finish_present(void *cmd_queue);
+void stream_signal_after_submit(void *cmd_queue);
 
 void stream_on_finish_effects(void *cmd_list, void *cmd_queue,
                               unsigned long long rtv_handle,

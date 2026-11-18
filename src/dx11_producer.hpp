@@ -60,11 +60,17 @@ namespace mgpu::dx11producer
     // first (dllmain mirrors the D3D12 teardown), then this.
     void shutdown();
 
-    // init_swapchain again on a D3D11 chain after init: a resize. The armed
-    // stream was sized from the first chain; this build stops the producer
-    // for the session and says so, rather than copy a resized surface into
-    // a slot sized for the old one.
-    void on_chain_rebuilt(unsigned width, unsigned height, unsigned dxgi_format);
+    // init_swapchain again on a D3D11 chain after init: a resize. Before the
+    // arm, the shared colour slot is remade at the new size and the producer
+    // keeps feeding (the arm then sizes the ring slot from the new texture).
+    // After the arm the slot cannot resize, so the producer stops for the
+    // session and says so, rather than copy a resized surface into a slot
+    // sized for the old one.
+    void on_chain_rebuilt(void *swapchain, unsigned width, unsigned height, unsigned dxgi_format);
+
+    // Restore the NW.js-only ResizeBuffers wrapper only at final destruction.
+    // A resize destruction happens inside the original call that needs it.
+    void on_chain_destroyed(void *swapchain, bool resize);
 
     // destroy_device: is this native the D3D11 device the producer holds?
     bool is_game_device(void *device);

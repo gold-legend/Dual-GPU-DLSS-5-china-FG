@@ -591,15 +591,175 @@ void barrier(ID3D12Resource *r, D3D12_RESOURCE_STATES a, D3D12_RESOURCE_STATES b
 }
 }   // namespace
 
+// NW.js borderless activation sometimes asks for a height one row smaller.
+// Neet And Angel's binary/log demonstrates the right repair: suppress that
+// request at IDXGISwapChain::ResizeBuffers itself, not in a window overlay.
+// Patch only this proxy object: DXGISwapChain has one shared vtable for all
+// D3D10/11/12 chains, so writing its slot 13 in place would hook our D3D12
+// output too. A private copy of IDXGISwapChain4's 42 COM methods avoids that.
+namespace
+{
+using resize_buffers_fn = HRESULT (STDMETHODCALLTYPE *)(IDXGISwapChain *, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+constexpr size_t resize_buffers_slot = 13;
+constexpr size_t dxgi_swapchain4_slots = 42;
+SRWLOCK g_resize_lock = SRWLOCK_INIT;
+IDXGISwapChain *g_resize_chain = nullptr;       // not owned; never used after non-resize destruction
+void **g_resize_slot = nullptr;
+void *g_resize_shared_vtable = nullptr;
+void *g_resize_private_vtable[dxgi_swapchain4_slots] = {};
+resize_buffers_fn g_resize_original = nullptr;
+unsigned long long g_resize_suppressed = 0;
+bool g_resize_pending = false;
+unsigned g_resize_request_h = 0;
+
+bool nwjs_process()
+{
+    static const bool result = [] {
+        wchar_t path[MAX_PATH] = {};
+        if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return false;
+        const wchar_t *name = wcsrchr(path, L'\\');
+        return name != nullptr && _wcsicmp(name + 1, L"nw.exe") == 0;
+    }();
+    return result;
+}
+
+HRESULT STDMETHODCALLTYPE nwjs_resize_buffers(IDXGISwapChain *chain, UINT count, UINT width, UINT height,
+                                               DXGI_FORMAT format, UINT flags)
+{
+    AcquireSRWLockShared(&g_resize_lock);
+    resize_buffers_fn original = g_resize_original;
+    if (chain != g_resize_chain || original == nullptr)
+    {
+        ReleaseSRWLockShared(&g_resize_lock);
+        // If this is somehow still called after removal, use the saved ReShade
+        // entry point, never chain->ResizeBuffers (that would recurse here).
+        return original != nullptr ? original(chain, count, width, height, format, flags) : E_FAIL;
+    }
+    DXGI_SWAP_CHAIN_DESC desc{};
+    const HRESULT get_hr = chain->GetDesc(&desc);
+    if (FAILED(get_hr))
+    {
+        g_resize_pending = false;
+        ReleaseSRWLockShared(&g_resize_lock);
+        return original(chain, count, width, height, format, flags);
+    }
+    const UINT actual_count = count == 0 ? desc.BufferCount : count;
+    const DXGI_FORMAT actual_format = format == DXGI_FORMAT_UNKNOWN ? desc.BufferDesc.Format : format;
+    if (width == desc.BufferDesc.Width && desc.BufferDesc.Width != 0 && desc.BufferDesc.Height != 0 &&
+        (height + 1 == desc.BufferDesc.Height || desc.BufferDesc.Height + 1 == height) &&
+        actual_count == desc.BufferCount && actual_format == desc.BufferDesc.Format)
+    {
+        g_resize_pending = true;
+        g_resize_request_h = height;
+        const unsigned long long n = ++g_resize_suppressed;
+        ReleaseSRWLockShared(&g_resize_lock);
+        if (n <= 16 || n % 100 == 0)
+        {
+            char l[440];
+            snprintf(l, sizeof l,
+                     "[MGPU][DX11P-RESIZE] suppressed one-row oscillation %ux%u -> %ux%u; preserved %ux%u fmt=%u "
+                     "count=%u. DXGI resize suppressed; ReShade may still rebuild before this original-call hook (count=%llu).",
+                     desc.BufferDesc.Width, desc.BufferDesc.Height, width, height,
+                     desc.BufferDesc.Width, desc.BufferDesc.Height, (unsigned)desc.BufferDesc.Format,
+                     desc.BufferCount, n);
+            mgpu::diag::info(l);
+        }
+        return S_OK;
+    }
+    // Any genuine request invalidates an unused suppression marker before the
+    // original call can emit init_swapchain(resize=true).
+    g_resize_pending = false;
+    ReleaseSRWLockShared(&g_resize_lock);
+    const HRESULT hr = original(chain, count, width, height, format, flags);
+    if (SUCCEEDED(hr))
+    {
+        AcquireSRWLockExclusive(&g_resize_lock);
+        DXGI_SWAP_CHAIN_DESC refreshed{};
+        if (chain == g_resize_chain && SUCCEEDED(chain->GetDesc(&refreshed)))
+        {
+            char l[240];
+            snprintf(l, sizeof l, "[MGPU][DX11P-RESIZE] genuine resize passed through: %ux%u fmt=%u count=%u.",
+                     refreshed.BufferDesc.Width, refreshed.BufferDesc.Height,
+                     (unsigned)refreshed.BufferDesc.Format, refreshed.BufferCount);
+            mgpu::diag::info(l);
+        }
+        ReleaseSRWLockExclusive(&g_resize_lock);
+    }
+    return hr;
+}
+
+void install_nwjs_resize_guard(void *swapchain)
+{
+    if (!nwjs_process() || swapchain == nullptr) return;
+    mgpu::diag::info_direct("[MGPU][NWJS-STAGE] resize guard: GetDesc enter");
+    auto *chain = reinterpret_cast<IDXGISwapChain *>(swapchain);
+    DXGI_SWAP_CHAIN_DESC desc{};
+    if (FAILED(chain->GetDesc(&desc)))
+    {
+        mgpu::diag::warn_direct("[MGPU][DX11P-RESIZE] guard NOT installed: GetDesc failed on the game chain.");
+        return;
+    }
+    mgpu::diag::info_direct("[MGPU][NWJS-STAGE] resize guard: GetDesc returned; read private vtable");
+    AcquireSRWLockExclusive(&g_resize_lock);
+    g_resize_slot = *reinterpret_cast<void ***>(chain);
+    g_resize_shared_vtable = *g_resize_slot;
+    memcpy(g_resize_private_vtable, g_resize_shared_vtable, sizeof g_resize_private_vtable);
+    g_resize_original = reinterpret_cast<resize_buffers_fn>(g_resize_private_vtable[resize_buffers_slot]);
+    if (g_resize_original == nullptr || g_resize_original == &nwjs_resize_buffers)
+    {
+        g_resize_original = nullptr;
+        ReleaseSRWLockExclusive(&g_resize_lock);
+        mgpu::diag::warn_direct("[MGPU][DX11P-RESIZE] guard NOT installed: invalid ResizeBuffers entry at COM slot 13.");
+        return;
+    }
+    mgpu::diag::info_direct("[MGPU][NWJS-STAGE] resize guard: original slot 13 valid; install object-local table");
+    g_resize_private_vtable[resize_buffers_slot] = reinterpret_cast<void *>(&nwjs_resize_buffers);
+    g_resize_chain = chain;
+    g_resize_pending = false;
+    InterlockedExchangePointer(g_resize_slot, g_resize_private_vtable);
+    ReleaseSRWLockExclusive(&g_resize_lock);
+    mgpu::diag::info_direct("[MGPU][NWJS-STAGE] resize guard: private vtable installed");
+    char l[380];
+    snprintf(l, sizeof l,
+             "[MGPU][DX11P-RESIZE] original-call one-row guard ACTIVE on the nw.exe D3D11 proxy %p: %ux%u fmt=%u "
+             "count=%u. Private vtable: the bridge's D3D12 chain is NOT patched. Genuine resize/format/count changes pass.",
+             (void *)chain, desc.BufferDesc.Width, desc.BufferDesc.Height,
+             (unsigned)desc.BufferDesc.Format, desc.BufferCount);
+    mgpu::diag::info(l);
+}
+
+bool consume_nwjs_resize_event(void *swapchain, unsigned width, unsigned height, unsigned format)
+{
+    bool consumed = false;
+    AcquireSRWLockExclusive(&g_resize_lock);
+    if (swapchain == g_resize_chain && g_resize_pending)
+    {
+        g_resize_pending = false;
+        consumed = width == g_w && height == g_resize_request_h && format == g_fmt;
+        if (consumed)
+        {
+            char l[380];
+            snprintf(l, sizeof l,
+                     "[MGPU][DX11P-RESIZE] ignored ReShade's resize notification %ux%u fmt=%u: the underlying DXGI "
+                     "chain remains %ux%u; producer continues with the original frame size.",
+                     width, height, format, g_w, g_h);
+            mgpu::diag::info(l);
+        }
+    }
+    ReleaseSRWLockExclusive(&g_resize_lock);
+    return consumed;
+}
+}   // namespace
+
 void init(void *device, void *swapchain, unsigned width, unsigned height, unsigned dxgi_format)
 {
     bool expect = false;
     if (!g_inited.compare_exchange_strong(expect, true, std::memory_order_acq_rel)) return;
-    (void)swapchain;
     if (read_key() != 1) return;
     if (device == nullptr || width == 0 || height == 0) { fail("init: no D3D11 device or an empty chain", E_INVALIDARG); return; }
     g_dev11 = reinterpret_cast<ID3D11Device *>(device);
     g_w = width; g_h = height; g_fmt = dxgi_format;
+    install_nwjs_resize_guard(swapchain);
     mgpu::diag::info("[MGPU][DX11P] DX11=1: building the D3D11 producer - a D3D12 device of ours on the "
                      "game's adapter, fed from the game's D3D11 context through shared textures and a "
                      "shared fence. Experimental. Real vectors and own Reflex are not on this path yet.");
@@ -611,19 +771,102 @@ bool on() { return g_mode.load(std::memory_order_acquire) == 1; }
 
 bool is_game_device(void *device) { return device != nullptr && g_dev11 != nullptr && device == (void *)g_dev11; }
 
-void on_chain_rebuilt(unsigned width, unsigned height, unsigned dxgi_format)
+void on_chain_destroyed(void *swapchain, bool resize)
+{
+    if (resize) return; // The original ResizeBuffers call still needs the hook.
+    AcquireSRWLockExclusive(&g_resize_lock);
+    if (swapchain == g_resize_chain && g_resize_slot != nullptr)
+    {
+        if (*g_resize_slot == g_resize_private_vtable)
+            InterlockedExchangePointer(g_resize_slot, g_resize_shared_vtable);
+        else
+            mgpu::diag::warn("[MGPU][DX11P-RESIZE] another hook replaced the NW.js chain's vtable; leaving it intact.");
+        g_resize_chain = nullptr;
+        g_resize_slot = nullptr;
+        g_resize_pending = false;
+        mgpu::diag::info("[MGPU][DX11P-RESIZE] original vtable restored at non-resize swapchain destruction.");
+    }
+    ReleaseSRWLockExclusive(&g_resize_lock);
+}
+
+void on_chain_rebuilt(void *swapchain, unsigned width, unsigned height, unsigned dxgi_format)
 {
     if (!on()) return;
+    if (consume_nwjs_resize_event(swapchain, width, height, dxgi_format)) return;
     if (width == g_w && height == g_h && dxgi_format == g_fmt) return;
-    char l[300];
+    // Chromium borderless activation can oscillate by one physical row without
+    // changing the user's resolution. Keep the original texture and armed ring.
+    if (GetModuleHandleW(L"nw.dll") != nullptr && width == g_w && dxgi_format == g_fmt &&
+        (height + 1 == g_h || g_h + 1 == height))
+    {
+        static unsigned one_row_ignored = 0;
+        if (++one_row_ignored <= 8)
+        {
+            char l[280];
+            snprintf(l, sizeof l,
+                     "[MGPU][NWJS-CHAIN] ignored one-row activation resize %ux%u -> %ux%u; "
+                     "the producer and armed stream continue at the original size.",
+                     g_w, g_h, width, height);
+            mgpu::diag::info(l);
+        }
+        return;
+    }
+    if (!g_ready || g_dev12 == nullptr) return;   // nothing built; init sizes from this chain
+
+    // Armed: the ring slot was sized from the old colour texture at arm time
+    // and the stream's size guard would reject the new frames, so keep the
+    // Build 1 behaviour - stop feeding and say relaunch re-arms at the new size.
+    if (mgpu::gpu1::stream_armed())
+    {
+        char l[300];
+        snprintf(l, sizeof l,
+                 "[MGPU][DX11P] the game chain was rebuilt %ux%u fmt=%u (was %ux%u fmt=%u) AFTER the arm: "
+                 "the slot was sized from the first chain, so the DX11 producer stops feeding it for this "
+                 "session. Relaunch to re-arm at the new size.",
+                 width, height, dxgi_format, g_w, g_h, g_fmt);
+        mgpu::diag::warn(l);
+        g_failed = true;
+        return;
+    }
+
+    // Not armed yet - the common startup case (a windowed first chain, then the
+    // game resizes to fullscreen before AutoArm fires). Remake the shared
+    // colour slot at the new size: the arm sizes the ring slot from whatever
+    // texture is live at that moment, so the stream arms at the final size and
+    // the producer never has to stop. Depth and vectors already follow their
+    // taps (ensure_depth/ensure_mvec remake on a size change).
+    if (g_queue != nullptr && g_done != nullptr && g_done_value != 0ull && g_done_ev != nullptr)
+    {
+        // Bounded: the old colour texture may still be referenced by a list in
+        // flight; it must not be released while the GPU can still read it.
+        if (g_done->GetCompletedValue() < g_done_value)
+        {
+            g_done->SetEventOnCompletion(g_done_value, g_done_ev);
+            WaitForSingleObject(g_done_ev, 2000);
+        }
+    }
+    const unsigned ow = g_w, oh = g_h, ofmt = g_fmt;
+    g_w = width; g_h = height; g_fmt = dxgi_format;
+    rel(g_color12); rel(g_color11);
+    if (g_color_h != nullptr) { CloseHandle(g_color_h); g_color_h = nullptr; }
+    if (!make_shared_tex(g_w, g_h, g_fmt, &g_color11, &g_color_h, &g_color12, "colour", true, nullptr))
+    {
+        // make_shared_tex(fatal) already logged the step and set g_failed.
+        char l[280];
+        snprintf(l, sizeof l,
+                 "[MGPU][DX11P] the game chain was rebuilt %ux%u fmt=%u (was %ux%u fmt=%u) and the colour "
+                 "slot could not be remade: the producer stops feeding it for this session.",
+                 width, height, dxgi_format, ow, oh, ofmt);
+        mgpu::diag::error(l);
+        return;
+    }
+    char l[340];
     snprintf(l, sizeof l,
-             "[MGPU][DX11P] the game chain was rebuilt %ux%u fmt=%u (was %ux%u fmt=%u). The stream was sized "
-             "from the first chain, so the DX11 producer stops feeding it for this session: NR holds its "
-             "last frame. Relaunch to re-arm at the new size. (Build 1 limit; the D3D12 path's own "
-             "rebuild handling is the model for the next one.)",
-             width, height, dxgi_format, g_w, g_h, g_fmt);
-    mgpu::diag::warn(l);
-    g_failed = true;
+             "[MGPU][DX11P] the game chain was rebuilt %ux%u fmt=%u (was %ux%u fmt=%u) BEFORE the arm: "
+             "the shared colour slot was remade at the new size and the producer keeps feeding. The arm "
+             "will size the ring slot from this texture.",
+             width, height, dxgi_format, ow, oh, ofmt);
+    mgpu::diag::info(l);
 }
 
 void on_mvec(void *context, void *resource)
@@ -655,8 +898,45 @@ void on_finish_effects(void *context, void *back_buffer, void *depth)
     ID3D11Texture2D *bb = reinterpret_cast<ID3D11Texture2D *>(back_buffer);
     ID3D11Texture2D *tap = reinterpret_cast<ID3D11Texture2D *>(depth);
 
+    // NW.js can finish effects for auxiliary swapchains as well as the visible
+    // game. Their frame counters look healthy, but copying those surfaces can
+    // leave the neural output showing a stale or blank auxiliary window.
+    D3D11_TEXTURE2D_DESC bd{};
+    bb->GetDesc(&bd);
+    const bool one_row = bd.Height + 1 == g_h || g_h + 1 == bd.Height;
+    if ((unsigned)bd.Format != g_fmt || bd.Width != g_w ||
+        (bd.Height != g_h && !one_row))
+    {
+        static unsigned ignored_frames = 0;
+        if (++ignored_frames <= 16 || ignored_frames % 300 == 0)
+        {
+            char l[320];
+            snprintf(l, sizeof l,
+                     "[MGPU][NWJS-FRAME] ignored auxiliary frame %ux%u fmt=%u; "
+                     "expected %ux%u fmt=%u (one-row activation tolerated).",
+                     bd.Width, bd.Height, (unsigned)bd.Format,
+                     g_w, g_h, g_fmt);
+            mgpu::diag::info(l);
+        }
+        return;
+    }
+
     // ---- D3D11: the copies and the signal, on the game's own context ----
-    ctx->CopyResource(g_color11, bb);
+    if (bd.Height == g_h)
+    {
+        ctx->CopyResource(g_color11, bb);
+    }
+    else
+    {
+        D3D11_BOX src{};
+        src.left = 0;
+        src.top = 0;
+        src.front = 0;
+        src.right = g_w;
+        src.bottom = bd.Height < g_h ? bd.Height : g_h;
+        src.back = 1;
+        ctx->CopySubresourceRegion(g_color11, 0, 0, 0, 0, bb, 0, &src);
+    }
     bool have_depth = false;
     if (tap != nullptr && ensure_depth(tap))
     {
@@ -729,6 +1009,7 @@ void on_finish_effects(void *context, void *back_buffer, void *depth)
     if (FAILED(hr)) { fail("D3D12 command list Close", hr); return; }
     ID3D12CommandList *ls[1] = { g_list };
     g_queue->ExecuteCommandLists(1, ls);
+    mgpu::gpu1::stream_signal_after_submit(g_queue);   // SignalAt=2: this frame's list is now submitted.
     ++g_done_value;
     g_queue->Signal(g_done, g_done_value);
     ++g_frames;

@@ -169,6 +169,11 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr);
 // is set to: the transport must not silently require the probe to be on.
 unsigned long long depth_source();
 
+// LUMENITE-MOTION experiment: the resource behind MGPU_MotionOutTex, resolved
+// on the game's effect runtime each frame. Zero means the optional effect is
+// absent or has not produced a binding; the normal acquisition path is kept.
+unsigned long long motion_source();
+
 // ---- R145: THE LIVE STATE OF THE DEPTH TAP'S TECHNIQUE ----
 //
 // tech_scan() already computes this, self-enables the technique when it finds
@@ -188,6 +193,20 @@ unsigned long long depth_source();
 // was taken a few frames too early and then frozen for the session. A latched
 // 0 is a false fault; only this value is safe to show a user.
 int tap_state();
+
+// ---- R334: THE TAP SELF-ENABLE CAN BE SWITCHED OFF FOR THE SESSION ----
+//
+// ReShade ships a built-in add-on, Effect Runtime Sync, that mirrors a
+// technique's state to every other runtime in the process. It is ON when
+// ReShade.ini [ADDON] SyncEffectRuntimes is absent and openxr_loader.dll or
+// openvr_api.dll is loaded (Seed of the Dead 2 ships Unreal's OpenXR plugin).
+// With two runtimes - the game's and the bridge's - our one
+// set_technique_state(tap, true) is mirrored back and forth inside ReShade
+// until the stack overflows (SoD2 runs B, D, H: identical dumps, our tech_scan
+// at the top). dllmain decides once at the first effect runtime whether the
+// sync is on and calls this with false; tech_scan then only REPORTS the tap
+// state and never enables it. Default true = the shipped behaviour.
+void set_tap_self_enable(bool allowed);
 
 // ---- P12.9 (R78): the MVec acquisition handover ----
 //

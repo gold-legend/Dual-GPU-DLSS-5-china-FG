@@ -8,6 +8,7 @@
 // the candidate table; the report lines go through mgpu::diag (the queue).
 
 #include "mvec_extract.hpp"
+#include "mvec_admission.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"   // ui_ini_read, ui_ini_write
 #include "calibrator.hpp"     // game_ngx_init_seen: a contract title never enters
@@ -289,14 +290,27 @@ namespace
         if (!g_live.load(std::memory_order_relaxed) || g_dormant_until != 0 || !is_game(device)) return;   // R280i
         if (desc.type != reshade::api::resource_type::texture_2d) return;
         const unsigned fmt = static_cast<unsigned>(desc.texture.format);
-        // R280l: admitted within the scene band (half to full of the chain, any order of
-        // creation vs. chain resize - RE4-X7); the DECISION requires the exact scene size.
-        if (!(four_ch16(fmt) || (g_sweep && (two_ch(fmt) || four_ch_sweep(fmt)))) || g_w == 0 || g_h == 0) return;   // R307/R308: the sweep takes every two- and four-channel format
+        // R280l: the decision requires the exact scene size. Before the first source
+        // is built, also retain a bounded final-resolution candidate created before
+        // the chain's startup resize; otherwise that resource can never be observed.
+        const bool sweep_candidate = g_sweep && (two_ch(fmt) || four_ch_sweep(fmt));
+        const bool startup_open = !g_sweep && g_src.load(std::memory_order_relaxed) == 0 && !g_objects_tried;
+        const bool normal_admit = admit_velocity_resource(fmt, desc.texture.width, desc.texture.height, g_w, g_h, false);
+        const bool startup_admit = startup_open && !normal_admit &&
+            admit_velocity_resource(fmt, desc.texture.width, desc.texture.height, g_w, g_h, true);
+        if (!sweep_candidate && !normal_admit && !startup_admit) return;
         // R308: mip chains and arrays are admitted in the sweep (it copies mip 0 of layer 0 only; R307
         // refused them, and every buffer it missed on Far Cry 6 had the write pattern of one).
         // Multisampled ones are not - there is no copy into a one-sample staging - and are counted.
         if (g_sweep && desc.texture.samples > 1) { g_sw_rej_msaa.fetch_add(1u, std::memory_order_relaxed); return; }
-        if (desc.texture.width * 2u < g_w || desc.texture.width > g_w + g_w / 50u || desc.texture.height * 2u < g_h || desc.texture.height > g_h + g_h / 50u) return;
+        if (g_sweep && (desc.texture.width * 2u < g_w || desc.texture.width > g_w + g_w / 50u || desc.texture.height * 2u < g_h || desc.texture.height > g_h + g_h / 50u)) return;
+        if (startup_admit)
+        {
+            char l[240];
+            snprintf(l, sizeof l, "[MGPU][R280] pre-resize candidate registered: %ux%u fmt=%u while chain is %ux%u; exact size still required.",
+                     desc.texture.width, desc.texture.height, fmt, g_w, g_h);
+            mgpu::diag::info(l);
+        }
         std::lock_guard<std::mutex> lk(g_cs);
         entry *slot = nullptr;
         for (unsigned i = 0; i < g_cap && slot == nullptr; ++i) if (g_t[i].handle == 0 || g_t[i].died != 0) slot = &g_t[i];
@@ -439,7 +453,7 @@ namespace
         {
             entry &e = g_t[i];
             if (e.handle == 0 || e.died != 0) continue;
-            if (e.w != g_w || e.h != g_h) continue;   // R280l: exact scene size decides
+            if (!exact_scene_size(e.w, e.h, g_w, g_h)) continue;   // R280l: exact scene size decides
             const unsigned long long writes = e.to_rt + e.to_uav;
             const unsigned long long dw = writes - e.win_w, ds = e.to_srv - e.win_s;
             e.win_w = writes; e.win_s = e.to_srv;
@@ -1055,7 +1069,19 @@ void init(void *game_device_native, unsigned screen_w, unsigned screen_h)
         // launch, before gameplay) - nothing to tear down, so the new size is taken at once.
         if (!g_objects_ok && g_src.load(std::memory_order_relaxed) == 0)
         {
-            if (screen_w != g_w || screen_h != g_h) { g_w = screen_w; g_h = screen_h; g_pend_w = g_pend_h = 0; }
+            if (screen_w != g_w || screen_h != g_h)
+            {
+                g_w = screen_w; g_h = screen_h; g_pend_w = g_pend_h = 0;
+                unsigned exact = 0;
+                {
+                    std::lock_guard<std::mutex> lk(g_cs);
+                    for (unsigned i = 0; i < g_cap; ++i)
+                        if (g_t[i].handle != 0 && g_t[i].died == 0 && exact_scene_size(g_t[i].w, g_t[i].h, g_w, g_h)) ++exact;
+                }
+                char l[240];
+                snprintf(l, sizeof l, "[MGPU][R280] scene size adopted %ux%u; %u registered candidate(s) now match exactly.", g_w, g_h, exact);
+                mgpu::diag::info(l);
+            }
             return;
         }
         if (screen_w == g_w && screen_h == g_h)

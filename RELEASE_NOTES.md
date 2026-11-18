@@ -1,54 +1,62 @@
-# MGPU Prism FG 1.0
+# MGPU Prism FG 2.0
 
-双卡神经渲染、固定 1.5 帧编辑场对齐，以及神经处理之后的 XeSS X2 帧生成。
+双卡 DLSS 神经渲染、三遍串行 Prism 处理，以及位于神经输出之后的 DLSS Frame Generation 2x／4x。
 
-本版本基于 MGPU 0.4，引入 Prism NR 的独立中文面板、调色和部分算法思路。它不是简单把单卡 Prism 原样搬到副卡，而是围绕跨显卡的颜色、深度、运动信息与 Present 链重新适配。
+本版基于 MGPU／Neural Coprocessor 0.6.0，保留跨卡颜色、深度与运动信息链，加入 Prism 独立中文面板、PX1 当前帧重建和每遍控制。2.0 主路径改用 NVIDIA DLSS FG，不再使用 1.0 的 AMD Optical Flow／XeSS FG。
 
-## 主要内容
+> **实验性预发布版本。** 不承诺所有游戏兼容、精确四倍、零闪烁、零拖影或固定性能提升。优先用于离线单机。
 
-- **固定 1.5 帧**：三帧两次神经求值，间隔按两帧、一帧交替，不因复杂场景自动回退。
-- **PX1 当前帧重建**：低分辨率神经求值＋GuidedFit 编辑量拟合，在当前原生颜色上重建，不是直接放大神经小图。
-- **Carry 编辑场对齐**：保持帧不再调用 NGX，使用当前深度和运动向量对齐编辑场并填充去遮挡区域，减轻固定节奏拖影。
-- **XeSS X2**：同尺寸时域稳定＋AMD Optical Flow＋XeSS FG；不向 XeSS 提供真实游戏深度。
-- **独立面板**：小键盘 `*` 打开，包含网络分辨率、角色守护、时域参数、中间帧、目标队列和六页 66 项自定义调色。
-- **发布范围**：只开放每帧／1.5 帧与 XeSS X2；每 2／4 帧、X3／X4 不在本次开放范围。
+## 主要更新
 
-## 实测截面
+- 三遍串行神经求值，第三遍作为最终输出；各遍保留独立历史。
+- 每遍网络、分辨率、强度和风格控制；Prism 调色与角色守护保留。
+- 修复跨卡预取时颜色、深度、运动向量与帧序号的同帧绑定。
+- PX1 运动残余约束：保留静止清晰度，减轻运动中的编辑残余闪烁。
+- 副卡 DLSS FG 2x／4x：4x 生成三张不同时间位置的中间帧，不用重复帧填充冒充 4x。
+- 神经开关与 FG pacing 的 Present 交接修复，避免两个线程同时操作共享呈现资源。
+- 发布默认不启用 FrameCap，不为其他显卡或用户预设 30／55／60 FPS 上限。
 
-《剑星》，RTX 3070 Ti 渲染，RTX 5060 Ti 神经处理，3840×2160 输出。
+## 当前运行证据与限制
 
-- 固定 1.5 的一次截面：游戏生产约 59.6 FPS，神经更新约 39.7 FPS。
-- 另一次开启 XeSS X2 的截面：游戏生产约 59.9 FPS，神经更新约 39.9 FPS，显示输出约 102.6 FPS。
+《剑星》测试机：RTX 3070 Ti 渲染，RTX 5060 Ti 神经处理，3840×2160。
 
-**这些是单次运行截面，不是多轮均值或严格 A/B；显示输出 FPS 不等于神经求值 FPS，也不证明端到端输入延迟。**
+日志持续记录 `requested=4x`、`this-group=4x`、生成与呈现计数，且 `errors=0`；`DXGI_FRAME_STATISTICS` 也报告了显示帧与 vblank 间隔。这支持 4x 路径正在运行并有帧进入显示统计。
+
+**PresentMon 三次采样均因大量 ETW 事件丢失而没有生成可用 CSV，因此独立外部真实显示帧率对照尚未完成。** `generated` 与 `presented-gen` 不等于已经独立验证实际上屏，更不等于任何场景精确四倍。
+
+## 已知问题
+
+- 静止画面较稳定；运动闪烁已明显减轻，但仍有轻微快速闪烁。
+- 每遍自定义分辨率向上调节仍存在失效问题。
+- 关闭神经画面的交接修复通过自动测试，尚待用户实机复验。
+- DLSS FG 仍可能出现果冻、细小物体或遮挡伪影。
+- 缺少多机型、多游戏、长时间、帧间隔与端到端输入延迟验收。
 
 ## 安装前必读
 
 1. 备份现有注入与配置，不要并行第二条神经路径或游戏自身 FG。
-2. 插件文件名保留为 `nvngx.dll_mgpu_bridge.addon64`。
-3. 用户自备的 `nvngx_dlssnr.dll` 放入 `mgpu` 子目录，不放在 exe 旁。
-4. 检查游戏端 `ReShade.ini` 的搜索路径，确保游戏端 ReShade 能加载随包的 `mgpu_depth_tap.fx`；随包 `ReShade2.ini` 只负责副卡运行时。
-5. **从全关状态启用 XeSS，必须在启动前设置 `XeSSFG=1`。进游戏后才打开只保存配置，需完整重启才能创建代理。**
-6. 运行中不要修改分辨率、游戏 DLSS 模式或会重建交换链的选项。
-7. 优先用于离线单机；在线游戏与反作弊风险由使用者自行承担。
+2. 安装支持 add-on 的 64 位 ReShade。
+3. 插件文件名保留为 `nvngx.dll_mgpu_bridge.addon64`。
+4. 用户合法自备的 `nvngx_dlssnr.dll` 放入 `mgpu` 子目录；使用 DLSS FG 还需自备 `mgpu/nvngx_dlssg.dll`。
+5. 确保游戏端 ReShade 搜索路径能找到 `mgpu_depth_tap.fx`。
+6. 发布默认 `Passes=1`、`FrameGen=0`、`FGMulti=2`，不启用插件帧率上限。
+7. 在面板修改 FrameGen 或倍率后，必须完整退出并重启游戏。
+8. 运行中不要修改游戏分辨率、DLSS 模式或会重建交换链的选项。
+
+完整步骤见仓库 `INSTALL.md`。
 
 ## 下载
 
-- `MGPU-Prism-FG-1.0-运行包.zip`：稳定插件、发布配置、深度 tap、原样 Intel 运行库和中文安装说明。
-- `MGPU-Prism-FG-1.0-源码与文档.zip`：项目源码、所需许可范围内的 AMD 源文件、生成文件、中文文档与实测截图。
-- `SHA256SUMS.txt`：完整性校验。
+- `MGPU-Prism-FG-2.0-运行包.zip`：2.0 插件、默认配置、深度 tap、中文安装说明与许可。
+- `MGPU-Prism-FG-2.0-源码与文档.zip`：源码、构建脚本、测试与文档。
+- `SHA256SUMS.txt`：附件完整性校验。
 
-NVIDIA DLL、模型和 ReShade 安装器不随包提供。NVIDIA 与 Intel 的构建头文件按各自许可由构建者准备，详见 `BUILD.md`。
+**不包含** `_nvngx.dll`、`nvngx_dlssnr.dll`、`nvngx_dlssg.dll`、其他 NVIDIA DLL、模型、ReShade 安装器、游戏文件或私人日志。NVIDIA SDK 构建头文件由构建者阅读官方许可后通过随附脚本获取。
 
-## 已知边界
+## 构建验证
 
-- 尚未完成多机型、多游戏、长时间与端到端延迟验收。
-- 固定 1.5 与光流插帧都可能在快速运动、透明物体、粒子或去遮挡区域出现瑕疵，不承诺零拖影。
-- `framesPresented=2` 是 X2 工作证据，不代表任何环境下精确翻倍。
-- 源码仍保留部分研发诊断与未开放旧路径，不代表这些路径已经通过 1.0 验收。
-
-完整机制、安装步骤、排障与反馈格式见仓库中的 `README.md`、`ARCHITECTURE.md`、`INSTALL.md` 和 `RESULTS.md`。
+2.0 Release 构建成功，CTest 10／10 通过。自动测试不等于真实双卡、NGX、DLSSG、画质、上屏或延迟验收。
 
 ## 致谢
 
-感谢 Marcelo Guibout 的 MGPU／Neural Coprocessor、ChefZC 的 Prism NR，以及 ReShade、Dear ImGui、MinHook、DLSSNR-Cost-Scaler、AMD FidelityFX、Intel XeSS 和 JetBrains Mono 的作者与贡献者。各组件保留原许可；本分支不是上述作者或厂商的官方版本。
+感谢 Marcelo Guibout 的 MGPU／Neural Coprocessor、ChefZC／ChefDavid0815 的 Prism NR，以及 ReShade、Dear ImGui、MinHook、DLSSNR-Cost-Scaler 和 JetBrains Mono 的作者与贡献者。各组件保留原许可；本分支不是上述作者或厂商的官方版本。
