@@ -47,8 +47,8 @@
 
 ## 下载
 
-- `MGPU-Prism-FG-2.0-运行包.zip`：2.0 插件、默认配置、深度 tap、中文安装说明与许可。
-- `MGPU-Prism-FG-2.0-源码与文档.zip`：源码、构建脚本、测试与文档。
+- `MGPU-Prism-FG-2.0-Runtime.zip`：2.0 插件、默认配置、深度 tap、中文安装说明与许可。
+- `MGPU-Prism-FG-2.0-Source.zip`：源码、构建脚本、测试与文档。
 - `SHA256SUMS.txt`：附件完整性校验。
 
 **不包含** `_nvngx.dll`、`nvngx_dlssnr.dll`、`nvngx_dlssg.dll`、其他 NVIDIA DLL、模型、ReShade 安装器、游戏文件或私人日志。NVIDIA SDK 构建头文件由构建者阅读官方许可后通过随附脚本获取。

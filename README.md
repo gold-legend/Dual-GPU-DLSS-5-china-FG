@@ -110,6 +110,6 @@ src/worker.cpp             神经开关与呈现线程交接
 
 ## 发布文件
 
-- `MGPU-Prism-FG-2.0-运行包.zip`：插件、默认配置、深度 tap、中文安装说明与许可。
-- `MGPU-Prism-FG-2.0-源码与文档.zip`：可审阅源码、构建脚本、测试与文档。
+- `MGPU-Prism-FG-2.0-Runtime.zip`：插件、默认配置、深度 tap、中文安装说明与许可。
+- `MGPU-Prism-FG-2.0-Source.zip`：可审阅源码、构建脚本、测试与文档。
 - `SHA256SUMS.txt`：附件完整性校验。

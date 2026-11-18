@@ -19,8 +19,8 @@
 ## 三、Release 附件
 
 ```text
-MGPU-Prism-FG-2.0-运行包.zip
-MGPU-Prism-FG-2.0-源码与文档.zip
+MGPU-Prism-FG-2.0-Runtime.zip
+MGPU-Prism-FG-2.0-Source.zip
 SHA256SUMS.txt
 ```
 
