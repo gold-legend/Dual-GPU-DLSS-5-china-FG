@@ -1,4 +1,4 @@
-# MGPU Prism FG 2.0 发布与核验步骤
+# MGPU Prism FG 2.1 发布与核验步骤
 
 ## 一、发布前验收
 
@@ -12,15 +12,15 @@
 ## 二、源码与标签
 
 - 将发布源码与文档保存到仓库根目录，确保首页能直接阅读。
-- 2.0 使用标签 `v2.0.0`，标题为 `MGPU Prism FG 2.0`。
+- 2.1 使用标签 `v2.1.0`，标题为 `MGPU Prism FG 2.1`。
 - 不覆盖或改动 `v1.0.0` 历史标签。
 - 不把源码 ZIP 当成仓库唯一内容，也不上传构建缓存和本地运行日志。
 
 ## 三、Release 附件
 
 ```text
-MGPU-Prism-FG-2.0-Runtime.zip
-MGPU-Prism-FG-2.0-Source.zip
+MGPU-Prism-FG-2.1-Runtime.zip
+MGPU-Prism-FG-2.1-Source.zip
 SHA256SUMS.txt
 ```
 
@@ -29,7 +29,7 @@ Release 正文使用 `RELEASE_NOTES.md`。明确保留：PresentMon 本次采样
 ## 四、发布后自检
 
 - 仓库首页和文档相对链接可打开；
-- Release 标签指向 2.0 提交，三个附件均可下载；
+- Release 标签指向 2.1 提交，三个附件均可下载；
 - 下载后的哈希与 `SHA256SUMS.txt` 一致；
 - 新环境解压运行包后，目录结构与 `INSTALL.md` 一致；
 - 仓库和附件不包含 NVIDIA 二进制、SDK 头文件、私人路径或日志；

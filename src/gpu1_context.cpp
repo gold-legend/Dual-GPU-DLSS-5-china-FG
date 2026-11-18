@@ -9805,6 +9805,7 @@ namespace
         //                              interesting one
         unsigned long long q_hist[8] = {};
         unsigned long long q_sum = 0, q_n = 0, q_max = 0;
+        unsigned long long q_live_next = 1200; // read-only live L1 report; no rendering behavior
         unsigned long long consumed = 0;   // frames whose seal has been checked
         unsigned long long last_seen = 0;
 
@@ -10279,8 +10280,8 @@ namespace
         UINT cv_inc = 0;
         unsigned long long cv_built = 0, cv_fb_far = 0, cv_fb_old = 0, cv_fb_slot = 0;
         unsigned long long cv_late = 0;           // frames more than one game frame late
-        static const UINT EV_MAX = 6;             // R217: + shrink, chain, stretch around 2 passes
-        static const unsigned EV_ROLES = 19;      // R216: + shrink, stretch, crop, cut, SR; R217: chain
+        static const UINT EV_MAX = 12;            // PX1: three read-only marks for each of three passes
+        static const unsigned EV_ROLES = 28;      // PX1: per-pass input/down, NGX and reconstruction brackets
         ID3D12QueryHeap *evheap = nullptr;
         ID3D12Resource *evread = nullptr;
         bool ev_ok = false;
@@ -24625,6 +24626,24 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 s.evread->Unmap(0, &en);
             }
         }
+        // Live PX1 stage totals: some ReShade/game exit paths unregister the add-on
+        // without reaching the final stream summary, so do not make the data depend on exit.
+        if (s.ev_ok && run_nr && s.ts_n != 0ull && s.ts_n % 600ull == 0ull)
+        {
+            for (unsigned p = 0u; p < 3u; ++p)
+            {
+                const unsigned ri = 19u + p, rn = 22u + p, rc = 25u + p;
+                if (s.ev_n[ri] == 0ull || s.ev_n[rn] == 0ull || s.ev_n[rc] == 0ull) continue;
+                char pl[300];
+                snprintf(pl, sizeof pl,
+                         "[MGPU][PX1PERF] cumulative GPU1 ms P%u | input+Down=%.3f | NGX=%.3f | Fit+Compose=%.3f | n=%llu/%llu/%llu",
+                         p + 1u, s.ev_sum[ri] / (double)s.ev_n[ri],
+                         s.ev_sum[rn] / (double)s.ev_n[rn],
+                         s.ev_sum[rc] / (double)s.ev_n[rc],
+                         s.ev_n[ri], s.ev_n[rn], s.ev_n[rc]);
+                mgpu::diag::info(pl);
+            }
+        }
 
         // R26: the same frame's unpack, measured on the COPY queue's own
         // clock. Divided by cq_ts_freq and never by ts_freq - the two are
@@ -25368,6 +25387,15 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                 if (lat > s.lat_max) { s.lat_max = lat; s.lat_max_frame = got.frame_index; }
                 if (s.lat_n == 0) s.first_lat = lat;
                 s.lat_sum += lat; ++s.lat_n;
+                // R394 was declared and printed but never fed. Feed the existing
+                // read-only instrument at the actual consume point; the fence
+                // query is non-blocking and is skipped when instruments are off.
+                if (mgpu::fginstr::on())
+                {
+                    const unsigned long long arrived = (s.nfence != nullptr)
+                        ? (unsigned long long)s.nfence->GetCompletedValue() : 0ull;
+                    mgpu::fginstr::note_consume(lat, got.frame_index, s.produced, arrived, got.qpc_submit);
+                }
 
                 // L2: from the fence sighting, not from the record.
                 if (s.seen_fence_at != 0 && s.freq.QuadPart > 0)
@@ -25379,6 +25407,7 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         if (rl < s.ready_min) s.ready_min = rl;
                         if (rl > s.ready_max) s.ready_max = rl;
                         s.ready_sum += rl; ++s.ready_n;
+                        mgpu::fginstr::note_ready(rl);
                     }
                 }
                 if (slot < stream_state::RING) ++s.slot_hits[slot];
@@ -25512,6 +25541,24 @@ void stream_poll()
         for (int bi = 0; bi < 8; ++bi) bk.hist[bi] = s.q_hist[bi];
         bk.sum = s.q_sum; bk.n = s.q_n; bk.max = s.q_max;
         mgpu::pdiag::periodic(s.produced, bk);
+    }
+
+    // Live L1: expose the existing copy-record queue samples before exit.
+    // This only formats counters already recorded by stream_on_finish_effects;
+    // it does not wait on either GPU or change production, transport or pacing.
+    if (s.gfence != nullptr && s.q_n > 0 && s.produced >= s.q_live_next)
+    {
+        s.q_live_next = s.produced + 1200;
+        char ql[720]; int qw = 0;
+        qw += snprintf(ql + qw, sizeof ql - (size_t)qw,
+                       "[MGPU][L1L] GPU0 BACKLOG LIVE at copy-record, produced=%llu n=%llu mean=%.2f max=%llu | frames behind:",
+                       s.produced, s.q_n, (double)s.q_sum / (double)s.q_n, s.q_max);
+        for (unsigned b = 0; b < 8 && qw < (int)sizeof ql - 100; ++b)
+            qw += snprintf(ql + qw, sizeof ql - (size_t)qw, " %u%s=%llu",
+                           b, (b == 7) ? "+" : "", s.q_hist[b]);
+        snprintf(ql + qw, sizeof ql - (size_t)qw,
+                 ". Cumulative this run; read-only, no fence wait. SEAL starts at command recording, so this is its CPU-lead component, not PCIe copy time.");
+        mgpu::diag::info(ql);
     }
 
     // ---- V28: THE INNER LOOP. Decide, then fall through to the commit. ----
@@ -28478,8 +28525,12 @@ void stream_poll()
                                           ew == s.width && eh == s.height && !s.nrs_on;
                     if (rsd_here) mgpu::residual::before(s.nl, pi, ii, s.nr_params, nr_color);
 
+                    // PX1 read-only GPU brackets: Down/input -> NGX -> GuidedFit+Compose.
+                    // These marks do not alter dispatch order, synchronization or any NGX parameter.
+                    if (x1_frame) vr_mark(s, 19u + pi);
                     const NVSDK_NGX_Result er =
                         s.nr_eval(s.nl, ngx_h, s.nr_params, nullptr);
+                    if (x1_frame) vr_mark(s, 22u + pi);
 
                     if (nrs_here)
                     {
@@ -28882,7 +28933,9 @@ void stream_poll()
                     }
                     if (s.ev_ok && s.ev_count < stream_state::EV_MAX)   // R214
                     {
-                        s.ev_role[s.ev_count] = role;
+                        // With PX1 the two brackets above isolate input and NGX; this final
+                        // timestamp therefore measures reconstruction, not another NGX evaluate.
+                        s.ev_role[s.ev_count] = x1_frame ? (25u + pi) : role;
                         ++s.ev_count;
                         s.nl->EndQuery(s.evheap, D3D12_QUERY_TYPE_TIMESTAMP, s.ev_count);
                     }
@@ -29880,7 +29933,11 @@ void stream_poll()
                     "pass 2 centre", "pass 2 strip L", "pass 2 strip R",     // R215
                     "shrink", "pass 1 small", "stretch", "pass 1 crop", "pass 2 crop",
                     "cut box", "SR window", "SR cut",                         // R216
-                    "chain / B1 final GuidedFit+PX1" };                       // R217 / B1
+                    "chain / B1 final GuidedFit+PX1",                         // R217 / B1
+                    "PX1 P1 input+Down", "PX1 P2 input+Down", "PX1 P3 input+Down",
+                    "PX1 P1 NGX", "PX1 P2 NGX", "PX1 P3 NGX",
+                    "PX1 P1 Fit+Compose", "PX1 P2 Fit+Compose",
+                    "PX1 P3 Fit+Compose" };
                 char el[2000];
                 int w = snprintf(el, sizeof el,
                                  "[MGPU][R214] PER-EVALUATE GPU TIME on GPU 1, ms (each from the "

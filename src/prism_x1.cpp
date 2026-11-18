@@ -310,9 +310,8 @@ float SkinMask(float3 pd, float3 p)
   return exp(-dot(q, q)) * Smooth(0.02, 0.06, Luma(p));
 }
 
-float3 GuardEdit(float3 pd, float3 p, float3 e)
+float3 GuardEdit(float skin, float3 p, float3 e)
 {
-  const float skin = SkinMask(pd, p);
   const float mx = max(p.r, max(p.g, p.b));
   const float mn = min(p.r, min(p.g, p.b));
   const float w = max(skin * 0.8,
@@ -380,12 +379,15 @@ void CS_Compose(uint3 id : SV_DispatchThreadID)
     if (amplifiedY < 0.0)
       e += Luma(rawEdit) - amplifiedY;
   }
-  e = GuardEdit(maskCode, maskBase, e);
+  // Compute the native character mask once per pixel and reuse the identical
+  // value in both guard operations and the skin branch; no color math changes.
+  const float skinRaw = SkinMask(maskCode, maskBase);
+  e = GuardEdit(skinRaw, maskBase, e);
   float3 result = Enc(base * exp2(e));
   // The panel contract is 0%=off, 100%=full character protection. Gate the
   // complete skin branch as well as GuardEdit; previously 0% still ran the
   // MGPU skin residual and native high-frequency recovery.
-  const float skin = saturate(SkinMask(maskCode, maskBase) * gGuard);
+  const float skin = saturate(skinRaw * gGuard);
   if (skin > 1e-4)
   {
     const float3 smallInput = LowBilinear(gSmallInput, f);
@@ -401,7 +403,7 @@ void CS_Compose(uint3 id : SV_DispatchThreadID)
     // itself remains display-referred and is never reconstructed from A/B.
     float3 mgpuEdit = clamp(log2(max(Dec(mgpuCode), 1.0 / 512.0) /
                                  max(base, 1.0 / 512.0)), -3.0, 3.0);
-    mgpuEdit = GuardEdit(maskCode, maskBase, mgpuEdit);
+    mgpuEdit = GuardEdit(skinRaw, maskBase, mgpuEdit);
     const float3 mgpuGuarded = Enc(base * exp2(mgpuEdit));
     result = lerp(result, mgpuGuarded, skin);
 
@@ -960,28 +962,9 @@ bool compose(ID3D12GraphicsCommandList *cl, unsigned parity,
     const bool had_history = g_history_valid && limit_residual;
     if (!limit_residual)
     {
-        const bool had_local_history = g_history_valid;
-        barrier_to(cl, g_history, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                   D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-        constants(cl, low_width, low_height);
-        write_srv(cpu_slot(parity, CAPTURE_BASE), low_proxy, g_fmt);
-        write_srv(cpu_slot(parity, CAPTURE_BASE + 1), g_depth_valid ? depth : low_proxy,
-                  g_depth_valid ? DXGI_FORMAT_R32_FLOAT : g_fmt);
-        write_srv(cpu_slot(parity, CAPTURE_BASE + 2), low_proxy, g_fmt);
-        write_srv(cpu_slot(parity, CAPTURE_BASE + 3), g_a, DXGI_FORMAT_R16G16B16A16_FLOAT);
-        write_srv(cpu_slot(parity, CAPTURE_BASE + 4), low_proxy, g_fmt);
-        write_srv(cpu_slot(parity, CAPTURE_BASE + 5), low_proxy, g_fmt);
-        write_srv(cpu_slot(parity, CAPTURE_BASE + 6), low_proxy, g_fmt);
-        write_srv(cpu_slot(parity, CAPTURE_BASE + 7), mask_base, g_fmt);
-        write_uav(cpu_slot(parity, CAPTURE_BASE + 8), g_history, DXGI_FORMAT_R16G16B16A16_FLOAT);
-        write_uav(cpu_slot(parity, CAPTURE_BASE + 9), g_history, DXGI_FORMAT_R16G16B16A16_FLOAT);
-        cl->SetPipelineState(g_capture);
-        cl->SetComputeRootDescriptorTable(1, gpu_slot(parity, CAPTURE_BASE));
-        cl->Dispatch((low_width + 15u) / 16u, (low_height + 15u) / 16u, 1u);
-        barrier_to(cl, g_history, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-        g_history_valid = true;
-        if (had_local_history && ++g_limit_frames == 1ull)
+        // Temporal residual history is disabled and gHistory has no shader reader.
+        // Do not dispatch CS_Capture or transition its unused target on every pass.
+        if (++g_limit_frames == 1ull)
         {
             char line[440];
             if (g_motion_valid)
