@@ -1,10 +1,10 @@
-# MGPU Prism FG 2.1
+# MGPU Prism FG 2.3
 
 **双卡 DLSS 神经渲染、三遍串行 Prism 处理，以及位于神经输出之后的 DLSS Frame Generation 2x／4x。**
 
 这是基于 **MGPU／Neural Coprocessor 0.6.0** 与 **Prism NR** 的社区二次开发版本。主卡渲染游戏，副卡执行神经处理与帧生成；当前主路径使用 NVIDIA DLSS FG，不再沿用 1.0 的 AMD Optical Flow／XeSS FG。
 
-> **2.1 是实验性预发布版本。** 它不是 NVIDIA、Prism NR 或游戏厂商的官方组件，不承诺所有游戏兼容、精确四倍、零闪烁或零拖影。请先在离线单机中测试。
+> **2.3 是实验性预发布版本（高刷暴力帧率实验线 / 3.0 方向）。** 它不是 NVIDIA、Prism NR 或游戏厂商的官方组件，不承诺所有游戏兼容、精确四倍、零闪烁或零拖影。请先在离线单机中测试。
 
 ## 2.1 的修改思路
 

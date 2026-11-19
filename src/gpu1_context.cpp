@@ -10144,6 +10144,7 @@ namespace
         static const unsigned CV_MAX = 3;         // skipped frames chained (4 frames in the path)
         ID3D12Resource *cv_prev[CV_MAX] = {};     // skipped frames' vectors, the game's format
         ID3D12Resource *cv_out = nullptr;         // the chained field, R32G32_FLOAT
+        ID3D12Resource *cv_out16 = nullptr;       // 2026-11-19: the same chain, R16G16_FLOAT, for DLSS FG
         ID3D12RootSignature *cv_rs = nullptr;
         ID3D12PipelineState *cv_pso = nullptr;
         // [OURS] NRS - caller-side NR scaling (2026-10-11). STEP 1 plumbed only:
@@ -10687,6 +10688,37 @@ namespace
         // copies. mvec_keep_f: the frame it was copied on, 0 = never.
         ID3D12Resource *tex_mvec_keep = nullptr;
         unsigned long long mvec_keep_f = 0;
+        // NRZeroVec=1: a dedicated all-zero R16G16 field bound to DLSS-NR in
+        // place of the transported vectors, while FG keeps tex_mvec_r. 2026-11-19:
+        // Stellar Blade judged zero-vector NR the least-flickering state; FG still
+        // needs the real stream. Committed resources are zero-initialised, it is
+        // never written after creation, and it rests in NON_PIXEL_SHADER_RESOURCE.
+        ID3D12Resource *tex_mvec_zero = nullptr;
+        // FGVecNext=1: slot f+1's raw vectors (motion f->f+1, the interval FG
+        // actually interpolates), copied cross-card for DLSSG with mv_el=1.
+        ID3D12Resource *tex_mvec_next = nullptr;
+        bool     mvec_next_in_read = false;              // tex_mvec_next state tracker
+        // FGEvery=1 (2026-11-19): DLSS FG evaluates on EVERY consumed game
+        // frame, not only the frames a neural answer lands on. tex_fg_base is
+        // a private copy of the latest nr_final (refreshed in the run_nr FG
+        // block, rested in UNORDERED_ACCESS which fg::record expects); on the
+        // frames NR skips, this frame's own vectors/depth are unpacked into
+        // tex_fg_mv/tex_fg_dp and handed over with mv_el=1.
+        int      fg_every = 0;
+        ID3D12Resource *tex_fg_base = nullptr;
+        ID3D12Resource *tex_fg_mv   = nullptr;
+        ID3D12Resource *tex_fg_dp   = nullptr;
+        bool     fg_base_valid = false;
+        bool     fg_mv_in_read = false;                  // tex_fg_mv state tracker
+        bool     fg_dp_in_read = false;                  // tex_fg_dp state tracker
+        unsigned long long fg_every_evals = 0;
+        unsigned fg_every_said = 0;
+        // Why-not instrumentation (2026-11-19): which gate stops the
+        // every-frame record on the frames NR skipped.
+        unsigned long long fg_every_seen = 0, fg_every_no_neural = 0,
+                           fg_every_blocked_base = 0, fg_every_blocked_mv = 0,
+                           fg_every_blocked_dp = 0, fg_base_refreshes = 0;
+        unsigned long long fg_iter_total = 0, fg_iter_run_nr = 0;
 
         // ---- R30/R63: depth transport ----
         //
@@ -10804,6 +10836,8 @@ namespace
         unsigned long long r311_dropped = 0;            // R311: copies from the game's own routes dropped under MVecSource (mvec_cs)
         bool     r311_drop_said = false;
         bool     r309_aside = false;                     // the zero field is bound in place of the vectors
+        bool     fg_vec_chain = false;                   // 2026-11-19: FGVectors=chain - FG eats the chained field
+        bool     fg_vec_next = false;                    // 2026-11-19: FGVecNext=1 - FG eats slot f+1's raw vectors
         bool     r309_zero_ready = false;                // tex_mvec holds zeros and is in a read state
         bool     r309_probe_own = false;                 // the probe in flight was started by R309 alone
         int      r309_ring[6] = {0,0,0,0,0,0};          // last 6 judged probes: -1 worse, +1 better, 0 neither
@@ -12317,6 +12351,7 @@ namespace {
         for (unsigned ci = 0; ci < stream_state::CV_MAX; ++ci)
             if (s.cv_prev[ci] != nullptr) { s.cv_prev[ci]->Release(); s.cv_prev[ci] = nullptr; }
         if (s.cv_out != nullptr) { s.cv_out->Release(); s.cv_out = nullptr; }
+        if (s.cv_out16 != nullptr) { s.cv_out16->Release(); s.cv_out16 = nullptr; }
         for (unsigned i = 0; i < 2u; ++i)
             if (s.sr_color[i] != nullptr) { s.sr_color[i]->Release(); s.sr_color[i] = nullptr; }
         if (s.sr_depth  != nullptr) { s.sr_depth->Release();  s.sr_depth  = nullptr; }
@@ -12338,6 +12373,14 @@ namespace {
             { s.tex_mvec_r[mi]->Release(); s.tex_mvec_r[mi] = nullptr; }
         if (s.tex_mvec_keep != nullptr) { s.tex_mvec_keep->Release(); s.tex_mvec_keep = nullptr; }   // D2.0 NR2
         s.mvec_keep_f = 0;
+        if (s.tex_mvec_zero != nullptr) { s.tex_mvec_zero->Release(); s.tex_mvec_zero = nullptr; }   // NRZeroVec
+        if (s.tex_mvec_next != nullptr) { s.tex_mvec_next->Release(); s.tex_mvec_next = nullptr; }   // FGVecNext
+        s.mvec_next_in_read = false;
+        if (s.tex_fg_base != nullptr) { s.tex_fg_base->Release(); s.tex_fg_base = nullptr; }   // FGEvery
+        if (s.tex_fg_mv   != nullptr) { s.tex_fg_mv->Release();   s.tex_fg_mv   = nullptr; }
+        if (s.tex_fg_dp   != nullptr) { s.tex_fg_dp->Release();   s.tex_fg_dp   = nullptr; }
+        s.fg_base_valid = false; s.fg_mv_in_read = false; s.fg_dp_in_read = false;
+        s.fg_every_evals = 0ull; s.fg_every_said = 0u;
         for (unsigned di = 0; di < 2; ++di)
             if (s.tex_depth[di] != nullptr)
             { s.tex_depth[di]->Release(); s.tex_depth[di] = nullptr; }
@@ -13855,6 +13898,7 @@ namespace
         "Texture2D<float2> gV2 : register(t2);\n"
         "Texture2D<float2> gV3 : register(t3);\n"
         "RWTexture2D<float2> oV : register(u0);\n"
+        "RWTexture2D<float2> oV16 : register(u1);\n"   // 2026-11-19: R16G16 copy of the chain for DLSS FG
         "cbuffer C : register(b0) { float2 gScale; uint2 gDim; uint gN; uint gP0; uint gP1; uint gP2; };\n"
         "float2 ld(uint k, float2 q)\n"
         "{\n"
@@ -13876,6 +13920,7 @@ namespace
         "    q += v * gScale;\n"
         "  }\n"
         "  oV[id.xy] = acc;\n"
+        "  oV16[id.xy] = acc;\n"
         "}\n";
 
     // At arm, after the MVec pair exists. False turns chain off for the run
@@ -13912,7 +13957,7 @@ namespace
         rng[0].NumDescriptors = 4; rng[0].BaseShaderRegister = 0;
         rng[0].OffsetInDescriptorsFromTableStart = 0;
         rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-        rng[1].NumDescriptors = 1; rng[1].BaseShaderRegister = 0;
+        rng[1].NumDescriptors = 2; rng[1].BaseShaderRegister = 0;
         rng[1].OffsetInDescriptorsFromTableStart = 4;
         D3D12_ROOT_PARAMETER rp[2] = {};
         rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
@@ -13953,10 +13998,14 @@ namespace
                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                           D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.cv_out);
         if (SUCCEEDED(hr))
+            hr = make_tex(ndev, s.mvec_w, s.mvec_h, DXGI_FORMAT_R16G16_FLOAT,
+                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.cv_out16);
+        if (SUCCEEDED(hr))
         {
             D3D12_DESCRIPTOR_HEAP_DESC hd{};
             hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-            hd.NumDescriptors = 10;                  // 5 per parity
+            hd.NumDescriptors = 12;                  // 6 per parity (4 SRV + 2 UAV since 2026-11-19)
             hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
             hr = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.cv_heap));
         }
@@ -13968,15 +14017,16 @@ namespace
             return false;
         }
         s.cv_inc = ndev->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-        // Per parity: SRV(this frame's vectors) SRV(skipped 1..3) UAV(chained).
+        // Per parity: SRV(this frame's vectors) SRV(skipped 1..3) UAV(chained R32) UAV(chained R16, FG).
         for (UINT p = 0; p < 2u; ++p)
         {
             D3D12_CPU_DESCRIPTOR_HANDLE h = s.cv_heap->GetCPUDescriptorHandleForHeapStart();
-            h.ptr += (SIZE_T)(p * 5u) * s.cv_inc;
+            h.ptr += (SIZE_T)(p * 6u) * s.cv_inc;
             vr_srv(ndev, s.tex_mvec_r[p], h); h.ptr += s.cv_inc;
             for (unsigned i = 0; i < stream_state::CV_MAX; ++i)
             { vr_srv(ndev, s.cv_prev[i], h); h.ptr += s.cv_inc; }
-            vr_uav(ndev, s.cv_out, h);
+            vr_uav(ndev, s.cv_out, h); h.ptr += s.cv_inc;
+            vr_uav(ndev, s.cv_out16, h);
         }
         return true;
     }
@@ -13989,7 +14039,7 @@ namespace
         s.nl->SetComputeRootSignature(s.cv_rs);
         s.nl->SetPipelineState(s.cv_pso);
         D3D12_GPU_DESCRIPTOR_HANDLE gh = s.cv_heap->GetGPUDescriptorHandleForHeapStart();
-        gh.ptr += (UINT64)(ii * 5u) * s.cv_inc;
+        gh.ptr += (UINT64)(ii * 6u) * s.cv_inc;
         s.nl->SetComputeRootDescriptorTable(0, gh);
         // The transported Lumenite values remain FULL-SIZE pixel displacements,
         // but this chain walks the LOW-RES source grid. Convert only the lookup
@@ -15208,7 +15258,14 @@ namespace
                         s.nrs_pscale[pi] = ps;
                         s.nrs_pw[pi] = pw; s.nrs_ph[pi] = ph;
                     }
-                    unsigned mxw = nw, mxh = nh;
+                    // 2026-11-19: size the scratch for the FULL native extent. The
+                    // old arm-time-max sizing refused every runtime raise above
+                    // the largest arm-time per-pass scale with "restart to raise
+                    // it" (the R370 warn), which presented as 网络分辨率不能手动
+                    // 调节: the slider wrote the ini but the bridge kept the old
+                    // value. Native sizing costs one 4K buffer set on GPU1 and
+                    // matches what the other arm path already does (line ~22528).
+                    unsigned mxw = s.width, mxh = s.height;
                     for (unsigned i = 0; i < s.nr_built && i < stream_state::MAX_PASSES; ++i)
                         if (s.nrs_all || s.nrs_pscale[i] < 0.999f)
                         {
@@ -15671,6 +15728,38 @@ namespace
             h = make_tex(ndev, s.width, s.height, nrfmt,
                          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_pong);
+        // FGEvery=1: private base/mvec/depth so DLSS FG can run on every
+        // consumed game frame, not only NR-complete ones. The base mirrors
+        // tex_out (it receives CopyResource of nr_final, which is tex_out or
+        // the last pass's texture at the same extent/format); the mv/dp pair
+        // mirror the mode-3 transport textures. Key read here inline, once,
+        // the same way NRZeroVec/FGVecNext do it above.
+        {
+            char feb[INI_BYTES];
+            bool fe_want = false;
+            if (ini_slurp(feb, sizeof feb))
+            {
+                const char *fe = ini_find(feb, "FGEvery");
+                fe_want = (fe != nullptr && *fe == '1');
+            }
+            s.fg_every = fe_want ? 1 : 0;
+            if (SUCCEEDED(h) && fe_want)
+                h = make_tex(ndev, s.width, s.height, nrfmt,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.tex_fg_base);
+            if (SUCCEEDED(h) && fe_want && s.mvec_mode == 3 && s.mvec_w != 0u && s.mvec_h != 0u)
+                h = make_tex(ndev, s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format,
+                             D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_fg_mv);
+            if (SUCCEEDED(h) && fe_want && s.depth_mode != 0u && s.depth_w != 0u && s.depth_h != 0u)
+                h = make_tex(ndev, s.depth_w, s.depth_h, (DXGI_FORMAT)s.depth_format,
+                             D3D12_RESOURCE_FLAG_NONE,
+                             D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_fg_dp);
+            if (fe_want)
+                mgpu::diag::info("[MGPU][FGE] FGEvery=1: DLSS FG evaluates on every consumed game "
+                                 "frame from a private copy of the latest neural output; NR cadence "
+                                 "no longer paces generation.");
+        }
         if (SUCCEEDED(h)) h = make_buf(ndev, 1024, D3D12_HEAP_TYPE_READBACK, &s.nr_read);
         // R338 (StrobeCalib=1 only): the two 64x64 boxes, output and input, one readback. A failure turns the
         // calibrator off and never fails the arm.
@@ -15836,6 +15925,41 @@ namespace
                              D3D12_RESOURCE_FLAG_NONE,
                              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &s.tex_mvec_keep);
             s.mvec_keep_f = 0;
+            // NRZeroVec=1: the dedicated zero field for DLSS-NR. Read the key
+            // from the file here, once, the same way r309::read_keys does.
+            {
+                bool nr_zero_want = false;
+                char zvb[INI_BYTES];
+                if (ini_slurp(zvb, sizeof zvb))
+                {
+                    const char *zv = ini_find(zvb, "NRZeroVec");
+                    nr_zero_want = (zv != nullptr && *zv == '1');
+                }
+                if (SUCCEEDED(h) && nr_zero_want)
+                    h = make_tex(ndev, s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format,
+                                 D3D12_RESOURCE_FLAG_NONE,
+                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &s.tex_mvec_zero);
+                if (nr_zero_want)
+                    mgpu::diag::info("[MGPU][NRZ] NRZeroVec=1: DLSS-NR is bound a dedicated zero motion field; "
+                                     "the transported vectors still feed DLSS FG and every other consumer.");
+                // FGVecNext=1: slot f+1's vectors for DLSSG. Same shape as the
+                // keep copy; written by a cross-card copy each consumed frame.
+                bool fg_next_want = false;
+                if (ini_slurp(zvb, sizeof zvb))
+                {
+                    const char *nv = ini_find(zvb, "FGVecNext");
+                    fg_next_want = (nv != nullptr && *nv == '1');
+                }
+                if (SUCCEEDED(h) && fg_next_want)
+                    h = make_tex(ndev, s.mvec_w, s.mvec_h, (DXGI_FORMAT)s.mvec_format,
+                                 D3D12_RESOURCE_FLAG_NONE,
+                                 D3D12_RESOURCE_STATE_COPY_DEST, &s.tex_mvec_next);
+                if (fg_next_want)
+                    mgpu::diag::info("[MGPU][FGN] FGVecNext=1: DLSSG is handed slot f+1's raw vectors "
+                                     "(the f->f+1 interval it interpolates) with mv_el=1 when that slot "
+                                     "is still in the ring; otherwise the usual path.");
+                s.mvec_next_in_read = false;
+            }
         }
 
         // Optional Lumenite transport reduction. The small source pair remains
@@ -20789,10 +20913,21 @@ void stream_request()
         // them consume the current frame; only the final answer crosses to GPU1.
         if (s.passes > 3u) s.passes = 3u;
         s.nr_built = 3u;
-        s.nr_cadence = 1u;
         s.sr_on = 0u;
         s.subrect_pct = 100u;
-        mgpu::diag::info("[MGPU][B1] every-frame multi-NR: three independent native-cap handles, Passes=1..3; NRCadence=1");
+        // 2026-11-19: the cadence force (s.nr_cadence = 1) is lifted. Under
+        // local_nr every frame is "newest" (run_nr's first disjunct), so
+        // NRCadence is the ONLY way to skip evaluates - and skipping is what
+        // frees the game from the ring backpressure: held frames consume in
+        // ~1 ms, the producer stops waiting on slots, the game runs at its
+        // own fps while NR runs every Nth frame. FGEvery then fills every
+        // game frame with DLSS FG from the latest neural base.
+        char lb[300];
+        snprintf(lb, sizeof lb,
+                 "[MGPU][B1] every-frame multi-NR: three independent native-cap handles, Passes=1..3; "
+                 "NRCadence=%u honoured (held frames keep the previous neural output)",
+                 s.nr_cadence);
+        mgpu::diag::info(lb);
     }
 
     // R349: NRPreset is the fallback, NRPresetN overrides pass N. Arm-time only (the preset chooses the
@@ -22043,6 +22178,28 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 s.r310_cost = k.cost; s.r310_offlock = k.offlock; s.r310_test_ms = k.offlock ? k.test_ms : 0u;
                 s.r311c_thread = k.thread;   // R311c
                 s.r311_src = k.source; g_r311_src.store(k.source, std::memory_order_relaxed);   // R311
+                {   // 2026-11-19: FGVectors=chain - DLSS FG binds the R217 chained field
+                    // (R16G16 copy) on late frames, with mv_el=1 (the chain is already
+                    // the net displacement). Absent or anything but "chain": FG keeps
+                    // the raw slot vectors with the R87 multiplier, exactly as before.
+                    char fb[INI_BYTES];
+                    s.fg_vec_chain = false;
+                    if (ini_slurp(fb, sizeof fb))
+                    {
+                        const char *fv = ini_find(fb, "FGVectors");
+                        s.fg_vec_chain = (fv != nullptr && strncmp(fv, "chain", 5) == 0);
+                    }
+                    if (s.fg_vec_chain)
+                        mgpu::diag::info("[MGPU][FGV] FGVectors=chain: on late frames DLSS FG binds the R217 "
+                                         "chained field (R16G16, net displacement) with mv_el=1; fresh frames "
+                                         "keep the raw slot vectors.");
+                    const char *nv2 = ini_find(fb, "FGVecNext");
+                    s.fg_vec_next = (nv2 != nullptr && *nv2 == '1');
+                    if (s.fg_vec_next)
+                        mgpu::diag::info("[MGPU][FGN] FGVecNext armed: DLSSG gets slot f+1's raw vectors "
+                                         "(the f->f+1 interval) with mv_el=1 whenever the slot is still in "
+                                         "the ring; FGVectors=chain takes priority on late frames.");
+                }
                 r309::time_game.store(s.r310_cost, std::memory_order_relaxed);
                 if (s.r311_src != 0)
                 {
@@ -26029,6 +26186,21 @@ void stream_poll()
     while (s.consumed < sched_to)
     {
         const unsigned long long f = s.consumed + 1;
+        // FGEvery diagnostics (2026-11-19): total iterations vs run_nr vs the
+        // every-frame gate, printed every 600 iterations.
+        ++s.fg_iter_total;
+        if (s.fg_iter_total % 600ull == 1ull)
+        {
+            char fit[460];
+            snprintf(fit, sizeof fit,
+                     "[MGPU][FGE] iter=%llu run_nr=%llu overrun=%llu fg_every=%d neural=%d "
+                     "seen=%llu blk_base=%llu blk_mv=%llu blk_dp=%llu recs=%llu refresh=%llu",
+                     s.fg_iter_total, s.fg_iter_run_nr, s.overrun, s.fg_every,
+                     s.neural ? 1 : 0, s.fg_every_seen, s.fg_every_blocked_base,
+                     s.fg_every_blocked_mv, s.fg_every_blocked_dp, s.fg_every_evals,
+                     s.fg_base_refreshes);
+            mgpu::diag::info(fit);
+        }
 
         // The slot for frame f has been recycled if the producer is more than
         // RING frames ahead. That is a real, nameable condition - THE CONSUMER
@@ -26118,6 +26290,7 @@ void stream_poll()
         // already arrived: doing so reintroduces cadence skipping into the
         // every-frame chain.  Legacy cadence keeps its original newest-only rule.
         const bool run_nr = s.nr_ok && (newest || s.local_nr) && s.neural && !fg_thin && cadence_due;
+        if (run_nr) ++s.fg_iter_run_nr;   // FGEvery diagnostics
         if (s.nr_ok && (newest || s.local_nr) && s.neural && !fg_thin)
         {
             if (run_nr) s.nr_cadence_wait = 0;
@@ -27512,6 +27685,9 @@ void stream_poll()
                                     D3D12_RESOURCE_STATE_COPY_DEST);
                         barrier(s.nl, s.cv_out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                 D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                        if (s.cv_out16 != nullptr)
+                            barrier(s.nl, s.cv_out16, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                         cv_ran = true;
                         ++s.cv_built;
                         vr_mark(s, 18u);
@@ -27898,7 +28074,22 @@ void stream_poll()
                     // R309: stepped aside - the zero field (tex_mvec) through the synthetic branch below,
                     // fresh vectors or not. Exactly what MVec=1 with MVecDX=MVecDY=0 binds.
                     const bool r309_zero = r311e_zero && s.r309_zero_ready && s.mvec_mode == 3;   // R311e: zero until R280's verdict, or stepped aside
-                    if (!r309_zero && s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
+                    // NRZeroVec: NR alone eats the dedicated zero field. FG still
+                    // records tex_mvec_r below; the transport is untouched. Scale
+                    // 0.0 makes any residual multiplier moot. 2026-11-19 Stellar
+                    // Blade: this state judged the least-flickering of the run.
+                    if (s.tex_mvec_zero != nullptr && s.mvec_mode == 3)
+                    {
+                        s.nr_params->Set("DLSSNR.MVec", s.tex_mvec_zero);
+                        s.nr_params->Set("DLSSNR.MVecScaleX", 0.0f);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", 0.0f);
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseX", 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectBaseY", 0u);
+                        s.nr_params->Set("DLSSNR.MVecSubrectWidth",  (unsigned int)s.mvec_w);
+                        s.nr_params->Set("DLSSNR.MVecSubrectHeight", (unsigned int)s.mvec_h);
+                        if (pi == 0 && sk == 0) ++s.mvec_bound;
+                    }
+                    else if (!r309_zero && s.mvec_mode == 3 && s.tex_mvec_r[ii] != nullptr &&
                         s.mvec_bytes2 != 0 && s.mvec_slot_valid[slot].load(std::memory_order_acquire) != 0u &&
                         tdec.bind_mvec)   // R300a1: false only with TemporalRequireTuple=1 on an incoherent tuple
                     {
@@ -29289,12 +29480,72 @@ void stream_poll()
                                  depth_here ? 1 : 0, (void *)s.tex_depth[ii], (size_t)s.depth_bytes, s.depth_mode);
                         mgpu::diag::info(dl);
                     }
+                    // FGVectors=chain (2026-11-19): on a late frame the chain ran and
+                    // cv_out16 holds the net displacement in the raw vectors' units -
+                    // bind it with mv_el=1 so FG does not multiply again. Fresh frames
+                    // (cv_ran false) keep the raw slot vectors with the live mv_el.
+                    const bool fg_chain_here = s.fg_vec_chain && cv_ran && s.cv_out16 != nullptr && mvec_here;
+                    // FGVecNext (2026-11-19): DLSSG interpolates f -> f+1, so the
+                    // honest vector lives in slot f+1 (motion INTO f+1). The game
+                    // runs ahead of GPU 1, so that slot is normally still in the
+                    // ring when f is consumed. Copy it across (same nxfer
+                    // footprint read the chain uses) and hand it over with
+                    // mv_el=1. Slot missing/invalid: fall through to the usual
+                    // path. FGVectors=chain wins on late frames when both are set.
+                    bool fg_next_here = false;
+                    if (!fg_chain_here && s.fg_vec_next && mvec_here && s.tex_mvec_next != nullptr &&
+                        s.mvec_mode == 3 && s.nxfer != nullptr)
+                    {
+                        const unsigned long long nf = f + 1ull;
+                        const unsigned ns = (unsigned)(nf % stream_state::RING);
+                        if (s.slot_game_frame[ns] == nf &&
+                            s.mvec_slot_valid[ns].load(std::memory_order_acquire) != 0u &&
+                            nf + (unsigned long long)stream_state::RING >= s.produced + 3ull)
+                        {
+                            if (s.mvec_next_in_read)
+                                barrier(s.nl, s.tex_mvec_next, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                        D3D12_RESOURCE_STATE_COPY_DEST);
+                            D3D12_TEXTURE_COPY_LOCATION csu{}, cdu{};
+                            csu.pResource = s.nxfer;
+                            csu.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                            csu.PlacedFootprint = s.mvec_fp2;
+                            csu.PlacedFootprint.Offset = (UINT64)ns * s.slot_bytes + s.mvec_off;
+                            cdu.pResource = s.tex_mvec_next;
+                            cdu.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                            cdu.SubresourceIndex = 0;
+                            s.nl->CopyTextureRegion(&cdu, 0, 0, 0, &csu, nullptr);
+                            barrier(s.nl, s.tex_mvec_next, D3D12_RESOURCE_STATE_COPY_DEST,
+                                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                            s.mvec_next_in_read = true;
+                            fg_next_here = true;
+                        }
+                    }
                     mgpu::fg::record(s.nl, s.nr_final,
-                                     mvec_here ? s.tex_mvec_r[ii] : nullptr,
+                                     fg_next_here ? s.tex_mvec_next :
+                                     (fg_chain_here ? s.cv_out16 : (mvec_here ? s.tex_mvec_r[ii] : nullptr)),
                                      depth_here ? s.tex_depth[ii] : nullptr,
-                                     mv_el_frame, gnow);
+                                     (fg_next_here || fg_chain_here) ? 1.0f : mv_el_frame, gnow);
                     if (s.native_last_bound == gnow)
                         s.native_last_output = gnow;
+                    // FGEvery: keep the private base in step with what FG just
+                    // received, so the in-between frames NR never answered can
+                    // still be generated on this frame's own vectors. Rests in
+                    // UNORDERED_ACCESS - the state fg::record expects its base
+                    // in (line 798 transitions UAV->COPY_SOURCE itself).
+                    if (s.fg_every != 0 && s.tex_fg_base != nullptr)
+                    {
+                        barrier(s.nl, s.nr_final, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_SOURCE);
+                        barrier(s.nl, s.tex_fg_base, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+                        s.nl->CopyResource(s.tex_fg_base, s.nr_final);
+                        barrier(s.nl, s.tex_fg_base, D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        barrier(s.nl, s.nr_final, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+                        s.fg_base_valid = true;
+                        ++s.fg_base_refreshes;
+                    }
                 }
                 // Back to the mode's resting state - COPY_DEST on the shipped
                 // path, COMMON with the copy queue on, so the copy queue can
@@ -29358,6 +29609,87 @@ void stream_poll()
                 // tex_in[ii]; that half is what the presenter shows while the
                 // switch is off (stream_present_source's !s.neural branch).
                 s.tex_in_show = s.tex_in[ii];
+            }
+
+            // FGEvery=1 (2026-11-19): the frames NR skipped (superseded seals,
+            // cadence holds) still get a full DLSS FG evaluation - the latest
+            // neural output as base, THIS frame's own vectors/depth, mv_el=1.
+            // Generation count therefore follows the GAME's cadence: at 60 game
+            // fps FG is asked 60 times a second whatever NR's pace is. The
+            // vectors/depth are unpacked into the FGEvery-private textures
+            // because the mode-3 pair (tex_mvec_r/tex_depth) is only refreshed
+            // under run_nr. DLSSG extrapolates the repeated base colour along
+            // the fresh motion; when a real NR frame lands the run_nr record
+            // above re-anchors the pair.
+            if (!run_nr && s.neural && s.fg_every != 0)
+            {
+                ++s.fg_every_seen;
+                const bool fe_mv = (s.mvec_mode == 3 && s.tex_fg_mv != nullptr &&
+                                    s.mvec_bytes2 != 0 && mvec_fresh);
+                const bool fe_dp = (s.depth_mode != 0 && s.tex_fg_dp != nullptr &&
+                                    s.depth_bytes != 0 && r331_depth_in_slot(s, slot, f));
+                if (!s.fg_base_valid) ++s.fg_every_blocked_base;
+                else if (!fe_mv) ++s.fg_every_blocked_mv;
+                else if (!fe_dp) ++s.fg_every_blocked_dp;
+                if (s.fg_every_seen % 600ull == 1ull)
+                {
+                    char few[420];
+                    snprintf(few, sizeof few,
+                             "[MGPU][FGE] gates: seen=%llu blocked_base=%llu mv=%llu dp=%llu "
+                             "records=%llu base_refreshes=%llu",
+                             s.fg_every_seen, s.fg_every_blocked_base, s.fg_every_blocked_mv,
+                             s.fg_every_blocked_dp, s.fg_every_evals, s.fg_base_refreshes);
+                    mgpu::diag::info(few);
+                }
+                if (s.fg_base_valid && fe_mv && fe_dp)
+                {
+                    unsigned fe_rslot = slot; unsigned long long fe_rf = f;
+                    r338_mvec_source(s, slot, f, fe_rslot, fe_rf);
+                    if (s.fg_mv_in_read)
+                        barrier(s.nl, s.tex_fg_mv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION fsu{}, fdu{};
+                    fsu.pResource = s.nxfer;
+                    fsu.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    fsu.PlacedFootprint = s.mvec_fp2;
+                    fsu.PlacedFootprint.Offset = (UINT64)fe_rslot * s.slot_bytes + s.mvec_off;
+                    fdu.pResource = s.tex_fg_mv;
+                    fdu.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    fdu.SubresourceIndex = 0;
+                    s.nl->CopyTextureRegion(&fdu, 0, 0, 0, &fsu, nullptr);
+                    barrier(s.nl, s.tex_fg_mv, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    s.fg_mv_in_read = true;
+                    if (s.fg_dp_in_read)
+                        barrier(s.nl, s.tex_fg_dp, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                                D3D12_RESOURCE_STATE_COPY_DEST);
+                    D3D12_TEXTURE_COPY_LOCATION psu{}, pdu{};
+                    psu.pResource = s.nxfer;
+                    psu.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                    psu.PlacedFootprint = s.depth_fp;
+                    psu.PlacedFootprint.Offset = slot_off + s.depth_off;
+                    pdu.pResource = s.tex_fg_dp;
+                    pdu.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                    pdu.SubresourceIndex = 0;
+                    s.nl->CopyTextureRegion(&pdu, 0, 0, 0, &psu, nullptr);
+                    barrier(s.nl, s.tex_fg_dp, D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                    s.fg_dp_in_read = true;
+                    const unsigned long long fe_gf =
+                        (s.slot_game_frame[slot] != 0ull) ? s.slot_game_frame[slot] : f;
+                    mgpu::fg::record(s.nl, s.tex_fg_base, s.tex_fg_mv, s.tex_fg_dp,
+                                     1.0f, fe_gf);
+                    ++s.fg_every_evals;
+                    if (s.fg_every_said < 3u)
+                    {
+                        ++s.fg_every_said;
+                        char fel[300];
+                        snprintf(fel, sizeof fel,
+                                 "[MGPU][FGE] every-frame FG record f=%llu gf=%llu mv_slot=%u",
+                                 f, fe_gf, fe_rslot);
+                        mgpu::diag::info(fel);
+                    }
+                }
             }
 
             // Resolve after every mark is written, never before: the resolve

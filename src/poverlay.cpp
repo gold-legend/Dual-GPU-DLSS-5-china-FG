@@ -2093,7 +2093,7 @@ void DrawPanel(UINT bw, UINT bh, float dt)
     // Header: name, version, state.
     {
         const float cy = y0 + std::round((headH - LineHeight(kTitle)) * 0.5f);
-        const float nw = Text(x0 + pad, cy, L"MGPU Prism 2.2", kTitle, kWhite);
+        const float nw = Text(x0 + pad, cy, L"MGPU Prism 2.3", kTitle, kWhite);
         Text(x0 + pad + nw + U(8), cy + U(2), L"0.4", kLabel, kQuiet);
         const wchar_t *state;
         uint32_t mark;
@@ -2482,12 +2482,22 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             break;
         }
         case kCadence: {
-            if (n.cadence != 1)
+            // 2026-11-19: real 1/2/4 cadence control. The old row hard-forced
+            // 每帧 every frame it rendered, which also reverted an ini NRCadence
+            // seconds after arm. Cadence is what frees the game from the ring
+            // backpressure (held frames consume in ~1 ms) while FGEvery fills
+            // every game frame with DLSS FG from the latest neural base.
+            int cur = (n.cadence == 2) ? 1 : (n.cadence == 4) ? 2 : 0;
+            clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"每帧", L"1/2", L"1/4"}, cur, 7, 0, &hover, dt);
+            int want = clicked;
+            if (keyStep) want = (cur + (step > 0 ? 1 : 2)) % 3;
+            if (focused && in.enter) want = (cur + 1) % 3;
+            if (want >= 0 && want != cur)
             {
-                n.cadence = 1;
+                n.cadence = (want == 0) ? 1 : (want == 1) ? 2 : 4;
                 changed = true;
             }
-            clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"每帧"}, 0, 1, 0, &hover, dt);
+            if (focused) panel.hoverOption = hover;
             break;
         }
         }
