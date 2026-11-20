@@ -11489,7 +11489,8 @@ namespace
         "NRPreset2=0\n"
         "NRPreset3=1\n"
         "FrameGen=0\n"
-        "FGX=2\n";
+        "FGX=2\n"
+        "Frames=0\n";
 
     bool ini_slurp(char *buf, size_t n)
     {
