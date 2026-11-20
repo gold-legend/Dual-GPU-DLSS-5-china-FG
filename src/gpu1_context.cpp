@@ -11466,6 +11466,31 @@ namespace
             { g_ini_mirror[i].key = key; g_ini_mirror[i].val = v; g_ini_mirror[i].have = true; return; }
     }
 
+    // R344: the built-in starter config, written beside the add-on on first run
+    // when no mgpu.ini exists there. Deliberately SHORT: the two keys that decide
+    // whether the add-on does anything at all (AutoArm, Depth), the tuned pass
+    // layout, and nothing title-specific. NO DepthTransport key on purpose - the
+    // R343 probe stays free to pick the depth route on evidence.
+    static const char MGPU_STARTER_INI[] =
+        "; MGPU Prism - starter configuration.\n"
+        "; Auto-created beside the add-on on first run; edit freely, every key\n"
+        "; takes effect on the next launch (a few are live per frame).\n"
+        "; DepthTransport is intentionally absent: the add-on picks the depth\n"
+        "; route automatically ([R343] in the log). Write the key only to pin it.\n"
+        "AutoArm=1\n"
+        "Depth=1\n"
+        "DepthInverted=1\n"
+        "Passes=3\n"
+        "NRScale=0.65\n"
+        "NRScale1=0.69\n"
+        "NRScale2=0.58\n"
+        "NRScale3=0.58\n"
+        "NRPreset1=0\n"
+        "NRPreset2=0\n"
+        "NRPreset3=1\n"
+        "FrameGen=0\n"
+        "FGX=2\n";
+
     bool ini_slurp(char *buf, size_t n)
     {
         if (buf == nullptr || n < 2)
@@ -11476,9 +11501,41 @@ namespace
         buf[0] = '\0';
         FILE *f = nullptr;
         bool beside = false;
+        bool created = false;
         const wchar_t *wp = ini_path();
         if (wp[0] != L'\0') { f = _wfopen(wp, L"rb"); beside = (f != nullptr); }
         if (f == nullptr) f = fopen("mgpu.ini", "rb");   // legacy CWD fallback
+
+        // ---- R344: FIRST-RUN SELF-INSTALL ----
+        //
+        // ERROR 205 existed because nothing about a missing mgpu.ini is a choice:
+        // the code defaults are AutoArm=0 / Depth=0, so the add-on loaded healthy
+        // and did nothing, and two test sessions were spent on exactly that. The
+        // error screen fixed the silence but not the install: a bare drop of the
+        // .addon64 still showed a red screen. So the file ships INSIDE the add-on
+        // now. Absent beside the module (the CWD fallback above does not count -
+        // creating there would scatter configs into launchers' directories), the
+        // starter is written to the module's own path and this very call proceeds
+        // with it: the run is live on frame one AND the user has a real file to
+        // edit afterwards. One attempt per process; a failed write falls through
+        // to the old ERROR 205 path unchanged.
+        if (f == nullptr && wp[0] != L'\0')
+        {
+            static bool r344_tried = false;
+            if (!r344_tried)
+            {
+                r344_tried = true;
+                FILE *w = _wfopen(wp, L"wb");
+                if (w != nullptr)
+                {
+                    (void)fwrite(MGPU_STARTER_INI, 1, sizeof(MGPU_STARTER_INI) - 1, w);
+                    (void)fclose(w);
+                    created = true;
+                    f = _wfopen(wp, L"rb");
+                    beside = (f != nullptr);
+                }
+            }
+        }
 
         // Say once, out loud, WHICH file is in force - or that none is. Every
         // value on the arm line downstream of this is either the file's or a
@@ -11513,7 +11570,15 @@ namespace
                 // the add-on is loaded, healthy, and deliberately doing
                 // nothing. It says so in the imperative.
                 char pl[1700];
-                if (f == nullptr)
+                if (created)
+                    snprintf(pl, sizeof pl,
+                             "[MGPU][R344] no mgpu.ini beside the add-on - the built-in starter "
+                             "configuration was written to \"%ls\" and THIS RUN CONTINUES WITH IT. "
+                             "The file is yours to edit; it sets AutoArm=1 and Depth=1 so the stream "
+                             "arms on its own. DepthTransport is deliberately not in it - the add-on "
+                             "picks the depth route on evidence ([R343]).",
+                             wp);
+                else if (f == nullptr)
                     snprintf(pl, sizeof pl,
                              "[MGPU][P7.2] NO mgpu.ini FOUND - not beside the add-on (\"%ls\") and "
                              "not in the working directory. THE ADD-ON WILL DO NOTHING THIS RUN, "
@@ -11539,8 +11604,8 @@ namespace
                              "game's to change and a launcher that changes it silently reverts "
                              "every key to its default. Move mgpu.ini next to the .addon64.",
                              (wp[0] != L'\0') ? wp : L"<path unknown>");
-                if (f == nullptr) mgpu::diag::error(pl);
-                else              mgpu::diag::info(pl);
+                if (f == nullptr && !created) mgpu::diag::error(pl);
+                else                          mgpu::diag::info(pl);
             }
         }
 
