@@ -10584,6 +10584,31 @@ namespace
         unsigned char r331_bind_depth[2] = {}, r331_bind_mvec[2] = {};
         unsigned long long r331_cmp = 0ull, r331_depth_dis = 0ull, r331_mvec_dis = 0ull;
         unsigned long long r331_depth_retag = 0ull, r331_mvec_retag = 0ull, r331_report_at = 0ull;
+        // ---- R376 (PrismCarry): the 1.1-era cross-frame temporal carry, rebuilt ----
+        //
+        // The 1.1 mgpu.ini that never flickered on NTE carried
+        // PrismCarry=1 / PrismCarryBlend=0.50 / PrismCarryDepthTol=0.02 /
+        // MiddleFrame=1: a small temporal low-pass on the COMPOSITED neural
+        // picture, gated by depth so motion is never smeared. 2.4 shipped
+        // without the mechanism (zero references in source) - which is why
+        // RE2's dark high-contrast scenes boil: the NR pipeline's internal
+        // feedback oscillates frame to frame (probe: native 0.4045+-0.005
+        // while the composite swings 0.39..0.48), and nothing damps it.
+        // This is a self-contained pass on the final image: key absent = 0
+        // and not one instruction of the published 2.4 path changes.
+        unsigned carry_on = 0;                    // ini PrismCarry (0/1, absent = 0)
+        float carry_blend = 0.50f;                // ini PrismCarryBlend (0..0.95)
+        float carry_tol = 0.02f;                  // ini PrismCarryDepthTol
+        bool carry_valid = false;                 // a seeded previous frame exists
+        unsigned carry_w = 0, carry_h = 0;        // current carry_prev extent
+        ID3D12Resource *carry_prev = nullptr;     // the carried (blended) picture
+        ID3D12Resource *carry_depth = nullptr;    // depth the carried picture belongs to
+        ID3D12PipelineState *carry_pso = nullptr;
+        ID3D12RootSignature *carry_rs = nullptr;      // owned by the carry pass
+        ID3D12DescriptorHeap *carry_heap = nullptr;   // own 4-slot heap, never touches the per-pass NRS heap
+        D3D12_RESOURCE_STATES carry_prev_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        D3D12_RESOURCE_STATES carry_depth_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        unsigned carry_skip_logged = 0;           // one-line skip reasons, once each
         // ---- R343 (0.5.0 fix phase 1b): LateLatch - Dave's OPT2 (davidm71, MIT fork, permission 2026-10-21),
         // our code from his design. Key `LateLatch=1` (absent = today, byte-identical), `LateLatchAge` 0-4.
         // The newest-only rule means the frame evaluated next is whichever arrived last, which the f+1 prefetch
@@ -11567,6 +11592,11 @@ namespace
         "PrismX1DetailKeep=0.85\n"
         "XeSSFG=0\n"
         "XeSSMultiplier=2\n"
+        "; TemporalStrength: the Prism 1.1 golden stabiliser (recovered kernel) on the\n"
+        "; final composited picture, percent. 70 is the 1.1 lineage value that ran\n"
+        "; flicker-free; 0 disables. Motion-adaptive: moving pixels are released by a\n"
+        "; neighbourhood clamp, only still pixels are temporally damped.\n"
+        "TemporalStrength=70\n"
         "TemporalMotionAdaptive=1\n"
         "PresentQueue=0\n"
         "Finish=1\n"
@@ -12610,6 +12640,12 @@ namespace {
         if (s.nrs_rs_res   != nullptr) { s.nrs_rs_res->Release();   s.nrs_rs_res   = nullptr; }
         if (s.nrs_pso_opaque != nullptr) { s.nrs_pso_opaque->Release(); s.nrs_pso_opaque = nullptr; }
         if (s.nrs_heap     != nullptr) { s.nrs_heap->Release();     s.nrs_heap     = nullptr; }
+        // R376 carry resources (null unless PrismCarry=1 armed and ran)
+        if (s.carry_pso    != nullptr) { s.carry_pso->Release();    s.carry_pso    = nullptr; }
+        if (s.carry_rs     != nullptr) { s.carry_rs->Release();     s.carry_rs     = nullptr; }
+        if (s.carry_heap   != nullptr) { s.carry_heap->Release();   s.carry_heap   = nullptr; }
+        if (s.carry_prev   != nullptr) { s.carry_prev->Release();   s.carry_prev   = nullptr; }
+        if (s.carry_depth  != nullptr) { s.carry_depth->Release();  s.carry_depth  = nullptr; }
         if (s.nrs_color    != nullptr) { s.nrs_color->Release();    s.nrs_color    = nullptr; }
         if (s.nrs_out      != nullptr) { s.nrs_out->Release();      s.nrs_out      = nullptr; }
         // E2 probe resources (null unless the scale path ran)
@@ -15159,6 +15195,242 @@ namespace
         s.nl->Dispatch((s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u);
     }
 
+    // R376: PrismCarry - the 1.1-era cross-frame temporal carry, rebuilt.
+    //
+    // One small compute pass on the FINAL composited picture (tex_out), after
+    // pfinish: out = depth-gated lerp(current, carried_previous, blend). When
+    // the depth at a pixel moved by more than carry_tol, the gate opens and
+    // the pixel keeps the fresh NR result - motion is never smeared. When the
+    // scene is still (RE2 standing in a dark room), the gate stays shut and
+    // the 50% blend forces the NR feedback loop's gain below 1: the boiling
+    // dies out instead of ringing.
+    //
+    // Own descriptor heap (4 slots) - the per-pass NRS heap's 10-slots-per-pass
+    // layout is fully spoken for and must not be touched. Own PSO on the
+    // downsample root signature (1 SRV table + 4 constants is NOT enough here:
+    // 2 SRV + 2 UAV), so a dedicated root signature with TWO descriptor tables
+    // is created at first use, mirroring nrs_build_one's static sampler-free
+    // layout: table0 = SRVs, table1 = UAVs, 4 constants at root index 2.
+    //
+    // Seeding: the first frame after (re)creation passes gTol = -1, which the
+    // gate test abs(dc-dp) <= gTol can never satisfy - the shader writes the
+    // fresh picture straight through and initialises both carry textures.
+    // No clears, no upload heap, no extra command lists.
+    typedef HRESULT (WINAPI *pfn_d3dcompile_r376)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,
+                                                  ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
+                                                  ID3DBlob **, ID3DBlob **);
+    static const char *const kCarryHlsl =
+        "Texture2D<float4> gCur : register(t0);\n"
+        "Texture2D<float>  gDpC : register(t1);\n"
+        "RWTexture2D<float4> gOut : register(u0);\n"
+        "RWTexture2D<float>  gDpO : register(u1);\n"
+        "cbuffer C { uint gW; uint gH; float gBlend; float gTol; };\n"
+        "[numthreads(8,8,1)] void CS(uint3 id : SV_DispatchThreadID) {\n"
+        "    if (id.x >= gW || id.y >= gH) return;\n"
+        "    float4 n = gCur[id.xy];\n"
+        "    float dc = gDpC[id.xy];\n"
+        "    float4 o = n;\n"
+        "    if (abs(dc - gDpO[id.xy]) <= gTol)\n"
+        "        o = lerp(n, gOut[id.xy], gBlend);\n"
+        "    gOut[id.xy] = o;\n"
+        "    gDpO[id.xy] = dc;\n"
+        "}\n";
+
+    static bool nrs_carry_arm(stream_state &s, unsigned w, unsigned h, DXGI_FORMAT fmt)
+    {
+        if (s.carry_pso == nullptr)
+        {
+            HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+            pfn_d3dcompile_r376 compile = (dc != nullptr)
+                ? (pfn_d3dcompile_r376)GetProcAddress(dc, "D3DCompile") : nullptr;
+            if (compile == nullptr)
+            {
+                mgpu::diag::warn("[MGPU][R376] d3dcompiler_47 unavailable - PrismCarry off");
+                s.carry_on = 0u;
+                return false;
+            }
+            ID3DBlob *code = nullptr, *err = nullptr;
+            const HRESULT hr = compile(kCarryHlsl, strlen(kCarryHlsl), "r376_carry", nullptr, nullptr,
+                                       "CS", "cs_5_0", 0, 0, &code, &err);
+            if (FAILED(hr) || code == nullptr)
+            {
+                mgpu::diag::warn("[MGPU][R376] carry shader compile failed - PrismCarry off");
+                if (err != nullptr) err->Release();
+                s.carry_on = 0u;
+                return false;
+            }
+            // Root signature: table0 = 2 SRVs, table1 = 2 UAVs, 4 constants.
+            D3D12_DESCRIPTOR_RANGE srv[1]{}, uav[1]{}, *rp = nullptr;
+            srv[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+            srv[0].NumDescriptors = 2;
+            srv[0].BaseShaderRegister = 0;
+            srv[0].RegisterSpace = 0;
+            srv[0].OffsetInDescriptorsFromTableStart = 0;
+            uav[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+            uav[0].NumDescriptors = 2;
+            uav[0].BaseShaderRegister = 0;
+            uav[0].RegisterSpace = 0;
+            uav[0].OffsetInDescriptorsFromTableStart = 0;
+            D3D12_ROOT_PARAMETER rp_[3]{};
+            rp_[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp_[0].DescriptorTable.NumDescriptorRanges = 1;
+            rp_[0].DescriptorTable.pDescriptorRanges = srv;
+            rp_[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            rp_[1].DescriptorTable.NumDescriptorRanges = 1;
+            rp_[1].DescriptorTable.pDescriptorRanges = uav;
+            rp_[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+            rp_[2].Constants.Num32BitValues = 4;
+            rp_[2].Constants.ShaderRegister = 0;
+            rp_[2].Constants.RegisterSpace = 0;
+            D3D12_ROOT_SIGNATURE_DESC rsd{};
+            rsd.NumParameters = 3;
+            rsd.pParameters = rp_;
+            rsd.NumStaticSamplers = 0;
+            rsd.pStaticSamplers = nullptr;
+            rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+            ID3DBlob *rsb = nullptr, *rse = nullptr;
+            typedef HRESULT (WINAPI *pfn_ser)(const D3D12_ROOT_SIGNATURE_DESC *, const D3D12_ROOT_SIGNATURE_DESC *,
+                                            ID3DBlob **, ID3DBlob **);
+            pfn_ser serialize = nullptr;
+            if (dc != nullptr)
+                serialize = (pfn_ser)GetProcAddress(dc, "D3D12SerializeRootSignature");
+            HRESULT hr2 = E_FAIL;
+            ID3D12RootSignature *rs = nullptr;
+            if (serialize != nullptr && SUCCEEDED(serialize(&rsd, nullptr, &rsb, &rse)) && rsb != nullptr)
+                hr2 = s.nrs_dev->CreateRootSignature(0, rsb->GetBufferPointer(), rsb->GetBufferSize(), IID_PPV_ARGS(&rs));
+            if (rsb != nullptr) rsb->Release();
+            if (rse != nullptr) rse->Release();
+            if (FAILED(hr2) || rs == nullptr)
+            {
+                mgpu::diag::warn("[MGPU][R376] carry root signature failed - PrismCarry off");
+                code->Release();
+                s.carry_on = 0u;
+                return false;
+            }
+            D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+            pd.pRootSignature = rs;
+            pd.CS.pShaderBytecode = code->GetBufferPointer();
+            pd.CS.BytecodeLength = code->GetBufferSize();
+            const HRESULT hr3 = s.nrs_dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.carry_pso));
+            s.carry_rs = rs;   // kept alive; released at stream shutdown
+            code->Release();
+            if (FAILED(hr3))
+            {
+                mgpu::diag::warn("[MGPU][R376] carry PSO failed - PrismCarry off");
+                s.carry_on = 0u;
+                return false;
+            }
+            mgpu::diag::info("[MGPU][R376] carry pass armed (2 SRV + 2 UAV, depth-gated lerp)");
+        }
+        if (s.carry_heap == nullptr)
+        {
+            D3D12_DESCRIPTOR_HEAP_DESC hd{};
+            hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+            hd.NumDescriptors = 4;
+            hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+            if (FAILED(s.nrs_dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.carry_heap))))
+            {
+                mgpu::diag::warn("[MGPU][R376] carry descriptor heap failed - PrismCarry off");
+                s.carry_on = 0u;
+                return false;
+            }
+        }
+        if (s.carry_prev != nullptr && (s.carry_w != w || s.carry_h != h))
+        {
+            s.carry_prev->Release(); s.carry_prev = nullptr;
+            s.carry_depth->Release(); s.carry_depth = nullptr;
+            s.carry_valid = false;
+        }
+        if (s.carry_prev == nullptr)
+        {
+            HRESULT hr = make_tex(s.nrs_dev, w, h, fmt,
+                                  D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.carry_prev);
+            if (SUCCEEDED(hr))
+                hr = make_tex(s.nrs_dev, w, h, DXGI_FORMAT_R32_FLOAT,
+                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &s.carry_depth);
+            if (FAILED(hr) || s.carry_prev == nullptr || s.carry_depth == nullptr)
+            {
+                mgpu::diag::warn("[MGPU][R376] carry textures failed - PrismCarry off");
+                if (s.carry_prev != nullptr) { s.carry_prev->Release(); s.carry_prev = nullptr; }
+                if (s.carry_depth != nullptr) { s.carry_depth->Release(); s.carry_depth = nullptr; }
+                s.carry_on = 0u;
+                return false;
+            }
+            s.carry_w = w; s.carry_h = h;
+            s.carry_prev_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            s.carry_depth_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            s.carry_valid = false;   // seed on the next dispatch
+        }
+        return true;
+    }
+
+    static void nrs_carry_pass(stream_state &s, ID3D12Resource *out, ID3D12Resource *depth,
+                               unsigned long long f)
+    {
+        if (s.nl == nullptr || out == nullptr || depth == nullptr || s.nrs_dev == nullptr) return;
+        const D3D12_RESOURCE_DESC od = out->GetDesc();
+        const unsigned w = (unsigned)od.Width, h = od.Height;
+        if (!nrs_carry_arm(s, w, h, od.Format)) return;
+        const bool seed = !s.carry_valid;
+        // tex_out was just written (compose / pfinish) - flush as UAV, then
+        // let the carry shader read it as an SRV.
+        {
+            D3D12_RESOURCE_BARRIER ub{};
+            ub.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+            ub.UAV.pResource = out;
+            s.nl->ResourceBarrier(1, &ub);
+        }
+        barrier(s.nl, out, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        ID3D12DescriptorHeap *heaps[1] = { s.carry_heap };
+        s.nl->SetDescriptorHeaps(1, heaps);
+        s.nl->SetPipelineState(s.carry_pso);
+        if (s.carry_rs != nullptr) s.nl->SetComputeRootSignature(s.carry_rs);
+        D3D12_CPU_DESCRIPTOR_HANDLE cpu = s.carry_heap->GetCPUDescriptorHandleForHeapStart();
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu = s.carry_heap->GetGPUDescriptorHandleForHeapStart();
+        nrs_make_srv(s.nrs_dev, out, cpu, od.Format);                                   // t0
+        D3D12_CPU_DESCRIPTOR_HANDLE c1 = cpu; c1.ptr += s.nrs_inc;
+        nrs_make_srv(s.nrs_dev, depth, c1, DXGI_FORMAT_R32_FLOAT);                      // t1
+        D3D12_CPU_DESCRIPTOR_HANDLE c2 = cpu; c2.ptr += 2u * s.nrs_inc;
+        nrs_make_uav(s.nrs_dev, s.carry_prev, c2, od.Format);                           // u0
+        D3D12_CPU_DESCRIPTOR_HANDLE c3 = cpu; c3.ptr += 3u * s.nrs_inc;
+        nrs_make_uav(s.nrs_dev, s.carry_depth, c3, DXGI_FORMAT_R32_FLOAT);              // u1
+        s.nl->SetComputeRootDescriptorTable(0, gpu);
+        D3D12_GPU_DESCRIPTOR_HANDLE gpu1 = gpu; gpu1.ptr += 2u * s.nrs_inc;
+        s.nl->SetComputeRootDescriptorTable(1, gpu1);
+        unsigned cwh[4];
+        cwh[0] = w; cwh[1] = h;
+        float b = s.carry_blend;
+        float t = seed ? -1.0f : s.carry_tol;   // -1: gate can never pass, straight copy + seed
+        memcpy(&cwh[2], &b, 4);
+        memcpy(&cwh[3], &t, 4);
+        s.nl->SetComputeRoot32BitConstants(2, 4, cwh, 0);
+        s.nl->Dispatch((w + 7u) / 8u, (h + 7u) / 8u, 1u);
+        // Flush the RMW, then carry_prev -> tex_out so the presented picture is
+        // the carried one and the chain continues from it next frame.
+        {
+            D3D12_RESOURCE_BARRIER ub[2]{};
+            ub[0].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; ub[0].UAV.pResource = s.carry_prev;
+            ub[1].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; ub[1].UAV.pResource = s.carry_depth;
+            s.nl->ResourceBarrier(2, ub);
+        }
+        barrier(s.nl, out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                D3D12_RESOURCE_STATE_COPY_DEST);
+        barrier(s.nl, s.carry_prev, s.carry_prev_state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        D3D12_TEXTURE_COPY_LOCATION cs{}, cd{};
+        cs.pResource = s.carry_prev; cs.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; cs.SubresourceIndex = 0;
+        cd.pResource = out;          cd.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; cd.SubresourceIndex = 0;
+        s.nl->CopyTextureRegion(&cd, 0, 0, 0, &cs, nullptr);
+        s.carry_prev_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        barrier(s.nl, s.carry_prev, s.carry_prev_state, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        s.carry_prev_state = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        barrier(s.nl, out, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        s.carry_valid = true;
+        (void)f;
+    }
+
     // Apply staged per-pass scales after 250 ms of slider stillness. Defined
     // here because B1's GPU0 producer calls it as well as the legacy consumer.
     static void nrs_flush_staged_scales(stream_state &s)
@@ -15442,6 +15714,19 @@ namespace
             s.nrs_res_depth = !ini_has_key("NRScaleResolveDepth") ||
                               ini_read_flag("NRScaleResolveDepth");   // absent = unchanged
             s.nrs_all = ini_has_key("NRSPass") && ini_read_float("NRSPass", 1.0f) >= 2.0f;   // R354
+            // R376: 1.1's anti-boil carry. Absent = 0: the pass below never runs and
+            // every published-2.4 instruction is byte-identical.
+            s.carry_on  = ini_has_key("PrismCarry") ? (ini_read_float("PrismCarry", 0.0f) != 0.0f ? 1u : 0u) : 0u;
+            s.carry_blend = ini_read_float("PrismCarryBlend", 0.50f);
+            if (s.carry_blend < 0.0f) s.carry_blend = 0.0f;
+            if (s.carry_blend > 0.95f) s.carry_blend = 0.95f;   // keep the feedback gain < 1
+            s.carry_tol = ini_read_float("PrismCarryDepthTol", 0.02f);
+            if (s.carry_tol < 0.0f) s.carry_tol = 0.0f;
+            s.carry_valid = false;
+            if (s.carry_on != 0u)
+                mgpu::diag::info("[MGPU][R376] PrismCarry=1: 1.1-era cross-frame temporal carry armed "
+                                 "(blend=0.50, depthTol=0.02) - damps NR feedback oscillation; "
+                                 "depth-gated, motion is never smeared.");
             // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
             // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
             const bool nrs_want = ini_has_key("NRScale") &&
@@ -28010,6 +28295,19 @@ void stream_poll()
                             ++s.nr_evals;
                             if (mgpu::pfinish::active() && mgpu::pfinish::look() != 0u)
                                 mgpu::pfinish::apply(s.nl, ii, s.tex_out, s.tex_in[ii], true);
+                            // R376: 1.1's anti-boil carry, on the finished neural
+                            // picture only. depth_here guarantees tex_depth[ii] is
+                            // in NON_PIXEL_SHADER_RESOURCE THIS frame (unpack at
+                            // T1b). No depth, no carry - blending without the gate
+                            // would smear motion.
+                            if (s.carry_on != 0u && depth_here)
+                                nrs_carry_pass(s, s.tex_out, s.tex_depth[ii], f);
+                            else if (s.carry_on != 0u && (s.carry_skip_logged & 1u) == 0u)
+                            {
+                                s.carry_skip_logged |= 1u;
+                                mgpu::diag::warn("[MGPU][R376] carry skipped: no depth this frame "
+                                                 "(depth_here=0) - no gate, no blend.");
+                            }
                         }
                         if (s.local_nr_unpacks <= 4ull || s.local_nr_unpacks % 120ull == 0ull)
                         {
