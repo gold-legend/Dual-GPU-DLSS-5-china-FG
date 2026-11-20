@@ -36,7 +36,6 @@
 #include "prism_finish.hpp"
 #include "prism_sync.hpp"
 #include "prism_x1_multi.hpp"
-#include "fg_gpu1.hpp"
 #include "skinguard.hpp"
 #include "prism_grade.h"
 #include "residual.hpp"
@@ -202,60 +201,8 @@ bool gameClipped = false;  // the game's cursor clip, restored on close
 
 SHORT WINAPI HkAsyncKey(int vk) { return blocking && !FromSelf(_ReturnAddress()) ? 0 : realAsyncKey(vk); }
 
-// R243c: the DPI-unaware game's activation resize can bypass even
-// WM_WINDOWPOSCHANGING (SWP_NOSENDCHANGING / DXGI ResizeTarget both do). Hook
-// SetWindowPos itself: every sizing path funnels through it, including DXGI's
-// internal call. While the DComp overlay is on, the game window must cover its
-// monitor - pin any other size to the monitor before the real call.
-//
-// A monitor-sized OUTER rectangle is not a monitor-sized CLIENT rectangle while
-// the game still has a caption / thick frame. On RE2 DX12, repinning first made
-// the engine create a transient 3816x2096 chain inside 3840x2160; its 24x64
-// black border then survived the later full-size chain. Remove the non-client
-// frame BEFORE any repin, so the engine computes the client extent correctly.
-static void r243_make_borderless(HWND h)
-{
-    if (h == nullptr) return;
-    const LONG_PTR mask = WS_CAPTION | WS_BORDER | WS_THICKFRAME |
-                          WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
-    const LONG_PTR style = GetWindowLongPtrW(h, GWL_STYLE);
-    if ((style & mask) == 0) return;
-    SetWindowLongPtrW(h, GWL_STYLE, (style & ~mask) | WS_POPUP);
-    static std::atomic<unsigned> r243e_n{0};
-    const unsigned n = r243e_n.fetch_add(1) + 1;
-    if (n <= 8u)
-        LOG("[MGPU][R243e] removed the game window's non-client frame BEFORE sizing: style 0x%llx -> 0x%llx (%u so far)",
-            (unsigned long long)style, (unsigned long long)((style & ~mask) | WS_POPUP), n);
-}
 static BOOL WINAPI HkSetWindowPos(HWND h, HWND after, int x, int y, int cx, int cy, UINT flags)
 {
-    if (!FromSelf(_ReturnAddress()) && !(flags & SWP_NOSIZE))
-    {
-        void *gw = mgpu::gpu1::dcomp_game_hwnd();
-        if (gw && h == (HWND)gw && mgpu::gpu1::dcomp_overlay_mode())
-        {
-            r243_make_borderless(h);
-            HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
-            MONITORINFO mi{};
-            mi.cbSize = sizeof mi;
-            if (GetMonitorInfoW(mon, &mi))
-            {
-                const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
-                const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-                if (cx != mw || cy != mh)
-                {
-                    static std::atomic<unsigned> r243c_n{0};
-                    const unsigned n = r243c_n.fetch_add(1) + 1;
-                    if (n <= 8u || (n % 100u) == 0u)
-                        LOG("[MGPU][R243c] SetWindowPos %dx%d -> monitor %dx%d (%u so far)", cx, cy, mw, mh, n);
-                    x = mi.rcMonitor.left;
-                    y = mi.rcMonitor.top;
-                    cx = mw;
-                    cy = mh;
-                }
-            }
-        }
-    }
     return realSetWindowPosSWP(h, after, x, y, cx, cy, flags);
 }
 SHORT WINAPI HkKeyState(int vk) { return blocking && !FromSelf(_ReturnAddress()) ? 0 : realKeyState(vk); }
@@ -286,6 +233,31 @@ BOOL WINAPI HkSetCursorPos(int x, int y)
     }
     return realSetCursorPos(x, y);
 }
+// Convert a clip rect to physical screen pixels. DPI-unaware games (RE2)
+// pass LOGICAL rects (2194x1234 on this 175% rig); if such a rect reaches
+// ClipCursor on a thread whose awareness was raised (by any component), the
+// values are misread as PHYSICAL and the cursor is trapped in the top-left
+// corner of the 4K screen - measured live as clip 0,0->2194,1234 physical.
+// Reading the CALLING thread's awareness makes the conversion exact in both
+// cases and removes all dependence on whichever thread happens to call.
+static RECT clip_rect_to_physical(const RECT &r)
+{
+    if (GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) != DPI_AWARENESS_UNAWARE)
+        return r;   // aware caller: values are already physical
+    UINT dpi = 168;
+    int sysDpi = 96;
+    const DPI_AWARENESS_CONTEXT prev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (HWND gw = (HWND)mgpu::gpu1::dcomp_game_hwnd()) dpi = GetDpiForWindow(gw);
+    if (HDC dc = GetDC(nullptr)) { sysDpi = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(nullptr, dc); }
+    SetThreadDpiAwarenessContext(prev);
+    if (dpi == 0 || sysDpi == 0 || dpi == (UINT)sysDpi) return r;
+    const double k = (double)dpi / (double)sysDpi;
+    RECT o;
+    o.left = (int)std::lround(r.left * k); o.top = (int)std::lround(r.top * k);
+    o.right = (int)std::lround(r.right * k); o.bottom = (int)std::lround(r.bottom * k);
+    return o;
+}
+
 BOOL WINAPI HkClipCursor(const RECT *r)
 {
     if (blocking && !FromSelf(_ReturnAddress()))
@@ -294,7 +266,15 @@ BOOL WINAPI HkClipCursor(const RECT *r)
         if (r) gameClip = *r;
         return TRUE;
     }
-    return realClipCursor(r);
+    RECT fixed{};
+    const RECT *pr = nullptr;
+    if (r) { fixed = clip_rect_to_physical(*r); pr = &fixed; }
+    // Apply on a per-monitor-aware thread so the physical values are taken
+    // literally; the game's own thread awareness no longer matters.
+    const DPI_AWARENESS_CONTEXT prev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const BOOL ok = realClipCursor(pr);
+    SetThreadDpiAwarenessContext(prev);
+    return ok;
 }
 // Movement, presses and the wheel are taken out; releases stay, so nothing held when the panel
 // opened is left stuck down in the game.
@@ -406,8 +386,94 @@ std::atomic<uint32_t> ownKeySeen[8] = {};
 // key and applying the delta's parity per poll makes both a tap and a hold exactly one toggle.
 std::atomic<unsigned> ownPressSeq{0};   // bumped on every NON-REPEAT KEYDOWN of cfg.key
 
+struct DpiSizeTranslation
+{
+    int game_w = 0, game_h = 0;
+    int logical_w = 0, logical_h = 0;
+    bool pending = false;
+};
+static thread_local DpiSizeTranslation dpi_size;
+
+static void translate_dpi_unaware_game_size(HWND h, UINT m, LPARAM &l)
+{
+    if (!mgpu::gpu1::dcomp_overlay_mode() || h != (HWND)mgpu::gpu1::dcomp_game_hwnd() ||
+        GetAwarenessFromDpiAwarenessContext(GetWindowDpiAwarenessContext(h)) != DPI_AWARENESS_UNAWARE) return;
+    if (m == WM_WINDOWPOSCHANGING && l)
+    {
+        WINDOWPOS *pos = reinterpret_cast<WINDOWPOS *>(l);
+        if ((pos->flags & SWP_NOSIZE) || pos->cx <= 0 || pos->cy <= 0) return;
+        RECT current{};
+        if (pos->flags == 0 && GetClientRect(h, &current) &&
+            pos->cx == current.right - current.left && pos->cy == current.bottom - current.top)
+        {
+            // Windows repeats the DPI-unaware activation size once more after the
+            // real resolution change. The host already has exactly this extent;
+            // treating the duplicate as a new game resolution would shrink twice.
+            pos->flags |= SWP_NOSIZE;
+            dpi_size.pending = false;
+            LOG("[MGPU][R243-DPI] ignored duplicate automatic host sizing %dx%d", pos->cx, pos->cy);
+            return;
+        }
+        HMONITOR monitor = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO logical{}, physical{};
+        logical.cbSize = sizeof logical;
+        physical.cbSize = sizeof physical;
+        if (!GetMonitorInfoW(monitor, &logical)) return;
+        const DPI_AWARENESS_CONTEXT previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        const BOOL have_physical = GetMonitorInfoW(monitor, &physical);
+        SetThreadDpiAwarenessContext(previous);
+        if (!have_physical) return;
+        const int logical_monitor_w = logical.rcMonitor.right - logical.rcMonitor.left;
+        const int logical_monitor_h = logical.rcMonitor.bottom - logical.rcMonitor.top;
+        const int physical_monitor_w = physical.rcMonitor.right - physical.rcMonitor.left;
+        const int physical_monitor_h = physical.rcMonitor.bottom - physical.rcMonitor.top;
+        if (logical_monitor_w <= 0 || logical_monitor_h <= 0 || physical_monitor_w <= 0 || physical_monitor_h <= 0) return;
+        const int converted_w = std::max(1, MulDiv(pos->cx, logical_monitor_w, physical_monitor_w));
+        const int converted_h = std::max(1, MulDiv(pos->cy, logical_monitor_h, physical_monitor_h));
+        if (converted_w == pos->cx && converted_h == pos->cy) return;
+        dpi_size.game_w = pos->cx;
+        dpi_size.game_h = pos->cy;
+        dpi_size.logical_w = converted_w;
+        dpi_size.logical_h = converted_h;
+        dpi_size.pending = true;
+        pos->cx = converted_w;
+        pos->cy = converted_h;
+        LOG("[MGPU][R243-DPI] translated host extent to %dx%d logical; game extent stays %dx%d",
+            converted_w, converted_h, dpi_size.game_w, dpi_size.game_h);
+    }
+    else if (m == WM_SIZE && dpi_size.pending &&
+             LOWORD(l) == (DWORD)dpi_size.logical_w && HIWORD(l) == (DWORD)dpi_size.logical_h)
+    {
+        l = (LPARAM)MAKELPARAM(dpi_size.game_w, dpi_size.game_h);
+        dpi_size.pending = false;
+        LOG("[MGPU][R243-DPI] WM_SIZE restored to game extent %dx%d", dpi_size.game_w, dpi_size.game_h);
+    }
+}
+
 LRESULT CALLBACK HkWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+    if (m == WM_SIZE || m == WM_DPICHANGED || m == WM_WINDOWPOSCHANGING)
+    {
+        static std::atomic<unsigned> geometryLogCount{0};
+        const unsigned n = geometryLogCount.fetch_add(1, std::memory_order_relaxed);
+        if (n < 64)
+        {
+            RECT logical{}, physical{};
+            GetClientRect(h, &logical);
+            const DPI_AWARENESS_CONTEXT previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            GetClientRect(h, &physical);
+            const UINT dpi = GetDpiForWindow(h);
+            SetThreadDpiAwarenessContext(previous);
+            const WINDOWPOS *pos = (m == WM_WINDOWPOSCHANGING) ? reinterpret_cast<const WINDOWPOS *>(l) : nullptr;
+            LOG("[MGPU][R243-DPI] wnd msg=0x%04x hwnd=%p tid=%lu logical=%ldx%ld physical=%ldx%ld dpi=%u "
+                "size=%ldx%ld requested=%dx%d flags=0x%x",
+                m, (void *)h, GetCurrentThreadId(),
+                (long)(logical.right - logical.left), (long)(logical.bottom - logical.top),
+                (long)(physical.right - physical.left), (long)(physical.bottom - physical.top), dpi,
+                (long)LOWORD(l), (long)HIWORD(l), pos ? pos->cx : 0, pos ? pos->cy : 0, pos ? pos->flags : 0u);
+        }
+    }
+    translate_dpi_unaware_game_size(h, m, l);
     if (m == WM_MOUSEWHEEL) wheel += GET_WHEEL_DELTA_WPARAM(w);
     switch (m)
     {
@@ -460,43 +526,6 @@ LRESULT CALLBACK HkWndProc(HWND h, UINT m, WPARAM w, LPARAM l)
         for (auto &k : ownKey) k.store(0, std::memory_order_relaxed);
         ownKeySeq.fetch_add(1, std::memory_order_relaxed);
         break;
-    case WM_WINDOWPOSCHANGING: {
-        // R243b: DPI-unaware titles (RE2 on a 150% display) resize their window to
-        // the virtualized screen size on EVERY activation / alt-tab, and the shrink
-        // does NOT ride on set_fullscreen_state - it arrives straight through
-        // SetWindowPos/MoveWindow, which both funnel WM_WINDOWPOSCHANGING here.
-        // Pin the game window to its monitor before the game sees the message, so
-        // the DComp composition never loses coverage. Size-changing messages only.
-        if (mgpu::gpu1::dcomp_overlay_mode() && h == gameWnd && l)
-        {
-            WINDOWPOS *wp = (WINDOWPOS *)l;
-            if (!(wp->flags & SWP_NOSIZE))
-            {
-                r243_make_borderless(h);
-                HMONITOR mon = MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST);
-                MONITORINFO mi{};
-                mi.cbSize = sizeof mi;
-                if (GetMonitorInfoW(mon, &mi))
-                {
-                    const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
-                    const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-                    if (wp->cx != mw || wp->cy != mh)
-                    {
-                        const int ox = wp->cx, oy = wp->cy;
-                        wp->x = mi.rcMonitor.left;
-                        wp->y = mi.rcMonitor.top;
-                        wp->cx = mw;
-                        wp->cy = mh;
-                        static std::atomic<unsigned> r243b_n{0};
-                        const unsigned n = r243b_n.fetch_add(1) + 1;
-                        if (n <= 8u || (n % 100u) == 0u)
-                            LOG("[MGPU][R243b] WM_WINDOWPOSCHANGING %dx%d -> monitor %dx%d (%u so far)", ox, oy, mw, mh, n);
-                    }
-                }
-            }
-        }
-        break;
-    }
     default:
         break;
     }
@@ -545,9 +574,16 @@ void SetBlocking(bool on)
 {
     if (on == blocking) return;
     LOG("[MGPU][POV][INPUT-GUARD] game input %s", on ? "BLOCKED (visible panel)" : "RELEASED");
+    // Save and restore the game's cursor clip in ONE fixed coordinate space.
+    // GetClipCursor/ClipCursor return/interpret the rect in the CALLING
+    // thread's DPI awareness. Saving on an unaware thread (logical 2194x1234)
+    // and restoring on a per-monitor-aware one installed those logical values
+    // as a PHYSICAL clip - the cursor was trapped in the top-left corner of
+    // the 4K screen until the game happened to re-clip. Pin both calls to
+    // DPI-unaware so the round trip reproduces the game's own clip exactly.
+    const DPI_AWARENESS_CONTEXT clipPrev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
     if (on)
     {
-        realGetCursorPos(&frozenCursor);
         RECT clip, desk;
         GetClipCursor(&clip);
         GetWindowRect(GetDesktopWindow(), &desk);
@@ -560,8 +596,12 @@ void SetBlocking(bool on)
     {
         blocking = false;
         if (gameClipped) realClipCursor(&gameClip);
-        realSetCursorPos(frozenCursor.x, frozenCursor.y);
     }
+    SetThreadDpiAwarenessContext(clipPrev);
+    if (on)
+        realGetCursorPos(&frozenCursor);
+    else
+        realSetCursorPos(frozenCursor.x, frozenCursor.y);
 }
 
 // ------------------------------------------------------------------ draw list
@@ -1602,6 +1642,48 @@ struct OvStats
     unsigned outW = 0, outH = 0, netW = 0, netH = 0;
 } g_stats;
 
+// The panel used to report the logical window size (2194x1234 at 175% DPI)
+// as the output. The actual present chain is physical pixels, so when the
+// game window covers the monitor we report the monitor's physical size.
+static void physical_output_extent(unsigned fallback_w, unsigned fallback_h,
+                                   unsigned &out_w, unsigned &out_h)
+{
+    out_w = fallback_w;
+    out_h = fallback_h;
+
+    HWND host = (HWND)mgpu::gpu1::dcomp_game_hwnd();
+    if (host == nullptr) return;
+
+    HMONITOR monitor = MonitorFromWindow(host, MONITOR_DEFAULTTONEAREST);
+    if (monitor == nullptr) return;
+
+    RECT client{};
+    MONITORINFO mi{};
+    mi.cbSize = sizeof mi;
+
+    const DPI_AWARENESS_CONTEXT previous =
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const BOOL client_ok = GetClientRect(host, &client);
+    const BOOL monitor_ok = GetMonitorInfoW(monitor, &mi);
+    SetThreadDpiAwarenessContext(previous);
+
+    if (!client_ok || !monitor_ok) return;
+
+    const int cw = client.right - client.left;
+    const int ch = client.bottom - client.top;
+    const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
+    const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+    if (cw <= 0 || ch <= 0 || mw <= 0 || mh <= 0) return;
+
+    // A fullscreen physical client rect may be 3839x2159; as long as it
+    // substantially covers the monitor, report the physical monitor size.
+    if (cw >= mw - 2 && ch >= mh - 2)
+    {
+        out_w = (unsigned)mw;
+        out_h = (unsigned)mh;
+    }
+}
+
 void ReadSet(OvSet &s)
 {
     mgpu::gpu1::ui_state st;
@@ -1622,6 +1704,7 @@ void ReadSet(OvSet &s)
     s.splitPos = st.split_pos;
     s.outW = st.nrs_native_w;
     s.outH = st.nrs_native_h;
+    physical_output_extent(st.nrs_native_w, st.nrs_native_h, s.outW, s.outH);
     s.netW = st.nrs_work_w;
     s.netH = st.nrs_work_h;
     if (mgpu::pfinish::active())
@@ -2011,7 +2094,7 @@ std::wstring RowHelp(int r, const OvSet &s, int option)
     case kSplit:
         return L"左边原画，右边神经画面。面板打开时可以拖动画面上的分割线。";
     case kFrameGen:
-        return L"在最终神经画面之后运行副卡 DLSS 帧生成 4x，使用真实运动向量、深度和相机输入。切换后必须重启游戏才生效；默认关闭，Dynamic 不自动开启。";
+        return L"在最终神经画面之后运行副卡 DLSS 帧生成，使用真实运动向量、深度和相机输入。2x 每真实帧生成 1 帧；4x 每真实帧生成 3 帧（需驱动 DLSSG MultiFrameCount>=3，不支持时自动退回 2x）。切换后必须重启游戏才生效；默认关闭，Dynamic 不自动开启。";
     }
     return L"";
 }
@@ -2093,8 +2176,7 @@ void DrawPanel(UINT bw, UINT bh, float dt)
     // Header: name, version, state.
     {
         const float cy = y0 + std::round((headH - LineHeight(kTitle)) * 0.5f);
-        const float nw = Text(x0 + pad, cy, L"MGPU Prism 2.2", kTitle, kWhite);
-        Text(x0 + pad + nw + U(8), cy + U(2), L"0.4", kLabel, kQuiet);
+        Text(x0 + pad, cy, L"MGPU Prism 2.4", kTitle, kWhite);
         const wchar_t *state;
         uint32_t mark;
         if (!s.armed)
@@ -2167,14 +2249,9 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         }
         const float sizeY = vy + LineHeight(kValue) + U(6);
         Text(gx0, sizeY, sizes, kLabel, kQuiet);
-        wchar_t rateText[160];
-        const double fg_fps = mgpu::fg::display_fps();
-        if (fg_fps > 0.0)
-            std::swprintf(rateText, 160, L"神经计算 %.1f fps　·　游戏生产 %.1f fps　·　显示 %.1f fps（含帧生成）",
-                          (double)g_stats.evalFps, (double)g_stats.renderFps, fg_fps);
-        else
-            std::swprintf(rateText, 160, L"神经计算 %.1f fps　·　游戏生产 %.1f fps",
-                          (double)g_stats.evalFps, (double)g_stats.renderFps);
+        wchar_t rateText[128];
+        std::swprintf(rateText, 128, L"神经计算 %.1f fps　·　游戏生产 %.1f fps",
+                      (double)g_stats.evalFps, (double)g_stats.renderFps);
         Text(gx0, sizeY + LineHeight(kLabel) + U(2), rateText, kLabel, kQuiet);
         y += telH;
         Fill(x0, y - t, x1, y, kHair);
@@ -2451,26 +2528,28 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             break;
         }
         case kFrameGen: {
-            const int cur = mgpu::gpu1::ui_ini_read("FrameGen", 0) == 4 ? 1 : 0;
-            clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"关", L"4x"}, cur, 3, 0, &hover, dt, true);
+            const int cur = mgpu::gpu1::ui_ini_read("FrameGen", 0) == 4
+                ? (mgpu::gpu1::ui_ini_read("FGX", 2) == 4 ? 2 : 1) : 0;
+            clicked = Segments(r, cx1 - U(180), sy, cx1, sh, {L"关", L"2x", L"4x"}, cur, 3, 0, &hover, dt, true);
             int want = clicked;
-            if (keyStep) want = step > 0 ? 1 : 0;
-            if (focused && in.enter) want = 1 - cur;
+            if (keyStep) want = step > 0 ? (cur + 1) % 3 : (cur + 2) % 3;
+            if (focused && in.enter) want = (cur + 1) % 3;
             if (want >= 0 && want != cur)
             {
-                if (want == 1)
+                if (want == 1 || want == 2)
                 {
                     // Official 0.6.0 DLSS-FG defaults. Dynamic stays as the user
                     // configured it; this switch never enables it implicitly.
-                    (void)mgpu::gpu1::ui_ini_write("FGMulti", 4);
-                    (void)mgpu::gpu1::ui_ini_write("FGPhase", 75);
+                    (void)mgpu::gpu1::ui_ini_write("FGMulti", 2);
+                    if (want == 1) (void)mgpu::gpu1::ui_ini_write("FGPhase", 75);
                     (void)mgpu::gpu1::ui_ini_write("FGMvScaleNow", 1);
                     (void)mgpu::gpu1::ui_ini_write("FGMvUnit", 1);
                     (void)mgpu::gpu1::ui_ini_write("FGSkipCarry", 1);
                     (void)mgpu::gpu1::ui_ini_write("FGPace", 1);
                     (void)mgpu::gpu1::ui_ini_write("FGSkipJump", 0);
+                    (void)mgpu::gpu1::ui_ini_write("FGX", want == 2 ? 4 : 2);
                     (void)mgpu::gpu1::ui_ini_write("FrameGen", 4);
-                    Toast(L"帧生成 4x 已保存，重启游戏后生效", kCaution, 3.0);
+                    Toast(want == 2 ? L"帧生成 4x 已保存，重启游戏后生效" : L"帧生成 2x 已保存，重启游戏后生效", kCaution, 3.0);
                 }
                 else
                 {
@@ -3315,40 +3394,6 @@ void on_present(void *queue_native, void *sc_native)
         if (displayChain != nullptr && displayChain != (void *)sc) return;
     }
     PollInput(bw, bh, panel.open);
-
-    // R243d: periodic patrol - the DPI-unaware game's activation resize has at
-    // least one path that bypasses R243/R243b/R243c (suspect SetWindowPlacement).
-    // Nothing escapes time: every ~2.3 s, if the DComp overlay is on and the game
-    // window no longer covers its monitor, pin it back with SetWindowPos.
-    if ((presents % 48u) == 0u && mgpu::gpu1::dcomp_overlay_mode())
-    {
-        HWND gw = (HWND)mgpu::gpu1::dcomp_game_hwnd();
-        if (gw)
-        {
-            r243_make_borderless(gw);
-            HMONITOR mon = MonitorFromWindow(gw, MONITOR_DEFAULTTONEAREST);
-            MONITORINFO mi{};
-            mi.cbSize = sizeof mi;
-            RECT wr{};
-            if (GetMonitorInfoW(mon, &mi) && GetWindowRect(gw, &wr))
-            {
-                const int mw = mi.rcMonitor.right - mi.rcMonitor.left;
-                const int mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
-                if ((wr.right - wr.left) != mw || (wr.bottom - wr.top) != mh ||
-                    wr.left != mi.rcMonitor.left || wr.top != mi.rcMonitor.top)
-                {
-                    static std::atomic<unsigned> r243d_n{0};
-                    const unsigned n = r243d_n.fetch_add(1) + 1;
-                    if (n <= 8u || (n % 100u) == 0u)
-                        LOG("[MGPU][R243d] re-pin %dx%d @ %d,%d -> monitor %dx%d @ %d,%d (%u so far)",
-                            wr.right - wr.left, wr.bottom - wr.top, wr.left, wr.top,
-                            mw, mh, mi.rcMonitor.left, mi.rcMonitor.top, n);
-                    SetWindowPos(gw, nullptr, mi.rcMonitor.left, mi.rcMonitor.top, mw, mh,
-                                 SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
-                }
-            }
-        }
-    }
 
     if (in.toggle || (panel.open && in.back))
     {

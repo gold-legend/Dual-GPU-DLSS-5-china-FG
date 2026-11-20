@@ -29,8 +29,7 @@ namespace mgpu::fg
 {
 namespace
 {
-constexpr unsigned SETS = 3u;
-constexpr unsigned MAX_GEN = 3u;          // 4x = three distinct interpolated frames plus the real frame.
+constexpr unsigned SETS = 4u;   // 4x presents 4 frames per set; one more set absorbs the longer holds
 using init_ext_fn = NVSDK_NGX_Result (NVSDK_CONV *)(unsigned long long, const wchar_t *, ID3D12Device *, NVSDK_NGX_Version, const NVSDK_NGX_Parameter *);
 using caps_fn = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter **);
 using alloc_fn = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Parameter **);
@@ -42,12 +41,12 @@ using release_fn = NVSDK_NGX_Result (NVSDK_CONV *)(NVSDK_NGX_Handle *);
 struct set_t
 {
     ID3D12Resource *real = nullptr;   // FINAL neural colour, never an intermediate pass.
-    ID3D12Resource *gen[MAX_GEN] = {};
-    native_gpu1::frame native{};       // Lease stays alive until every present retires.
+    ID3D12Resource *gen[3] = {nullptr, nullptr, nullptr};  // FGX=4: up to 3 interpolated frames (mfi 1..3)
+    native_gpu1::frame native{};       // Lease stays alive until both presents retire.
     unsigned long long frame = 0;
-    unsigned gen_count = 0;            // Distinct generated textures ready in this set, in scene order.
     float elapsed = 1.0f;            // Game frames spanned by this real neural frame.
-    float phase = 0.0f;              // 2x only: 0 = middle; 2/3 or 3/4 when DLSSG accepted FGPhase.
+    float phase = 0.0f;              // 0 = middle; 2/3 or 3/4 when DLSSG accepted FGPhase; 0.75 = FGX=4 last gen frame.
+    unsigned gen_n = 0;              // valid gen frames in gen[0..gen_n-1] (0 = real only)
     bool handed = false;
     UINT64 fence = 0;
     std::atomic<bool> busy{false};
@@ -55,7 +54,6 @@ struct set_t
 
 std::atomic<bool> g_on{false};
 bool g_armed = false, g_diagnose = false, g_bound = false;
-bool g_transport_suspended = false;       // Bridge thread only: neural OFF owns presentation.
 arm_info g_i{};
 set_t g_set[SETS];
 unsigned g_k = 0;
@@ -81,15 +79,13 @@ unsigned long long g_evals = 0, g_fallbacks = 0, g_half_n = 0;
 std::atomic<unsigned long long> g_pres_gen{0}, g_pres_real{0}, g_handoffs{0}, g_dropped{0};
 double g_half_sum = 0, g_ema_ms = 0;
 bool g_pace = true;
-bool g_instr = false;                   // FGInstr=1: read-only present/display verification.
 int g_pace_mode = 1;                    // FGPace: 0 immediate, 1 relative, 2 scene clock, 3 absolute.
-int g_fill = 0;                         // FGFill: 1 generates only the skipped game-frame gaps.
+int g_fgx = 2;                          // FGX: 2 = one interpolated frame (2x), 4 = three (4x, DLSS4 MFG)
+bool g_fgx_refused = false;             // a 4x evaluate was rejected: 2x for the rest of this arm
+bool g_fgx_fallback_said = false;       // the "driver cannot 4x" line logged once
 int g_phase_req = 0;                    // FGPhase: 0, 67 or 75; read again at each arm.
 bool g_phase_refused = false, g_phase_said = false;
 unsigned g_mfc_max = 0;
-unsigned g_mult_req = 2;                // FGMulti: only 2 and 4 are exposed by this build.
-unsigned g_mult_armed = 2;              // Textures allocated per set at arm time.
-unsigned g_mult_cap = 2;                // Driver/runtime ceiling; 4x falls back to 2x explicitly.
 unsigned long long g_phase_pairs = 0, g_phase_nofit = 0;
 mgpu::fgpace::scene_clock g_scene;       // bridge thread
 mgpu::fgpace::clock_state g_clk;         // pacing thread
@@ -103,10 +99,10 @@ unsigned long long g_dgate_real_only = 0;
 struct job_t
 {
     set_t *set = nullptr;
-    unsigned n_gen = 0;
+    unsigned gen_n = 0;        // 0..3 in-between frames to show before the real one
     float r = 0, g = 0, b = 0;
     LARGE_INTEGER t0{};
-    double half_ms = 8;                // Interval between adjacent output frames (legacy field name).
+    double half_ms = 8;
     int pace = 1;
     double ema_ms = 0, c_real = 0, span = 0;
 };
@@ -139,7 +135,7 @@ bool module_dir(wchar_t *dir, size_t n)
 bool read_keys(int &framegen, unsigned long long &app_id, bool &diagnose, bool &pace)
 {
     framegen = 0; app_id = 0x4D475055ull; diagnose = false; pace = true;
-    g_pace_mode = 1; g_fill = 0; g_phase_req = 0; g_dcheck = 0; g_mult_req = 2;
+    g_pace_mode = 1; g_phase_req = 0; g_dcheck = 0;
     wchar_t dir[MAX_PATH];
     if (!module_dir(dir, MAX_PATH)) return false;
     wchar_t path[MAX_PATH];
@@ -152,22 +148,18 @@ bool read_keys(int &framegen, unsigned long long &app_id, bool &diagnose, bool &
     if (got > mgpu::config::MAX_BYTES) return false;
     const char *v = mgpu::config::find(buf.data(), got, "FrameGen");
     framegen = v != nullptr ? atoi(v) : 0;
-    v = mgpu::config::find(buf.data(), got, "FGMulti");
-    g_mult_req = v != nullptr && atoi(v) == 4 ? 4u : 2u;
     v = mgpu::config::find(buf.data(), got, "NativeInput");
     diagnose = v != nullptr && atoi(v) == 1;
     v = mgpu::config::find(buf.data(), got, "FGPace");
     g_pace_mode = v != nullptr ? atoi(v) : 1;
     if (g_pace_mode < 0 || g_pace_mode > 3) g_pace_mode = 1;
     pace = g_pace_mode != 0;
-    v = mgpu::config::find(buf.data(), got, "FGFill");
-    g_fill = v != nullptr && atoi(v) == 1 ? 1 : 0;
+    v = mgpu::config::find(buf.data(), got, "FGX");
+    g_fgx = (v != nullptr && atoi(v) == 4) ? 4 : 2;
     v = mgpu::config::find(buf.data(), got, "FGPhase");
     if (v != nullptr && (atoi(v) == 67 || atoi(v) == 75)) g_phase_req = atoi(v);
     v = mgpu::config::find(buf.data(), got, "FGDisplayCheck");
     g_dcheck = v != nullptr && atoi(v) == 1 ? 1 : 0;
-    v = mgpu::config::find(buf.data(), got, "FGInstr");
-    g_instr = v != nullptr && atoi(v) == 1;
     auto fkey = [&](const char *key, float dflt, float lo, float hi) {
         const char *x = mgpu::config::find(buf.data(), got, key);
         if (x == nullptr) return dflt;
@@ -339,25 +331,11 @@ bool ensure_feature(ID3D12GraphicsCommandList *cl)
             (void)cap->Get("FrameGeneration.FeatureInitResult", &init_result);
             (void)cap->Get("DLSSG.MultiFrameCountMax", &mfc);
             g_mfc_max = mfc;
-            char line[520];
-            snprintf(line, sizeof(line), "[MGPU][FG] Init_Ext=0x%08X available=%d driver-needed=%d init=0x%08X MFC-max=%u; requested=%ux, snippet=%s",
-                (unsigned)ir, available, needs_driver, init_result, mfc, g_mult_req, where);
+            char line[440];
+            snprintf(line, sizeof(line), "[MGPU][FG] Init_Ext=0x%08X available=%d driver-needed=%d init=0x%08X MFC-max=%u; 2x only, snippet=%s",
+                (unsigned)ir, available, needs_driver, init_result, mfc, where);
             mgpu::diag::info(line);
         }
-    }
-    if (g_mult_req == 4u && g_mfc_max != 0u && g_mfc_max < 3u)
-    {
-        g_mult_cap = 2u;
-        char line[360];
-        snprintf(line, sizeof line,
-            "[MGPU][FG] 4x requires three interpolated frames but DLSSG reports MultiFrameCountMax=%u; applying 2x, not pretending 4x.",
-            g_mfc_max);
-        mgpu::diag::warn(line);
-    }
-    else if (g_mult_req == 4u && g_mfc_max == 0u)
-    {
-        mgpu::diag::warn("[MGPU][FG] DLSSG did not report MultiFrameCountMax; 4x will be validated by three real EvaluateFeature calls. "
-            "Any rejection disables 4x for this arm and explicitly falls back to 2x.");
     }
     auto *p = g_params;
     p->Set("CreationNodeMask", 1u); p->Set("VisibilityNodeMask", 1u);
@@ -422,15 +400,14 @@ bool extents(ID3D12Resource *r, unsigned &w, unsigned &h, DXGI_FORMAT &fmt)
     return true;
 }
 
-NVSDK_NGX_Result evaluate(ID3D12GraphicsCommandList *cl, set_t &set,
+NVSDK_NGX_Result evaluate(ID3D12GraphicsCommandList *cl, set_t &set, ID3D12Resource *out,
                           ID3D12Resource *mvec, ID3D12Resource *depth, float mv_el,
                           bool reset, unsigned long long fid,
-                          unsigned gen_index, unsigned mfc, unsigned mfi)
+                          unsigned mfc = 1u, unsigned mfi = 1u)
 {
-    if (gen_index >= MAX_GEN || mfc == 0u || mfi == 0u || mfi > mfc) return NVSDK_NGX_Result_Fail;
     unsigned rw = 0, rh = 0, ow = 0, oh = 0, mw = 0, mh = 0, dw = 0, dh = 0;
     DXGI_FORMAT rf = DXGI_FORMAT_UNKNOWN, of = DXGI_FORMAT_UNKNOWN, mf = DXGI_FORMAT_UNKNOWN, df = DXGI_FORMAT_UNKNOWN;
-    if (!extents(set.real, rw, rh, rf) || !extents(set.gen[gen_index], ow, oh, of) ||
+    if (!extents(set.real, rw, rh, rf) || !extents(out, ow, oh, of) ||
         !extents(mvec, mw, mh, mf) || !extents(depth, dw, dh, df) ||
         rw != g_i.w || rh != g_i.h || ow != rw || oh != rh || rf != g_i.fmt || of != rf ||
         mf != DXGI_FORMAT_R16G16_FLOAT)
@@ -449,7 +426,7 @@ NVSDK_NGX_Result evaluate(ID3D12GraphicsCommandList *cl, set_t &set,
     p->Set("DLSSG.UI", (ID3D12Resource *)nullptr);
     p->Set("DLSSG.UIAlpha", (ID3D12Resource *)nullptr);
     p->Set("DLSSG.BidirectionalDistortionField", (ID3D12Resource *)nullptr);
-    p->Set("DLSSG.OutputInterpolated", set.gen[gen_index]);
+    p->Set("DLSSG.OutputInterpolated", out);
     p->Set("DLSSG.OutputReal", (ID3D12Resource *)nullptr);
     p->Set("DLSSG.OutputDisableInterpolation", (ID3D12Resource *)nullptr);
     p->Set("DLSSG.MultiFrameCount", mfc);
@@ -506,48 +483,12 @@ void wait_until(const LARGE_INTEGER &t0, double ms)
     Sleep((DWORD)wait_ms);
 }
 
-namespace disp {
-std::atomic<double> fps{0.0};
-double ts[64] = {};
-unsigned head = 0, count = 0;
-
-// Rolling display FPS over the frames the pacing thread actually puts on
-// screen (generated + real). Written by the pacing thread only, read by the
-// overlay; the cached value makes the race benign.
-void note()
-{
-    static double k = -1.0;
-    if (k < 0.0)
-    {
-        LARGE_INTEGER fq{};
-        QueryPerformanceFrequency(&fq);
-        k = fq.QuadPart != 0 ? 1000.0 / (double)fq.QuadPart : 0.0;
-    }
-    LARGE_INTEGER q{};
-    QueryPerformanceCounter(&q);
-    const double t = (double)q.QuadPart * k;
-    ts[head] = t;
-    head = (head + 1u) % 64u;
-    if (count < 64u) ++count;
-    if (count >= 2u)
-    {
-        const unsigned oldest = count == 64u ? head : 0u;
-        const double span = t - ts[oldest];
-        const unsigned intervals = count == 64u ? 63u : count - 1u;
-        if (span > 0.0) fps.store((double)intervals * 1000.0 / span, std::memory_order_relaxed);
-    }
-}
-
-void reset() { fps.store(0.0, std::memory_order_relaxed); head = count = 0; }
-} // namespace disp
-
 bool present_job(const job_t &job, UINT64 &fence)
 {
-    if (job.n_gen > MAX_GEN) return false;
     LARGE_INTEGER fq{};
     QueryPerformanceFrequency(&fq);
     const double k = fq.QuadPart != 0 ? 1000.0 / (double)fq.QuadPart : 0.0;
-    const unsigned n = job.n_gen;
+    const unsigned n = job.gen_n;   // 0..3 in-between frames; the real one is index n
     auto now = [&]() -> double {
         LARGE_INTEGER q{}; QueryPerformanceCounter(&q);
         return (double)q.QuadPart * k;
@@ -557,17 +498,11 @@ bool present_job(const job_t &job, UINT64 &fence)
     };
     auto present = [&](unsigned j) -> bool {
         const bool real = j >= n;
-        ID3D12Resource *const resource = real ? job.set->real : (j < MAX_GEN ? job.set->gen[j] : nullptr);
-        if (resource == nullptr) return false; // Never repeat another texture to fake the requested multiplier.
-        mgpu::gpu1::present_override(resource,
+        mgpu::gpu1::present_override(real ? job.set->real : job.set->gen[j],
             real ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
         const bool ok = mgpu::gpu1::present_frame(job.r, job.g, job.b);
         mgpu::gpu1::present_override(nullptr, D3D12_RESOURCE_STATE_COMMON);
-        if (ok)
-        {
-            (real ? g_pres_real : g_pres_gen).fetch_add(1, std::memory_order_relaxed);
-            disp::note();
-        }
+        if (ok) (real ? g_pres_real : g_pres_gen).fetch_add(1, std::memory_order_relaxed);
         fence = (std::max)(fence, mgpu::gpu1::present_last_fence_value());
         return ok;
     };
@@ -576,14 +511,11 @@ bool present_job(const job_t &job, UINT64 &fence)
         return mgpu::fgpace::pair_relative(t0, job.pace == 0 ? 0.0 : job.half_ms, n, wait_abs, present);
     if (job.pace == 2 && n != 0u)
     {
-        double c[MAX_GEN + 1u] = {};
-        for (unsigned j = 0; j <= n; ++j)
-        {
-            double phase = (double)(j + 1u) / (double)(n + 1u);
-            if (n == 1u && j == 0u && job.set->phase > 0.0f && job.set->phase < 1.0f) phase = job.set->phase;
-            c[j] = job.c_real - job.span + job.span * phase;
-        }
-        const double period = (job.ema_ms > 0.0 ? job.ema_ms : 16.0) / (double)(n + 1u);
+        // scene times: the n gen frames at (k+1)/(n+1) of the span, the real one at the span's end
+        double c[4] = {};
+        for (unsigned i = 0; i < n; ++i) c[i] = job.c_real - job.span + job.span * (double)(i + 1u) / (double)(n + 1u);
+        c[n] = job.c_real;
+        const double period = (job.ema_ms > 0.0 ? job.ema_ms : 16.0) * (double)n / (double)(n + 1u);
         return mgpu::fgpace::pair_clock(g_clk, period, t0, job.span, c, n + 1u, now, wait_abs, present);
     }
     if (job.pace == 3 && n != 0u)
@@ -599,7 +531,7 @@ void thread_main()
         {
             std::unique_lock<std::mutex> lk(g_mx);
             g_cv.wait(lk, [] { return g_has_job || g_stop; });
-            if (g_stop && !g_has_job) return; // Finish an accepted real/generated group before stopping.
+            if (g_stop && !g_has_job) return; // Finish an accepted real/generated pair before stopping.
             job = g_job; g_has_job = false;
         }
         UINT64 fence = 0;
@@ -617,13 +549,13 @@ void free_sets()
         native_gpu1::retire(k, g_set[k].native);
         g_set[k].native.reset();
         if (g_set[k].real != nullptr) g_set[k].real->Release();
-        g_set[k].real = nullptr;
-        for (unsigned j = 0; j < MAX_GEN; ++j)
+        for (unsigned j = 0; j < 3u; ++j)
         {
             if (g_set[k].gen[j] != nullptr) g_set[k].gen[j]->Release();
             g_set[k].gen[j] = nullptr;
         }
-        g_set[k].frame = 0; g_set[k].gen_count = 0; g_set[k].handed = false;
+        g_set[k].real = nullptr;
+        g_set[k].frame = 0; g_set[k].gen_n = 0; g_set[k].handed = false;
         g_set[k].elapsed = 1.0f; g_set[k].phase = 0.0f;
         g_set[k].fence = 0; g_set[k].busy.store(false);
     }
@@ -666,10 +598,9 @@ bool arm(const arm_info &i)
     if (i.ndev == nullptr || i.nqueue == nullptr || i.w == 0 || i.h == 0 || i.game_luid == 0) return false;
     g_tried = g_up = false; g_k = 0; g_fid = g_last_eval_fid = g_last_eval_color = 0;
     g_need_reset = true; g_eval_value = 0; g_mfc_max = 0;
-    g_mult_armed = g_mult_req; g_mult_cap = g_mult_req;
+    g_fgx_refused = false; g_fgx_fallback_said = false;
     g_phase_refused = g_phase_said = false; g_phase_pairs = g_phase_nofit = 0;
     g_made = g_nomv = g_busy_skips = g_errors = g_evals = g_fallbacks = 0;
-    disp::reset();
     g_pres_gen.store(0); g_pres_real.store(0); g_handoffs.store(0); g_dropped.store(0);
     g_half_sum = 0; g_half_n = 0; g_ema_ms = 0; g_last_handoff.QuadPart = 0;
     g_scene.reset(); g_clk.reset(); g_clk.clear_counts(); g_abs.reset(); g_abs.clear_counts();
@@ -688,7 +619,7 @@ bool arm(const arm_info &i)
         hr = i.ndev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&g_set[k].real));
         d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        for (unsigned j = 0; j + 1u < g_mult_armed && SUCCEEDED(hr); ++j)
+        for (unsigned j = 0; j < 3u && SUCCEEDED(hr); ++j)
             hr = i.ndev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d,
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(&g_set[k].gen[j]));
     }
@@ -703,19 +634,17 @@ bool arm(const arm_info &i)
     }
     g_armed = true;
     g_on.store(true, std::memory_order_release);
-    mgpu::fginstr::arm(g_instr);
-    char pace_line[620];
+    char pace_line[520];
     snprintf(pace_line, sizeof pace_line,
-        "[MGPU][FG] Prism 2.0 scheduler (0.6.0 base): FGMulti=%u FGPace=%d FGFill=%d FGPhase=%d FGDisplayCheck=%d display-ms=%.3f. "
+        "[MGPU][FG] 0.6.0 scheduler: FGPace=%d FGPhase=%d FGX=%d FGDisplayCheck=%d display-ms=%.3f. "
         "FINAL colour + official GPU1-local MV/depth -> DLSSG -> present; estimated camera. Missing inputs present real colour only.",
-        g_mult_armed, g_pace_mode, g_fill, g_phase_req, g_dcheck, g_refresh_ms);
+        g_pace_mode, g_phase_req, g_fgx, g_dcheck, g_refresh_ms);
     mgpu::diag::info(pace_line);
-    char arm_line[360];
-    snprintf(arm_line, sizeof arm_line,
-        "[MGPU][FG] experimental %ux requested on the neural card: %u generated texture(s) per set. "
-        "FGPhase applies to 2x only; 4x evaluates three distinct outputs at indices 1/3, 2/3 and 3/3.",
-        g_mult_armed, g_mult_armed - 1u);
-    mgpu::diag::info(arm_line);
+    mgpu::diag::info(g_fgx >= 4
+        ? "[MGPU][FG] experimental 4x ARMED on the neural card: three DLSSG evaluates per real frame "
+          "(mfi 1/3, 2/3, 3/3). Needs DLSSG MultiFrameCount >= 3; a refusal falls back to 2x for this arm."
+        : "[MGPU][FG] experimental 2x ARMED on the neural card. FGPhase is used only after DLSSG accepts it; "
+          "a rejected phase falls back to the middle frame for later pairs.");
     return true;
 }
 
@@ -744,22 +673,23 @@ uint64_t bind_color(uint64_t current, uint64_t previous, uint64_t seal_qpc)
 
 unsigned dynamic_step()
 {
+    const unsigned asked = g_fgx >= 4 ? 4u : 2u;
     LARGE_INTEGER now{}, fq{};
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
     const double dt = g_dgate_t.QuadPart != 0 && fq.QuadPart != 0
         ? (double)(now.QuadPart - g_dgate_t.QuadPart) * 1000.0 / (double)fq.QuadPart : 0.0;
     g_dgate_t = now;
-    if (g_dgate.step(dt, g_refresh_ms, g_mult_cap))
+    if (g_dgate.step(dt, g_refresh_ms, asked))
     {
-        const unsigned allowed = g_dgate.allowed(g_mult_cap);
-        char line[520];
+        const unsigned allowed = g_dgate.allowed(asked);
+        char line[440];
         snprintf(line, sizeof line,
-            "[MGPU][FG][Dynamic] display=%.1f Hz neural=%.1f fps: requested=%ux allowed=%s. Real neural frames are always retained.",
-            g_refresh_ms > 0.0 ? 1000.0 / g_refresh_ms : 0.0, g_dgate.rate(), g_mult_cap,
-            allowed < 2u ? "OFF" : (allowed == 2u ? "2x" : (allowed == 3u ? "3x" : "4x")));
+            "[MGPU][FG][Dynamic] display=%.1f Hz neural=%.1f fps: %s. Real neural frames are always retained.",
+            g_refresh_ms > 0.0 ? 1000.0 / g_refresh_ms : 0.0, g_dgate.rate(),
+            allowed < 2u ? "frame generation OFF (display too slow)" : "multiplier fits; generation ON");
         mgpu::diag::info(line);
     }
-    return g_dgate.m == 0u ? 0u : g_dgate.allowed(g_mult_cap);
+    return g_dgate.m == 0u ? 0u : g_dgate.allowed(asked);
 }
 
 void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
@@ -782,10 +712,6 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
                            g_pfence->GetCompletedValue() < set.fence)))
     {
         ++g_busy_skips;
-        // This real NR frame never reached DLSSG. The next accepted colour is
-        // therefore not adjacent to the previous accepted colour. Re-seed the
-        // next real-frame pair instead of interpolating across a missing frame.
-        g_need_reset = true;
         return;
     }
     unsigned rw = 0, rh = 0; DXGI_FORMAT rf = DXGI_FORMAT_UNKNOWN;
@@ -800,7 +726,7 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
     cl->CopyResource(set.real, nr_final);
     transition(cl, set.real, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(cl, nr_final, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    set.frame = game_frame; set.gen_count = 0; set.handed = false; set.phase = 0.0f;
+    set.frame = game_frame; set.gen_n = 0; set.handed = false; set.phase = 0.0f;
     set.elapsed = mv_el > 0.0f ? mv_el : 1.0f;
     const unsigned long long fid = ++g_fid;
 
@@ -817,22 +743,71 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
     else
     {
         const bool reset = g_need_reset || g_last_eval_fid == 0 || fid != g_last_eval_fid + 1;
-        unsigned mult = g_mult_cap;
-        if (dynamic >= 2u && dynamic < mult) mult = dynamic;
-        if (mult < 2u) mult = 2u;
-        unsigned want_gen = mult - 1u;
-        if (want_gen > g_mult_armed - 1u) want_gen = g_mult_armed - 1u;
-        if (want_gen > MAX_GEN) want_gen = MAX_GEN;
-        // R391: fill only the real game-frame gaps carried by this neural
-        // frame. FGMulti remains the allocation/driver ceiling; when the
-        // consumer is caught up (elapsed=1), no redundant intermediate is made.
-        if (g_fill == 1)
-            want_gen = mgpu::fgpace::fill_count(set.elapsed, want_gen);
-
-        // FGPhase belongs to a single 2x intermediate frame. A real 4x group
-        // always asks for indices 1, 2 and 3 out of 3 into different textures.
-        unsigned phase_mfc = 1u, phase_mfi = 1u;
-        if (want_gen == 1u && g_phase_req != 0 && !reset && !g_phase_refused)
+        // FGX=4 (DLSS4 multi-frame generation): three evaluates of the SAME real frame,
+        // MultiFrameIndex 1..3 -> one interpolated frame at 1/4, 2/4, 3/4 of the interval.
+        // Needs DLSSG MultiFrameCount >= 3 (g_mfc_max, 0 = unknown: try and fall back on refusal).
+        if (g_fgx >= 4 && !g_fgx_refused && (g_mfc_max == 0u || g_mfc_max >= 3u))
+        {
+            if (g_mfc_max != 0u && g_mfc_max < 3u)
+            {
+                g_fgx_refused = true;   // known-insufficient driver: the 2x path below takes over
+                if (!g_fgx_fallback_said)
+                {
+                    g_fgx_fallback_said = true;
+                    char line[300];
+                    snprintf(line, sizeof line,
+                        "[MGPU][FG][4x] FGX=4 needs DLSSG MultiFrameCount >= 3, driver maximum=%u; 2x for this arm.",
+                        g_mfc_max);
+                    mgpu::diag::warn(line);
+                }
+            }
+            if (g_mfc_max == 0u || g_mfc_max >= 3u)
+            {
+                if (g_evals < 3u)
+                    mgpu::diag::info("[MGPU][FG] entering 4x EvaluateFeature x3 (mfi 1/3, 2/3, 3/3) with official GPU1-local MV/depth");
+                NVSDK_NGX_Result r = NVSDK_NGX_Result_Success;
+                for (unsigned mfi = 1u; mfi <= 3u; ++mfi)
+                {
+                    r = evaluate(cl, set, set.gen[mfi - 1u], mvec, depth, mv_el, reset, fid, 3u, mfi);
+                    ++g_evals;
+                    if (r != NVSDK_NGX_Result_Success)
+                    {
+                        if (mfi == 1u)
+                        {
+                            // the driver refused multi-frame generation itself: permanent 2x fallback
+                            g_fgx_refused = true;
+                            char line[320];
+                            snprintf(line, sizeof line,
+                                "[MGPU][FG][4x] DLSSG rejected MultiFrameCount=3 (0x%08X). FGX falls back to 2x for this arm.",
+                                (unsigned)r);
+                            mgpu::diag::warn(line);
+                        }
+                        else
+                        {
+                            ++g_errors; g_need_reset = true;
+                            char line[300];
+                            snprintf(line, sizeof(line), "[MGPU][FG] 4x EvaluateFeature mfi=%u failed 0x%08X errors=%llu; real colour is retained",
+                                mfi, (unsigned)r, g_errors);
+                            mgpu::diag::error(line);
+                            if (g_errors >= 3) fail_for_arm("three DLSSG evaluations failed");
+                        }
+                        break;
+                    }
+                }
+                if (!g_fgx_refused && r == NVSDK_NGX_Result_Success)
+                {
+                    g_last_eval_fid = fid; g_need_reset = false;
+                    if (!reset)
+                    {
+                        set.gen_n = 3; set.phase = 0.75f; ++g_made;
+                    }
+                }
+            }
+        }
+        if (g_fgx < 4 || g_fgx_refused)
+        {
+        unsigned mfc = 1u, mfi = 1u;
+        if (g_phase_req != 0 && !reset && !g_phase_refused)
         {
             const unsigned want = g_phase_req == 67 ? 2u : 3u;
             if (g_mfc_max != 0u && want > g_mfc_max)
@@ -848,109 +823,46 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
                     mgpu::diag::warn(line);
                 }
             }
-            else phase_mfc = phase_mfi = want;
+            else mfc = mfi = want;
         }
-
-        // A caught-up consumer needs no intermediate. Still seat DLSSG history
-        // on a reset, but never pass the invalid MultiFrameCount=0. If no
-        // evaluation happens, force the next generated group to reset instead
-        // of pairing it with stale history from an earlier real frame.
-        const unsigned calls = want_gen == 0u ? (reset ? 1u : 0u) : (reset ? 1u : want_gen);
-        bool group_ok = true;
-        for (unsigned j = 0; j < calls; ++j)
+        if (g_evals < 3u)
+            mgpu::diag::info("[MGPU][FG] entering EvaluateFeature with official GPU1-local MV/depth");
+        const NVSDK_NGX_Result r = evaluate(cl, set, set.gen[0], mvec, depth, mv_el, reset, fid, mfc, mfi);
+        ++g_evals;
+        if (r != NVSDK_NGX_Result_Success && mfi != 1u)
         {
-            const unsigned mfc = want_gen == 0u ? 1u : (want_gen == 1u ? phase_mfc : want_gen);
-            const unsigned mfi = want_gen == 0u ? 1u : (want_gen == 1u ? phase_mfi : j + 1u);
-            if (g_evals < 3u)
-                mgpu::diag::info("[MGPU][FG] entering EvaluateFeature with official GPU1-local MV/depth");
-            const NVSDK_NGX_Result r = evaluate(cl, set, mvec, depth, mv_el,
-                reset && j == 0u, fid, j, mfc, mfi);
-            ++g_evals;
-            if (r == NVSDK_NGX_Result_Success) continue;
-            group_ok = false;
-            ++g_errors; g_need_reset = true;
-            if (want_gen == 1u && phase_mfi != 1u)
-            {
-                g_phase_refused = true;
-                char line[360];
-                snprintf(line, sizeof line,
-                    "[MGPU][FG][Phase] DLSSG rejected frame %u/%u (0x%08X). FGPhase is disabled for this arm; later pairs use the middle frame.",
-                    mfi, mfc, (unsigned)r);
-                mgpu::diag::warn(line);
-            }
-            if (want_gen > 1u && g_mult_cap != 2u)
-            {
-                g_mult_cap = 2u;
-                char fallback[440];
-                snprintf(fallback, sizeof fallback,
-                    "[MGPU][FG] DLSSG rejected 4x at interpolated frame %u/%u (0x%08X). 4x is disabled for this arm; later groups use real 2x.",
-                    mfi, mfc, (unsigned)r);
-                mgpu::diag::warn(fallback);
-            }
-            char line[380];
+            g_phase_refused = true;
+            char line[360];
             snprintf(line, sizeof line,
-                "[MGPU][FG] EvaluateFeature color=%llu interpolated=%u/%u result=0x%08X errors=%llu; the whole group shows real colour only",
-                (unsigned long long)game_frame, mfi, mfc, (unsigned)r, g_errors);
+                "[MGPU][FG][Phase] DLSSG rejected frame %u/%u (0x%08X). FGPhase is disabled for this arm; later pairs use the middle frame.",
+                mfi, mfc, (unsigned)r);
+            mgpu::diag::warn(line);
+        }
+        if (r != NVSDK_NGX_Result_Success)
+        {
+            ++g_errors; g_need_reset = true;
+            char line[300];
+            snprintf(line, sizeof(line), "[MGPU][FG] EvaluateFeature color=%llu result=0x%08X errors=%llu; real colour is retained",
+                (unsigned long long)game_frame, (unsigned)r, g_errors);
             mgpu::diag::error(line);
             if (g_errors >= 3) fail_for_arm("three DLSSG evaluations failed");
-            break;
         }
-        if (group_ok)
+        else
         {
-            if (calls == 0u)
+            g_last_eval_fid = fid; g_need_reset = false;
+            if (!reset)
             {
-                g_need_reset = true;
-            }
-            else
-            {
-                g_last_eval_fid = fid; g_need_reset = false;
-                if (!reset && calls == want_gen)
+                set.gen_n = 1; ++g_made;
+                if (mfi != 1u)
                 {
-                    set.gen_count = want_gen;
-                    g_made += want_gen;
-                    if (want_gen == 1u && phase_mfi != 1u)
-                    {
-                        set.phase = (float)phase_mfi / (float)(phase_mfc + 1u);
-                        ++g_phase_pairs;
-                    }
+                    set.phase = (float)mfi / (float)(mfc + 1u);
+                    ++g_phase_pairs;
                 }
             }
         }
+        }
     }
     g_k = (g_k + 1u) % SETS;
-}
-
-bool sync_neural(bool neural)
-{
-    if (!g_armed) return false;
-    if (!neural)
-    {
-        // The worker must not enter present_frame until the pacing thread has
-        // finished its accepted group. Both paths share the present allocator,
-        // fence and swap chain; bypassing handoff alone leaves a cross-thread
-        // present race that can jam the queue on the very next neural frame.
-        if (!g_transport_suspended || g_thread != nullptr || on())
-        {
-            g_transport_suspended = true;
-            stop();
-            mgpu::diag::info("[MGPU][FG] neural OFF: accepted group drained and pacing thread joined; worker now presents LIVE transport frames");
-        }
-        return false;
-    }
-    if (g_transport_suspended)
-    {
-        g_transport_suspended = false;
-        // A neural switch is not permission to recover a failed generator.
-        if (g_fallbacks == 0 && !g_thread_failed.load(std::memory_order_acquire))
-        {
-            g_need_reset = true;
-            g_last_handoff.QuadPart = 0;
-            g_scene.reset(); g_clk.reset(); g_abs.reset();
-            g_on.store(true, std::memory_order_release);
-            mgpu::diag::info("[MGPU][FG] neural ON: frame generation resumed with fresh history");
-        }
-    }
-    return on();
 }
 
 bool handoff(float r, float g, float b)
@@ -971,12 +883,11 @@ bool handoff(float r, float g, float b)
     QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
     const double dt = g_last_handoff.QuadPart != 0 && fq.QuadPart != 0
         ? (double)(now.QuadPart - g_last_handoff.QuadPart) * 1000.0 / (double)fq.QuadPart : 0.0;
-    mgpu::fginstr::note_handoff(dt);
     if (dt > 3.0 && dt < 60.0) g_ema_ms = g_ema_ms <= 0 ? dt : g_ema_ms * 0.85 + dt * 0.15;
     g_last_handoff = now;
-    job_t job{}; job.set = &set; job.n_gen = set.gen_count; job.r = r; job.g = g; job.b = b; job.t0 = now;
-    job.half_ms = (g_ema_ms > 0 ? g_ema_ms : 16.0) / (double)(job.n_gen + 1u);
-    if (job.n_gen == 1u && set.phase > 0.0f && set.phase < 1.0f)
+    job_t job{}; job.set = &set; job.gen_n = set.gen_n; job.r = r; job.g = g; job.b = b; job.t0 = now;
+    job.half_ms = g_ema_ms > 0 ? g_ema_ms * 0.5 : 8.0;
+    if (set.phase > 0.0f && set.phase < 1.0f)
         job.half_ms = (g_ema_ms > 0 ? g_ema_ms : 16.0) * (double)(1.0f - set.phase);
     job.pace = g_pace_mode; job.ema_ms = g_ema_ms;
     if (job.pace == 2)
@@ -1003,12 +914,12 @@ bool handoff(float r, float g, float b)
     const unsigned long long n = g_handoffs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n % 120 == 0)
     {
-        char line[820];
-        snprintf(line, sizeof(line), "[MGPU][FG] handoffs=%llu requested=%ux cap=%ux this-group=%ux generated=%llu presented-gen=%llu presented-real=%llu "
-            "dropped=%llu real-fallbacks=%llu invalid-input=%llu busy=%llu errors=%llu evals=%llu pace=%d phase=%d dynamic-real=%llu "
-            "step-ms=%.2f; GPU1 imports=%llu",
-            n, g_mult_req, g_mult_cap, job.n_gen + 1u, g_made, g_pres_gen.load(), g_pres_real.load(), g_dropped.load(), g_fallbacks, g_nomv, g_busy_skips,
-            g_errors, g_evals, g_pace_mode, g_phase_refused ? 0 : g_phase_req, g_dgate_real_only,
+        char line[680];
+        snprintf(line, sizeof(line), "[MGPU][FG] handoffs=%llu generated=%llu presented-gen=%llu presented-real=%llu "
+            "dropped=%llu real-fallbacks=%llu invalid-input=%llu busy=%llu errors=%llu pace=%d phase=%d dynamic-real=%llu "
+            "half-ms=%.2f; GPU1 imports=%llu",
+            n, g_made, g_pres_gen.load(), g_pres_real.load(), g_dropped.load(), g_fallbacks, g_nomv, g_busy_skips,
+            g_errors, g_pace_mode, g_phase_refused ? 0 : g_phase_req, g_dgate_real_only,
             g_half_n ? g_half_sum / g_half_n : 0.0,
             (unsigned long long)native_gpu1::imported_frames());
         mgpu::diag::info(line);
@@ -1036,7 +947,6 @@ void release()
 {
     const bool was = g_armed;
     stop();
-    mgpu::fginstr::release();
     g_diagnose = false;
     g_bound = false;
     g_last_bound_frame = 0;
@@ -1080,9 +990,4 @@ void release()
     g_armed = false; g_up = false; g_tried = false; g_i = {};
     g_last_eval_fid = g_last_eval_color = 0; g_need_reset = true;
 }
-double display_fps()
-{
-    return disp::fps.load(std::memory_order_relaxed);
-}
-
 } // namespace mgpu::fg

@@ -67,9 +67,9 @@
 #include "prism_warp.hpp"   // PWARP: late neural edit on current game colour (own key, PrismWarp=1)
 #include "prism_x1_multi.hpp" // PX1: independent current-frame reconstruction/history for each NR pass
 #include "prism_ensemble.hpp" // Three same-original NR passes + current-frame robust composite
+#include "temporal_stab.hpp"  // Golden Prism 1.1 same-size colour/history stabiliser
 #include "gpu0_stage.hpp" // R333: StageCopy, GPU 0 async staging (Dave's OPT5 design). Off unless StageCopy=1
-#include "fg_gpu1.hpp"
-#include "fg_instr.hpp"    // R341: DLSS Frame Generation on the neural card (Dave's DLSSG1 design). Off unless FrameGen=4
+#include "fg_gpu1.hpp"    // R341: DLSS Frame Generation on the neural card (Dave's DLSSG1 design). Off unless FrameGen=4
 #include "fg_map.hpp"     // D2.0 NR step one: read-only frame-gen vector map. Off unless NRFrameFilter=1 (one load per site)
 #include "b1_contract.hpp" // B1: strict same-frame + same-generation NR acceptance
 
@@ -674,26 +674,102 @@ std::atomic<int> g_mv_pick_idx{0}, g_mv_next_same{-1}, g_mv_next_class{-1}, g_mv
 void set_mvec_neighbours(int cur, int next_same, int next_class)
 { g_mv_pick_idx.store(cur, std::memory_order_relaxed); g_mv_next_same.store(next_same, std::memory_order_relaxed); g_mv_next_class.store(next_class, std::memory_order_relaxed); }
 int mvec_candidate_request() { return g_mv_cand_req.load(std::memory_order_relaxed); }
+// DComp and swap-chain geometry must use physical pixels even when the game is
+// DPI-unaware. This is thread-local and restored before returning to the game.
+class ScopedPhysicalDpi
+{
+    DPI_AWARENESS_CONTEXT previous = nullptr;
+    bool active = false;
+public:
+    explicit ScopedPhysicalDpi(bool enable = true)
+    {
+        if (!enable || AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(),
+                                                    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)) return;
+        previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        active = previous != nullptr;
+    }
+    ~ScopedPhysicalDpi()
+    {
+        if (active) SetThreadDpiAwarenessContext(previous);
+    }
+    ScopedPhysicalDpi(const ScopedPhysicalDpi &) = delete;
+    ScopedPhysicalDpi &operator=(const ScopedPhysicalDpi &) = delete;
+};
+
 static void dcomp_fit_apply(unsigned src_w, unsigned src_h, const char *where)
 {
+    // Coordinate space: a DPI-UNAWARE host window's composition surface lives
+    // in LOGICAL pixels - DWM virtualizes the surface and stretches it by the
+    // system DPI scale at scan-out. Physical-pixel geometry on such a window
+    // composes only the top-left 1/scale region into the surface and the
+    // scan-out stretch then magnifies it (neural picture AND menu both zoomed
+    // 1.75x on a 175% display, only a head visible). So match the window's own
+    // awareness: logical client rect for unaware hosts, physical for aware.
+    bool host_unaware = false;
+    if (g_game_hwnd != nullptr)
+        host_unaware = GetAwarenessFromDpiAwarenessContext(
+                           GetWindowDpiAwarenessContext(g_game_hwnd)) == DPI_AWARENESS_UNAWARE;
+    RECT rc{};
+    if (host_unaware)
+    {
+        // Logical space only exists on a DPI-UNAWARE thread. Callers such as
+        // present_resize wrap everything in ScopedPhysicalDpi, so without this
+        // the read below silently returns PHYSICAL pixels and the zoom is back.
+        const DPI_AWARENESS_CONTEXT prev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_UNAWARE);
+        const BOOL ok = GetClientRect(g_game_hwnd, &rc);
+        SetThreadDpiAwarenessContext(prev);
+        if (ok == FALSE) return;
+    }
+    else
+    {
+        ScopedPhysicalDpi physical_dpi;
+        if (GetClientRect(g_game_hwnd, &rc) == FALSE) return;
+    }
     if (g_dcomp_fit == 0 || g_dcomp_device == nullptr || g_dcomp_visual == nullptr || g_game_hwnd == nullptr) return;
     if (src_w == 0u || src_h == 0u) return;
-    RECT rc{};
-    if (GetClientRect(g_game_hwnd, &rc) == FALSE) return;
     const unsigned cw = (unsigned)(rc.right - rc.left), ch = (unsigned)(rc.bottom - rc.top);
     if (cw == 0u || ch == 0u) return;
-    if (g_dcomp_fit == 2 && !(src_w > cw || src_h > ch))
+    if (host_unaware)
     {
-        char l[260];
-        snprintf(l, sizeof l,
-                 "[MGPU][R271] DcompFit=auto: source %ux%u is within the game window's client %ux%u at %s - "
-                 "nothing applied, the visual stays 1:1.", src_w, src_h, cw, ch, where);
-        mgpu::diag::info(l);
-        return;
+        static bool said_unaware = false;
+        if (!said_unaware)
+        {
+            said_unaware = true;
+            char ul[300];
+            snprintf(ul, sizeof ul,
+                     "[MGPU][R271] host window is DPI-unaware: composing in LOGICAL surface "
+                     "coordinates %ux%u (DWM stretches by the system DPI scale at scan-out).",
+                     cw, ch);
+            mgpu::diag::info(ul);
+        }
     }
     IDCompositionDevice *dc = (IDCompositionDevice *)g_dcomp_device;
     IDCompositionVisual *visual = (IDCompositionVisual *)g_dcomp_visual;
     IDCompositionScaleTransform *xf = (IDCompositionScaleTransform *)g_dcomp_scale;
+    if (g_dcomp_fit == 2 && src_w == cw && src_h == ch)
+    {
+        // A previous resolution may have installed a downscale. Auto mode must
+        // remove it when the physical client catches up, not leave it stuck.
+        static unsigned r_cw = 0, r_ch = 0;   // cache: skip redundant reset commits
+        static void *r_vis = nullptr;
+        HRESULT reset_hr = S_OK;
+        if (r_cw == cw && r_ch == ch && r_vis == (void *)g_dcomp_visual) return;
+        r_cw = cw; r_ch = ch; r_vis = (void *)g_dcomp_visual;
+        if (xf != nullptr)
+        {
+            xf->SetCenterX(0.0f); xf->SetCenterY(0.0f);
+            xf->SetScaleX(1.0f); xf->SetScaleY(1.0f);
+            reset_hr = visual->SetTransform(xf);
+            if (SUCCEEDED(reset_hr)) reset_hr = dc->Commit();
+        }
+        char l[360];
+        snprintf(l, sizeof l,
+                 "[MGPU][R271] DcompFit=auto: source %ux%u fits the physical game client %ux%u at %s - "
+                 "visual is 1:1%s. Reset hr=0x%08X.", src_w, src_h, cw, ch, where,
+                 xf != nullptr ? " (previous scale removed)" : "", (unsigned)reset_hr);
+        if (SUCCEEDED(reset_hr)) mgpu::diag::info(l); else mgpu::diag::warn(l);
+        return;
+    }
     HRESULT hr = S_OK;
     if (xf == nullptr)
     {
@@ -708,6 +784,17 @@ static void dcomp_fit_apply(unsigned src_w, unsigned src_h, const char *where)
         g_dcomp_scale = xf;
     }
     const float sx = (float)cw / (float)src_w, sy = (float)ch / (float)src_h;
+    // Cache: identical geometry on the same visual means the transform is
+    // already right - skip the Commit entirely. Without this, the periodic
+    // self-heal below would re-commit (and re-log) on every call.
+    {
+        static unsigned s_cw = 0, s_ch = 0;
+        static float s_sx = -1.0f, s_sy = -1.0f;
+        static void *s_vis = nullptr;
+        if (s_vis == (void *)g_dcomp_visual && s_cw == cw && s_ch == ch && s_sx == sx && s_sy == sy)
+            return;
+        s_vis = (void *)g_dcomp_visual; s_cw = cw; s_ch = ch; s_sx = sx; s_sy = sy;
+    }
     xf->SetCenterX(0.0f); xf->SetCenterY(0.0f);
     xf->SetScaleX(sx); xf->SetScaleY(sy);
     hr = visual->SetTransform(xf);
@@ -717,7 +804,7 @@ static void dcomp_fit_apply(unsigned src_w, unsigned src_h, const char *where)
              "[MGPU][R271] DcompFit=%s%s: composed visual scaled %.3f x %.3f (source %ux%u -> game window "
              "client %ux%u) at %s. SetTransform hr=0x%08X Commit hr=0x%08X. The compositor does the "
              "scaling; the neural stage still runs at the source size.",
-             (g_dcomp_fit == 2) ? "auto" : "1", (g_dcomp_fit == 2) ? " ENGAGED - the source is larger than the game window" : "",
+             (g_dcomp_fit == 2) ? "auto" : "1", (g_dcomp_fit == 2) ? " ENGAGED - source and physical client differ" : "",
              (double)sx, (double)sy, src_w, src_h, cw, ch, where, (unsigned)hr, (unsigned)ch_hr);
     if (SUCCEEDED(ch_hr)) mgpu::diag::info(l); else mgpu::diag::warn(l);
 }
@@ -1785,6 +1872,18 @@ bool present_frame(float r, float g, float b)
         g_pr_last = pr_now;
     }
 
+    // R271b: DcompFit=auto must be self-healing. RE2 recreates its window and
+    // swapchain on focus / fullscreen transitions, and present_resize's fit is
+    // one-shot (sized_to_source). A recreated visual silently loses the fit
+    // and the neural window (and the cursor drawn in it) shrinks to a corner.
+    // Re-verify cheaply every 32 presents; dcomp_fit_apply caches and skips
+    // the Commit when nothing changed, so the steady state costs one rect read.
+    if (g_dcomp_fit == 2 && g_dcomp_visual != nullptr && g_game_hwnd != nullptr)
+    {
+        static unsigned fit_tick = 0;
+        if (++fit_tick % 32u == 0u) dcomp_fit_apply(S.chain_w, S.chain_h, "present");
+    }
+
     ID3D12Device *dev = nullptr;
     ID3D12CommandQueue *queue = nullptr;
     IDXGISwapChain3 *sc = nullptr;
@@ -2447,11 +2546,6 @@ bool present_frame(float r, float g, float b)
             mgpu::diag::warn(occl);
         }
     }
-
-    // FGInstr (R371/R386/R403): the thread that presented feeds the frame-
-    // statistics sampler after a successful, displayed Present. Read-only.
-    if (hr == S_OK)
-        mgpu::fginstr::after_present(sc);
 
     // D6: NO WAIT HERE. This is the stall the ring exists to remove - a full
     // GPU round trip taken on the consume thread, once per presented frame,
@@ -10498,7 +10592,6 @@ namespace
         // Decides the fix (a deeper ring, or copy timing = LateLatch) from numbers; changes nothing itself.
         unsigned re_on = 0u;
         unsigned long long re_hist[8] = {}, re_nodepth[8] = {}, re_nomvec[8] = {}, re_report_at = 0ull;
-        unsigned long long fg_diag_n = 0ull;   // FG input diagnostic counter
 
         std::atomic<unsigned long long> mvec_copies{0}, mvec_missing{0};
         std::atomic<unsigned long long> mvec_copies_tap{0};   // R280o: the subset of mvec_copies made by the R277 tap
@@ -12287,6 +12380,7 @@ namespace {
         mgpu::pwarp::release();     // PWARP: owned output/history, after the GPU drain
         mgpu::prism_x1m::release_all(); // PX1: all per-pass history/coefficients after the drain
         mgpu::ensemble::release();      // three-pass snapshot/output, after the GPU drain
+        mgpu::temporal_stab::release(); // Golden colour history, after the same GPU drain
         // R216: same point, same reason.
         if (s.vr_pso_g != nullptr) { s.vr_pso_g->Release(); s.vr_pso_g = nullptr; }
         if (s.vr_pso   != nullptr) { s.vr_pso->Release();   s.vr_pso   = nullptr; }
@@ -15751,6 +15845,8 @@ namespace
                                      mgpu::residual::active() && !mgpu::psync::active());
         if (SUCCEEDED(h))
             (void)mgpu::ensemble::arm(ndev, s.width, s.height, nrfmt);
+        if (SUCCEEDED(h))
+            (void)mgpu::temporal_stab::arm(ndev, s.width, s.height, nrfmt);
         // Official 0.6.0 FG contract: use the stream's GPU1-local MV/depth.
         // NativeInput=1 is a separate diagnostic and never an FG prerequisite.
         if (SUCCEEDED(h))
@@ -16262,6 +16358,9 @@ namespace
 bool present_resize(UINT src_w, UINT src_h, int mode, DXGI_FORMAT src_fmt)   // 0=crop 1=match 2=fit
 {
     if (src_w == 0 || src_h == 0) return false;
+    // Covers monitor discovery, the neural window's SetWindowPos, and the
+    // DComp fit calculation. Every early return restores the previous context.
+    ScopedPhysicalDpi physical_dpi;
 
     auto &S = st();
     HWND hwnd = nullptr;
@@ -29213,6 +29312,13 @@ void stream_poll()
                     else
                         mgpu::pwarp::invalidate();
                 }
+
+                // Golden Prism 1.1 stabilises the final same-size colour only after
+                // a real evaluation. Held frames reuse the last stabilised output;
+                // no pass count, extent, preset, transport or present timing changes.
+                if (final_pass_ok && s.nr_final != nullptr)
+                    mgpu::temporal_stab::apply(s.nl, s.nr_final);
+
                 if (cv_ran)   // R217: restore only after PWARP has sampled the chain
                     barrier(s.nl, s.cv_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                             D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
@@ -29281,14 +29387,6 @@ void stream_poll()
                 // official stream textures, still NON_PIXEL_SHADER_RESOURCE here.
                 if (final_pass_ok && s.nr_final != nullptr)
                 {
-                    if (s.fg_diag_n++ % 600ull == 0ull)
-                    {
-                        char dl[360];
-                        snprintf(dl, sizeof dl, "[MGPU][FG][DIAG] mvec_here=%d tex_mvec_r=%p bytes2=%zu mode=%u | depth_here=%d tex_depth=%p bytes=%zu dmode=%u",
-                                 mvec_here ? 1 : 0, (void *)s.tex_mvec_r[ii], (size_t)s.mvec_bytes2, s.mvec_mode,
-                                 depth_here ? 1 : 0, (void *)s.tex_depth[ii], (size_t)s.depth_bytes, s.depth_mode);
-                        mgpu::diag::info(dl);
-                    }
                     mgpu::fg::record(s.nl, s.nr_final,
                                      mvec_here ? s.tex_mvec_r[ii] : nullptr,
                                      depth_here ? s.tex_depth[ii] : nullptr,

@@ -76,6 +76,8 @@ add_library(mgpu_bridge SHARED
     src/prism_x1_multi.cpp
     # Three-pass same-original ensemble: independent NGX histories, memoryless robust composite.
     src/prism_ensemble.cpp
+    # Golden Prism 1.1 same-size colour/history stabiliser (TemporalStrength).
+    src/temporal_stab.cpp
     # POVERLAY (2026-10-29): the standalone in-game panel - a port of prism-core 1.5.1's
     # overlay. Its own D3D12 + DirectWrite rendering on the game's queue at present, MinHook
     # input neutralisation. Not a ReShade-UI panel: it draws on the swap chain's back buffer

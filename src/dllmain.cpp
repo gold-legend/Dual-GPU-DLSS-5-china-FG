@@ -311,8 +311,32 @@ static bool force_windowed_active(reshade::api::device_api api)
 }
 // NW.js one-row ResizeBuffers protection lives in dx11_producer.cpp at the
 // original DXGI call, where ReShade cannot first rewrite the chain's size.
+static void log_swapchain_dpi_geometry(reshade::api::device_api api, const reshade::api::swapchain_desc &desc, void *hwnd_void)
+{
+    if (api != reshade::api::device_api::d3d12 || hwnd_void == nullptr) return;
+    HWND hwnd = static_cast<HWND>(hwnd_void);
+    const DPI_AWARENESS_CONTEXT thread_context = GetThreadDpiAwarenessContext();
+    const DPI_AWARENESS_CONTEXT window_context = GetWindowDpiAwarenessContext(hwnd);
+    RECT logical{}, physical{};
+    GetClientRect(hwnd, &logical);
+    const DPI_AWARENESS_CONTEXT previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    GetClientRect(hwnd, &physical);
+    const UINT window_dpi = GetDpiForWindow(hwnd);
+    SetThreadDpiAwarenessContext(previous);
+    char line[640];
+    snprintf(line, sizeof line,
+             "[MGPU][R243-DPI] swapchain request=%ux%u hwnd=0x%p tid=%lu | logical client=%ldx%ld physical client=%ldx%ld | "
+             "thread awareness=%d window awareness=%d window dpi=%u",
+             desc.back_buffer.texture.width, desc.back_buffer.texture.height, (void *)hwnd, GetCurrentThreadId(),
+             (long)(logical.right - logical.left), (long)(logical.bottom - logical.top),
+             (long)(physical.right - physical.left), (long)(physical.bottom - physical.top),
+             (int)GetAwarenessFromDpiAwarenessContext(thread_context),
+             (int)GetAwarenessFromDpiAwarenessContext(window_context), window_dpi);
+    mgpu::diag::info(line);
+}
 static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swapchain_desc &desc, void *hwnd)
 {
+    log_swapchain_dpi_geometry(api, desc, hwnd);
     if (!force_windowed_active(api) || !desc.fullscreen_state) return false;
     desc.fullscreen_state = false;
     const unsigned n = g_force_windowed_n.fetch_add(1) + 1;
@@ -325,45 +349,14 @@ static bool on_create_swapchain(reshade::api::device_api api, reshade::api::swap
     mgpu::diag::warn(l);
     return true;
 }
-// R243 (2026-11-14): RE2 is a DPI-UNAWARE process on a 150% display, so on
-// every activation / alt-tab its own display logic resizes the main window back
-// to the virtualized size (2209x1213) while the monitor is 3314x1820 physical:
-// the composed neural picture then covers only part of the screen ("half") and
-// the rest is unreachable. We cannot make the game DPI-aware from inside, but
-// the resize rides on the same set_fullscreen_state calls we already intercept
-// (R241 logs show them firing on every focus change). So on every such event,
-// while DcompOverlay forces the game windowed, pin the game window to its
-// monitor. SetWindowPos triggers WM_SIZE -> the game resizes its chain -> the
-// DX11 producer rebuild path (already fixed) carries the stream across.
-static std::atomic<unsigned> g_r243_n{0};
+// R243 used to resize the native host to a virtualized monitor rectangle. That
+// made the neural visual small and can double-scale mixed-DPI windows. Keep the
+// fullscreen transition hooks, but leave host geometry entirely to the game.
 static void r243_cover_monitor(void *hwnd_void)
 {
-    HWND hwnd = (HWND)hwnd_void;
-    if (hwnd == nullptr || !IsWindow(hwnd)) return;
-    HMONITOR mon = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-    MONITORINFO mi{};
-    mi.cbSize = sizeof mi;
-    if (!GetMonitorInfoW(mon, &mi)) return;
-    RECT wr{};
-    if (!GetWindowRect(hwnd, &wr)) return;
-    if (wr.left == mi.rcMonitor.left && wr.top == mi.rcMonitor.top &&
-        wr.right == mi.rcMonitor.right && wr.bottom == mi.rcMonitor.bottom) return;
-    const LONG_PTR mask = WS_CAPTION | WS_BORDER | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU;
-    LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-    if (style & mask) SetWindowLongPtrW(hwnd, GWL_STYLE, (style & ~mask) | WS_POPUP);
-    SetWindowPos(hwnd, nullptr, mi.rcMonitor.left, mi.rcMonitor.top,
-                 mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-                 SWP_NOZORDER | SWP_FRAMECHANGED | SWP_NOACTIVATE);
-    const unsigned n = g_r243_n.fetch_add(1) + 1;
-    if (n <= 8u || (n % 100u) == 0u)
-    {
-        char l[280];
-        snprintf(l, sizeof l, "[MGPU][R243] the game window shrank to %ldx%ld; re-pinned to the monitor %ldx%ld so the "
-                              "composed output covers the screen (DPI-virtualized titles resize on every activation). (%u so far)",
-                 (long)(wr.right - wr.left), (long)(wr.bottom - wr.top),
-                 (long)(mi.rcMonitor.right - mi.rcMonitor.left), (long)(mi.rcMonitor.bottom - mi.rcMonitor.top), n);
-        mgpu::diag::info(l);
-    }
+    // Do not resize or restyle the native host. DComp fits the neural visual to
+    // its actual physical client area in gpu1_context.cpp instead.
+    (void)hwnd_void;
 }
 static bool on_set_fullscreen_state(reshade::api::swapchain *swapchain, bool fullscreen, void *)
 {
@@ -1708,12 +1701,13 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             if (i + 1u < np) ImGui::Spacing();
         }
         bool fg = pm_fg_want;
-        if (ImGui::Checkbox("frame generation on the neural card", &fg))
+        if (ImGui::Checkbox("frame generation 4x", &fg))
         {
             if (mgpu::gpu1::ui_ini_write("FrameGen", fg ? 4 : 0)) pm_fg_want = fg;
+            if (fg) mgpu::gpu1::ui_ini_write("FGX", 4);   // 4x pipeline: three DLSSG evaluates per real frame
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("(experimental; off by default)");
+        ImGui::TextDisabled("(on the neural card; experimental; off by default)");
         if (pm_fg_want != pm_fg_file) differs = true;
         // R363: NRPreset1x2 is live too (the Best button applies it through ui_set_network)
         if (differs)
@@ -1742,7 +1736,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                                  : ((st.nrs_on && ((st.nrs_pass_mask >> i) & 1u)) ? "Residual (NRScale, N01950)" : "Native");
                 ImGui::Text("pass %u: %s, %s", i + 1u, net, mode);
             }
-            ImGui::Text("StageCopy %s | frame generation %s | DLSS-NR DLL %s",
+            ImGui::Text("StageCopy %s | frame generation 4x %s | DLSS-NR DLL %s",
                         st.stage_on ? "on" : "off", st.fg_on ? "on" : "off", st.nr_dll_version);
         }
     }

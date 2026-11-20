@@ -1263,7 +1263,7 @@ namespace mgpu::psimple
 
         // Title + armed status, the "Prism Core / 运行中" line. The state word carries the
         // spectral colour (green running, amber waiting), same as the prism panel's corner.
-        ImGui::TextUnformatted(T_("MGPU 神经渲染", "MGPU neural rendering"));
+        ImGui::TextUnformatted("MGPU Prism 2.4");
         {
             const char *zs = st.armed ? T_("运行中", "running") : T_("等待画面", "waiting");
             const ImVec4 c = st.armed ? PK_READY : PK_CAUTION;

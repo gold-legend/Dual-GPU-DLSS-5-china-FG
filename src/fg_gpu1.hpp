@@ -1,7 +1,6 @@
 #pragma once
 
 // Experimental secondary-adapter DLSS Frame Generation. OFF unless FrameGen=4.
-// FGMulti=2|4 selects one or three distinct generated frames per real frame.
 // DLSSG uses the official 0.6.0 path: the motion vectors and depth already
 // transported to GPU1, with the camera estimated from FGFov/FGNear/FGFar.
 // NativeInput=1 remains a separate GPU0 readback diagnostic, not an FG input.
@@ -39,18 +38,9 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
             ID3D12Resource *mvec, ID3D12Resource *depth, float mv_el,
             uint64_t game_frame);
 
-// Bridge thread only. Neural OFF drains and joins the pacing thread before
-// the worker takes presentation back; neural ON resumes FG after that handover.
-// Returns whether handoff() may be used for the current worker iteration.
-bool sync_neural(bool neural);
-
 // True only when this module's single pacing thread presents this output.
 // A false return always means the worker presents the current real nr_final.
 bool handoff(float r, float g, float b);
-
-// Rolling FPS of the frames this module's pacing thread actually presented
-// (generated + real). 0 before the first pair. Overlay read, benign race.
-double display_fps();
 
 // Join outside the stream lock; its present path takes that lock.
 void stop();

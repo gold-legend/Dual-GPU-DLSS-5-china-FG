@@ -1530,8 +1530,7 @@ namespace
                 // interval later). With NR off no new fg::record() arrives, so the worker MUST
                 // present the live transported input itself; handing off here used to freeze on
                 // the last generated pair forever.
-                const bool neural_now = mgpu::gpu1::stream_neural_enabled();
-                const bool r341_paced = mgpu::fg::sync_neural(neural_now) && mgpu::fg::handoff(cr, cg, cb);
+                const bool r341_paced = mgpu::gpu1::stream_neural_enabled() && mgpu::fg::handoff(cr, cg, cb);
 
                 if (!r341_paced && !mgpu::gpu1::present_frame(cr, cg, cb))
                 {
