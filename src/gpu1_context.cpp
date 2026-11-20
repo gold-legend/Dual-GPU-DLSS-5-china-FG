@@ -10502,6 +10502,17 @@ namespace
         UINT64 mvec_bytes = 0;
         int   mvec_mode = 0;
 
+        // FG zero field (single-GPU input discipline): DLSSG accepts NO motion
+        // vector format but R16G16_FLOAT (fg_gpu1 evaluate() rejects anything
+        // else), so the R32G32 synthetic field above can feed NR but never FG.
+        // A same-sized R16G16 committed texture is zero-initialized at creation
+        // (D3D12 guarantees it, as the R309 comment below states) and never
+        // touched again: zero vectors are exactly correct at rest, and a
+        // consistent zero field flickers never (garbage vectors do - the R258
+        // verdict of 2026-11-20 on NTE). Gated at the FG call site on NR
+        // eating the synthetic field with MVecDX=MVecDY=0.
+        ID3D12Resource *tex_mvec_fg = nullptr;
+
         // ---- R78: THE REAL MOTION VECTOR TRANSPORT, MVec=3 ----
         //
         // MODE 3 IS A DIFFERENT THING FROM MODES 1 AND 2 and shares almost
@@ -11473,26 +11484,130 @@ namespace
     // R343 probe stays free to pick the depth route on evidence.
     static const char MGPU_STARTER_INI[] =
         "; MGPU Prism - starter configuration.\n"
+        "; The verified flicker-free recipe (1.1 lineage) as shipped defaults.\n"
         "; Auto-created beside the add-on on first run; edit freely, every key\n"
         "; takes effect on the next launch (a few are live per frame).\n"
-        "; DepthTransport is intentionally absent: the add-on picks the depth\n"
-        "; route automatically ([R343] in the log). Write the key only to pin it.\n"
-        "AutoArm=1\n"
+        ";\n"
+        "; Deliberately ABSENT keys:\n"
+        ";   DepthTransport - the add-on picks the depth route on evidence ([R343]\n"
+        ";                    in the log). Write the key only to pin it.\n"
+        ";   FrameCap       - no frame cap is applied. Write FrameCap=<n> only if\n"
+        ";                    you want one.\n"
+        ";   MVecSource     - NEVER ship the zero field (MVecSource=3): it blocks the\n"
+        ";                    game's real vector routes and frame generation starves\n"
+        ";                    (every handoff arrives without vectors and no frame is\n"
+        ";                    generated). Real vectors only, learned per title.\n"
+        ";\n"
+        "; Diagnostic keys (Probes, MetaProbe, MVecSweep, EvalTimes, ...) are left\n"
+        "; at their built-in defaults (off) to keep this file about running, not\n"
+        "; measuring.\n"
         "Depth=1\n"
+        "MVec=3\n"
+        "MVecSealValid=1\n"
+        "MVecHoldD3D12=0\n"
+        "MVecLateProbe=0\n"
+        "MVecLatchOffset=0\n"
+        "; MVecExtractOff=1: on a D3D12 title with no NGX contract the R280 extract\n"
+        "; defers the velocity source until it finds a 4-channel buffer to decode.\n"
+        "; A title whose engine only has 2-channel velocity buffers (R16G16) never\n"
+        "; provides one: the defer holds the stream arm forever and the neural\n"
+        "; window never appears. Off: the census candidate ships at once over the\n"
+        "; barrier route. Contract titles (DLSS games) make the extract inert anyway.\n"
+        "MVecExtractOff=1\n"
+        "; Frame generation (DLSS FG on the neural card, 4x = three generated frames\n"
+        "; per real one). On titles whose vectors fail verification the bridge feeds FG\n"
+        "; the same consistent zero field NR gets (R16G16) - frame generation keeps\n"
+        "; working and stationary pictures never flicker; motion smears instead.\n"
+        "FrameGen=4\n"
+        "FGX=4\n"
+        "FGMulti=2\n"
+        "FGMvScaleNow=1\n"
+        "FGMvUnit=1\n"
+        "FGSkipCarry=1\n"
+        "FGPace=1\n"
+        "FGSkipJump=0\n"
+        "MVecScaleX=1.0\n"
+        "MVecScaleY=1.0\n"
+        "MVecDX=0.0\n"
+        "MVecDY=0.0\n"
         "DepthInverted=1\n"
-        "Passes=3\n"
-        "NRScale=0.65\n"
-        "NRScale1=0.69\n"
-        "NRScale2=0.58\n"
-        "NRScale3=0.58\n"
-        "NRPreset1=0\n"
-        "NRPreset2=0\n"
-        "NRPreset3=1\n"
-        "FrameGen=0\n"
-        "FGX=2\n"
-        "Frames=0\n";
+        "CopyQueue=2\n"
+        "NRScale=0.58\n"
+        "NRScale2=0.48\n"
+        "Calib=2\n"
+        "CalibRung=0\n"
+        "MvecFromEval=2\n"
+        "MVecBarrierSource=2\n"
+        "HistoryGate=1\n"
+        "JitterComp=0\n"
+        "RingWindow=1\n"
+        "Stride=0\n"
+        "Neural=1\n"
+        "Passes=2\n"
+        "Intensity=2.20\n"
+        "Intensity1=2.20\n"
+        "Intensity2=2.20\n"
+        "PrismSync=0\n"
+        "PrismSyncIntensity=1.00\n"
+        "PrismSyncGuard=1.00\n"
+        "PrismSyncFilter=1\n"
+        "NRCadence=1\n"
+        "PrismX1=1\n"
+        "PrismX1Intensity=2.15\n"
+        "PrismX1Guard=1.00\n"
+        "PrismX1DetailKeep=0.85\n"
+        "XeSSFG=0\n"
+        "XeSSMultiplier=2\n"
+        "TemporalMotionAdaptive=1\n"
+        "PresentQueue=0\n"
+        "Finish=1\n"
+        "FinishLook=5\n"
+        "FinishGuard=1.00\n"
+        "PassReset=0\n"
+        "Tuning=1\n"
+        "ToneStrength=1.0\n"
+        "StructureStrength=1.0\n"
+        "SkinStrength=0.30\n"
+        "Style=0.00\n"
+        "AutoMask=1\n"
+        "Subrect=100\n"
+        "CostCurve=0\n"
+        "SRUpscale=0\n"
+        "SRSnippet=1\n"
+        "SRPreset=0\n"
+        "SRQuality=2\n"
+        "SRScale=0\n"
+        "SRMvLowRes=2\n"
+        "Reflex=0\n"
+        "ReflexSleep=0\n"
+        "ReflexLatency=0\n"
+        "Auto=0\n"
+        "AutoTargetFps=60\n"
+        "AutoArm=1\n"
+        "DcompOverlay=1\n"
+        "Frames=0\n"
+        "CloseGameWithBridge=1\n"
+        "Present=nr\n"
+        "PresentVsync=1\n"
+        "Window=FIT\n"
+        "Monitor=auto\n"
+        "NoActivate=2\n"
+        "SwapGuard=0\n"
+        "DepthCompare=0\n"
+        "Profile=0\n"
+        "DcompFit=auto\n"
+        "DcompSafeMode=3\n"
+        "NRFrameFilter=0\n"
+        "ResidualPass=2\n"
+        "ResidualScale=0.75\n"
+        "SLTags=0\n"
+        "SLTagsMvec=0\n"
+        "SLTagsCapture=0\n"
+        "MVecStepAside=0\n"
+        "MVecProbe=0\n"
+        "MVecProbeIndex=0\n";
 
-    bool ini_slurp(char *buf, size_t n)
+bool ini_slurp(char *buf, size_t n)
     {
         if (buf == nullptr || n < 2)
         {
@@ -12506,8 +12621,9 @@ namespace {
         // P8.0, before the textures it describes.
         if (s.mvec_up != nullptr && s.mvec_cpu != nullptr) { s.mvec_up->Unmap(0, nullptr); }
         s.mvec_cpu = nullptr;
-        if (s.mvec_up  != nullptr) { s.mvec_up->Release();  s.mvec_up = nullptr; }
+        if (s.mvec_up != nullptr) { s.mvec_up->Release();  s.mvec_up = nullptr; }
         if (s.tex_mvec != nullptr) { s.tex_mvec->Release(); s.tex_mvec = nullptr; }
+        if (s.tex_mvec_fg != nullptr) { s.tex_mvec_fg->Release(); s.tex_mvec_fg = nullptr; }
         // R78: the mode-3 pair, released the same way tex_depth is.
         for (unsigned mi = 0; mi < 2; ++mi)
             if (s.tex_mvec_r[mi] != nullptr)
@@ -15967,6 +16083,15 @@ namespace
                 h = s.mvec_up->Map(0, &nore, reinterpret_cast<void **>(&s.mvec_cpu));
             }
         }
+
+        // FG zero field: R16G16_FLOAT (the ONLY format DLSSG accepts), same
+        // dimensions as the synthetic field. Created directly in the read
+        // state: a committed resource is zero-initialized, and it is never
+        // written again - NR's synthetic field is zeros too (MVecDX/MVecDY=0).
+        if (SUCCEEDED(h))
+            h = make_tex(ndev, s.width, s.height, DXGI_FORMAT_R16G16_FLOAT,
+                         D3D12_RESOURCE_FLAG_NONE,
+                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &s.tex_mvec_fg);
 
         // ---- T1b: the depth textures ----
         //
@@ -29467,10 +29592,21 @@ void stream_poll()
                 }
                 // FG sees ONLY the completed final composite. MV/depth are the
                 // official stream textures, still NON_PIXEL_SHADER_RESOURCE here.
+                // Zero-field modes (MVec=1/2 synthetic, or R311e in mode 3): NR
+                // eats the zero field, so FG gets the same consistent input -
+                // its own R16G16 zero texture - instead of starving on null.
+                // Single-GPU input discipline: the two networks never see
+                // different motion for the same frame.
                 if (final_pass_ok && s.nr_final != nullptr)
                 {
+                    bool fg_zero;
+                    if (s.mvec_mode != 3)
+                        fg_zero = s.tex_mvec_fg != nullptr && s.mvec_dx == 0.0f && s.mvec_dy == 0.0f;
+                    else
+                        fg_zero = s.tex_mvec_fg != nullptr && s.r309_zero_ready &&
+                                  (s.r309_aside || (g_mvec_x_active.load(std::memory_order_relaxed) && s.x_verdicts == 0u));
                     mgpu::fg::record(s.nl, s.nr_final,
-                                     mvec_here ? s.tex_mvec_r[ii] : nullptr,
+                                     fg_zero ? s.tex_mvec_fg : (mvec_here ? s.tex_mvec_r[ii] : nullptr),
                                      depth_here ? s.tex_depth[ii] : nullptr,
                                      mv_el_frame, gnow);
                     if (s.native_last_bound == gnow)
