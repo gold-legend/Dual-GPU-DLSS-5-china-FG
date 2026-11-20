@@ -404,7 +404,7 @@ static void *g_dcomp_scale = nullptr;   // IDCompositionScaleTransform, R271
 // launch, at the site that already resizes and commits the chain
 // (present_resize): no file write, no new lock use, no next-launch marker.
 static int   g_dcomp_fit = 0;           // DcompFit: 0 off, 1 on, 2 auto; read once when the chain is created
-namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); int ini_read_depth_transport(); int ini_read_skinguard_mode(); }   // unnamed-namespace readers, defined below (R312 added)
+namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); int ini_read_depth_transport(); bool ini_depth_transport_key_seen(); int ini_read_skinguard_mode(); }   // unnamed-namespace readers, defined below (R312 added; R343 added the key-seen probe)
 namespace { int ini_read_sr_int(const char *key, int dflt, int lo, int hi); }   // R335: the Factory4 key, read in create_present_chain
 // R337: the DLL identity line on a CreateFeature refusal reuses R210's version / SHA-256 readers (defined later in this file).
 namespace
@@ -604,6 +604,11 @@ void tap_copy_scope(bool on) { t_tap_copy_scope = on; }
 static std::atomic<unsigned> g_r312_w{0}, g_r312_h{0}, g_r312_fmt{0};
 static std::atomic<bool> g_r312_set{false};
 int depth_transport() { return ini_read_depth_transport(); }
+// R343 (auto depth fallback). Was DepthTransport written into mgpu.ini by the user?
+// dllmain's fallback only fires when it was NOT - an explicit value is respected
+// exactly, key absent (the default) leaves the route open to automatic repair.
+// Cached like the value: this runtime treats an ini edit as a restart decision.
+bool depth_transport_explicit() { return ini_depth_transport_key_seen(); }
 // R315 (MVecBarrierSource=1). dllmain hands the probe's key and fire count over each game frame
 // (this file does not include the probe's header - the acquisition layer stays independent).
 static std::atomic<int> g_r315_on{0};
@@ -11889,6 +11894,17 @@ namespace
         }
         cached = v;
         return v;
+    }
+
+    // R343: key-presence probe for the auto fallback. Cached for the same reason
+    // the value is: an ini edit takes effect on restart, not mid-run.
+    bool ini_depth_transport_key_seen()
+    {
+        static int seen = -1;
+        if (seen >= 0) return seen != 0;
+        char buf[INI_BYTES];
+        seen = (ini_slurp(buf, sizeof buf) && ini_find(buf, "DepthTransport") != nullptr) ? 1 : 0;
+        return seen != 0;
     }
 
     int ini_read_depth_inverted()

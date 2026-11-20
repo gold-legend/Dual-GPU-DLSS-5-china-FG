@@ -4114,7 +4114,40 @@ static void on_reshade_finish_effects(reshade::api::effect_runtime *runtime,
                     // Key absent (1): this block is three loads and nothing else.
                     {
                         static bool r312_done = false;
-                        const int r312 = r312_done ? 1 : mgpu::gpu1::depth_transport();
+                        int r312 = r312_done ? 1 : mgpu::gpu1::depth_transport();
+                        // ---- R343: AUTO FALLBACK to the render-size tap (the DepthTransport=3 route) ----
+                        //
+                        // Bare installs die on contract titles whose ReShade never raises the depth
+                        // tap (MGPU_DepthOutTex stays 0 - R139 shows tap 0x0 beside a live table):
+                        // the arm holds for depth and the neural window never comes up. The fix is
+                        // not a new route - it is the EXISTING transport-3 push (render-size geometry
+                        // into mgpu_depth_tap.fx, which reloads the effect and re-arms the hold), taken
+                        // automatically on evidence: the game's own NGX table declares depth while the
+                        // tap has stayed silent for a grace window. A user who wrote DepthTransport into
+                        // mgpu.ini is never overridden (depth_transport_explicit); titles without a
+                        // contract (RE2) never see table depth, so the probe never fires there.
+                        if (!r312_done && r312 == 1)
+                        {
+                            static unsigned r343_tbl_frames = 0;
+                            static bool r343_decided = false;
+                            if (!r343_decided && !mgpu::gpu1::depth_transport_explicit())
+                            {
+                                mgpu::calibrator::table r343_t;
+                                if (mgpu::calibrator::read(r343_t) && r343_t.depth != 0ull)
+                                {
+                                    ++r343_tbl_frames;
+                                    if (r343_tbl_frames >= 90 && mgpu::probe::depth_source() == 0ull)
+                                    {
+                                        r343_decided = true;
+                                        r312 = 3;
+                                        mgpu::diag::info("[MGPU][R343] DEPTH LANE: the game's NGX table declares depth but the tap "
+                                                         "(MGPU_DepthOutTex) has been silent for 90+ frames - switching to the "
+                                                         "render-size tap route (equivalent to DepthTransport=3) automatically. "
+                                                         "mgpu.ini has no explicit DepthTransport; write one to pin the route.");
+                                    }
+                                }
+                            }
+                        }
                         // R342a (E8): the pushed definitions persist in ReShadePreset.ini across launches, so
                         // a launch with DepthTransport absent / 1 after a run at 2-4 kept the tap at the OLD
                         // geometry while this add-on expected the full frame. Once per launch: if any

@@ -424,6 +424,8 @@ void tap_copy_scope(bool on);
 // R312 (DepthTransport). depth_transport(): the key, 1..4 (absent = 1). r312_set_target: dllmain, once,
 // the geometry it pushed into the tap's .fx; the arm then holds for depth until the tap matches it.
 int depth_transport();
+// R343: true when the user wrote DepthTransport into mgpu.ini (auto fallback stays off then).
+bool depth_transport_explicit();
 void r312_set_target(unsigned w, unsigned h, unsigned fmt);
 // R315: dllmain hands over the probe's MVecBarrierSource key and its fire count, each game frame, key on only.
 void r315_note(int on, unsigned long long fires);
