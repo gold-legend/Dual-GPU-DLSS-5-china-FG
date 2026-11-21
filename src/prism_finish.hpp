@@ -37,6 +37,9 @@
 //                     3 muted 4 rich. Live-changeable from the panel.
 //       FinishGuard   0.0..1.0, default 1.0 (character guard strength; 0 = off).
 //                     Live-changeable from the panel.
+//       FinishAnime   0 or 1, default 0. The panel's anime-colour switch: on widened
+//                     skin/chroma masks, restore only neural darkening toward the
+//                     same frame's original colour. Live-changeable from the panel.
 //       FinishGamma   0 or 2.0..2.6, default 2.2: the display-code <-> scene-linear
 //                     wrap around the grade. prism single-card graded the game's
 //                     LINEAR frame; the bridge's NR output is display code, so the
@@ -82,8 +85,10 @@ void apply(ID3D12GraphicsCommandList *cl, unsigned parity, ID3D12Resource *out, 
 // Live panel control. Values are picked up by the very next dispatch.
 void set_look(unsigned look);      // 0..5 (5 = the custom grade, Look 5)
 void set_guard(float guard);       // 0..1, clamped
+void set_anime(bool enabled);      // protect anime skin/chroma from neural darkening
 unsigned look();                   // what the next dispatch will use
 float guard();
+bool anime();
 
 // ---- the custom grade table (Look 5), ported from prism-core 1.5.1's grade.h ----
 // Indices are prism::Grade (prism_grade.h, 66 controls). Values are in the table's own units.

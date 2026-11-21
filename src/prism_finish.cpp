@@ -32,6 +32,7 @@ std::atomic<bool> g_active{false};
 // ---- keys (defaults; live values come from the atomics below) ----
 std::atomic<unsigned> g_look{0};        // 0..4 (5 falls back to 0)
 std::atomic<float>    g_guard{1.0f};    // 0..1
+std::atomic<unsigned> g_anime{0};       // 0 off, 1 protect anime colours from neural darkening
 float    g_gamma = 2.2f;                // arm-time only (a per-dispatch pow is cheap; keep it live-read from here)
 unsigned g_w = 0, g_h = 0;
 DXGI_FORMAT g_fmt = DXGI_FORMAT_UNKNOWN;
@@ -109,6 +110,26 @@ const char kWrapSuffix[] =
     "    const float sat = smoothstep(0.35, 0.7, mx > 1e-4 ? (mx - mn) / mx : 0.0);\n"
     "    const float w = max(skin * 0.8, sat * 0.7) * gGuard;\n"
     "    n = lerp(n, o, saturate(w * 0.85));\n"
+    "  }\n"
+    // 二次元: widen the skin locus for cel-shaded / pale characters and include
+    // vivid hair or cloth. Only neural DARKENING is rolled back toward the same
+    // frame's game colour; neural brightening and the later Look grade stay intact.
+    "  if (gPad0 != 0u && gGuard >= 0.0)\n"
+    "  {\n"
+    "    const float3 d = saturate(o) * 255.0;\n"
+    "    const float cb = 128.0 - 0.168736 * d.r - 0.331264 * d.g + 0.5 * d.b;\n"
+    "    const float cr = 128.0 + 0.5 * d.r - 0.418688 * d.g - 0.081312 * d.b;\n"
+    "    const float2 q = float2((cb - 107.0) / 32.0, (cr - 150.0) / 26.0);\n"
+    "    const float skin = exp(-dot(q, q)) * smoothstep(0.04, 0.16, PfLuma(o));\n"
+    "    const float mx = max(o.r, max(o.g, o.b));\n"
+    "    const float mn = min(o.r, min(o.g, o.b));\n"
+    "    const float chroma = smoothstep(0.16, 0.50, mx > 1e-4 ? (mx - mn) / mx : 0.0) *\n"
+    "                         smoothstep(0.08, 0.30, PfLuma(o));\n"
+    "    const float mask = max(skin, chroma * 0.65);\n"
+    "    const float resL = PfLuma(n) + 1.0 / 512.0;\n"
+    "    const float origL = PfLuma(o) + 1.0 / 512.0;\n"
+    "    const float dark = smoothstep(0.04, 0.35, log2(origL / resL));\n"
+    "    n = lerp(n, o, saturate(mask * dark));\n"
     "  }\n"
     // HDR luma cap belongs to the guard path. grade_only (-1) skips it because
     // PSYNC has already done its own reconstruction/guard work.
@@ -217,6 +238,8 @@ bool read_keys()
     if (look > 5u) look = 5u;
     g_look.store(look, std::memory_order_relaxed);
     g_guard.store(key_float(buf.data(), got, "FinishGuard", 1.0f, 0.0f, 1.0f),
+                  std::memory_order_relaxed);
+    g_anime.store(key_flag(buf.data(), got, "FinishAnime") ? 1u : 0u,
                   std::memory_order_relaxed);
     g_gamma = key_float(buf.data(), got, "FinishGamma", 2.2f, 0.0f, 2.6f);
     if (g_gamma > 0.0f && g_gamma < 2.0f) g_gamma = 2.2f;
@@ -494,10 +517,11 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt, bo
     g_active.store(true, std::memory_order_relaxed);
     char l[300];
     snprintf(l, sizeof l,
-             "[MGPU][PFN] prism finish ON: look=%u guard=%.2f gamma=%.2f at %ux%u fmt=%d "
+             "[MGPU][PFN] prism finish ON: look=%u guard=%.2f anime=%u gamma=%.2f at %ux%u fmt=%d "
              "(prism-core 1.5.1 look pipeline, vendored verbatim; e-field not ported)",
              g_look.load(std::memory_order_relaxed),
-             (double)g_guard.load(std::memory_order_relaxed), (double)g_gamma,
+             (double)g_guard.load(std::memory_order_relaxed),
+             g_anime.load(std::memory_order_relaxed), (double)g_gamma,
              g_w, g_h, (int)g_fmt);
     mgpu::diag::info(l);
     return true;
@@ -532,6 +556,7 @@ void apply(ID3D12GraphicsCommandList *cl, unsigned parity, ID3D12Resource *out, 
     c.look = g_look.load(std::memory_order_relaxed);
     c.guard = grade_only ? -1.0f : g_guard.load(std::memory_order_relaxed);
     c.gamma = g_gamma;
+    c.pad0 = g_anime.load(std::memory_order_relaxed);
     if (c.look == 5u) repack_grade();   // refresh the film grain's per-frame seed
     cl->SetComputeRoot32BitConstants(0, 8, &c, 0);
     cl->SetComputeRootDescriptorTable(2, gpu_slot(parity, 0u));
@@ -543,8 +568,8 @@ void apply(ID3D12GraphicsCommandList *cl, unsigned parity, ID3D12Resource *out, 
     {
         g_said_first = true;
         char l[240];
-        snprintf(l, sizeof l, "[MGPU][PFN] first finish dispatch applied (look=%u guard=%.2f grade_only=%d).",
-                 c.look, (double)c.guard, grade_only ? 1 : 0);
+        snprintf(l, sizeof l, "[MGPU][PFN] first finish dispatch applied (look=%u guard=%.2f anime=%u grade_only=%d).",
+                 c.look, (double)c.guard, c.pad0, grade_only ? 1 : 0);
         mgpu::diag::info(l);
     }
     else if ((g_applies % 600ull) == 0ull)
@@ -656,6 +681,18 @@ void set_guard(float guard)
     g_guard.store(guard, std::memory_order_relaxed);
 }
 
+void set_anime(bool enabled)
+{
+    const unsigned value = enabled ? 1u : 0u;
+    const unsigned old = g_anime.exchange(value, std::memory_order_relaxed);
+    if (old != value)
+    {
+        char l[128];
+        snprintf(l, sizeof l, "[MGPU][PFN] LIVE anime %u -> %u", old, value);
+        mgpu::diag::info(l);
+    }
+}
+
 unsigned look()
 {
     return g_look.load(std::memory_order_relaxed);
@@ -664,6 +701,11 @@ unsigned look()
 float guard()
 {
     return g_guard.load(std::memory_order_relaxed);
+}
+
+bool anime()
+{
+    return g_anime.load(std::memory_order_relaxed) != 0u;
 }
 
 void release()

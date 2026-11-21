@@ -1624,7 +1624,7 @@ struct OvSet
     bool enabled = false, split = false, armed = false;
     int look = 0, modelStyle = 0, passes = 1, cadence = 1, gradeSlot = 0, fpsCap = 0;
     float intensity = 1.0f, guard = 1.0f, faceMask = 0.30f, nrs = 0.75f, nrsCap = 1.0f, splitPos = 0.5f;
-    bool nrsOn = false;
+    bool nrsOn = false, anime = false;
     unsigned outW = 0, outH = 0, netW = 0, netH = 0;
     prism::GradeValues grade[prism::kGradeSlots];
 };
@@ -1708,6 +1708,7 @@ void ReadSet(OvSet &s)
     physical_output_extent(st.nrs_native_w, st.nrs_native_h, s.outW, s.outH);
     s.netW = st.nrs_work_w;
     s.netH = st.nrs_work_h;
+    s.anime = mgpu::pfinish::anime();
     if (mgpu::pfinish::active())
     {
         s.look = int(mgpu::pfinish::look());
@@ -1801,6 +1802,11 @@ void ApplySet(const OvSet &s)
     }
     const int wantMode = s.split ? 2 : 0;
     if (int(st.present_mode) != wantMode) mgpu::gpu1::ui_set_present_mode(wantMode);
+    if (mgpu::pfinish::anime() != s.anime)
+    {
+        mgpu::pfinish::set_anime(s.anime);
+        (void)mgpu::gpu1::ui_ini_write("FinishAnime", s.anime ? 1 : 0);
+    }
     if (mgpu::pfinish::active())
     {
         if (mgpu::pfinish::look() != unsigned(s.look))
@@ -1869,6 +1875,7 @@ enum Row
     kCadence,
     kNetScale,
     kGuard,
+    kAnime,
     kFaceMask,
     kFpsCap,
     kSplit,
@@ -2051,7 +2058,7 @@ void Cursor(float x, float y)
 const wchar_t *RowLabel(int r)
 {
     static const wchar_t *labels[kRows] = {
-        L"神经渲染", L"色彩", L"强度", L"模型风格", L"遍数", L"节奏", L"网络分辨率", L"角色守护", L"人脸遮罩", L"FPS 对齐", L"分屏对比", L"帧生成",
+        L"神经渲染", L"色彩", L"强度", L"模型风格", L"遍数", L"节奏", L"网络分辨率", L"角色守护", L"二次元", L"人脸遮罩", L"FPS 对齐", L"分屏对比", L"帧生成",
         L"P1 网络", L"P1 分辨率", L"P2 网络", L"P2 分辨率", L"P3 网络", L"P3 分辨率"};
     return labels[r];
 }
@@ -2088,6 +2095,8 @@ std::wstring RowHelp(int r, const OvSet &s, int option)
         return L"全局网络分辨率主控，30% 到 100%。调整后同步到当前所有遍；需要不同尺寸时，再使用下方的 P1／P2／P3 独立分辨率。";
     case kGuard:
         return L"角色守护强度，0% 关闭，100% 完整启用。沿用原有多遍之间的角色区域保护，不是 DLSSNR.ControlMask；拖动、滚轮或方向键可实时调节并保存。";
+    case kAnime:
+        return L"仅恢复神经画面造成的人物肤色／高饱和颜色压暗，实时生效并保存。";
     case kFaceMask:
         return L"人脸遮罩默认 30%，独立调节 NVIDIA 自动人脸／皮肤区域的结构处理，与角色守护无关。遮罩内仍有神经画面，0% 也不关闭神经渲染；每一遍都实时生效并保存。";
     case kFpsCap:
@@ -2150,9 +2159,9 @@ void DrawPanel(UINT bw, UINT bh, float dt)
     // 2026-11-14: the row count outgrew one column and the tail rows were buried at the
     // bottom of a screen-tall panel. Two columns: everything is visible at a glance.
     const float headH = U(52), telH = U(170), helpH = U(64), footH = U(40);
-    // Twelve base rows (including DLSS FG) plus network/resolution per pass.
-    // Character guard and NVIDIA face mask are separate strength sliders.
-    const int visRows = 12 + 2 * std::clamp(s.passes, 1, 3);
+    // Thirteen base rows (including DLSS FG) plus network/resolution per pass.
+    // Character guard, anime colour protection and NVIDIA face mask are independent.
+    const int visRows = 13 + 2 * std::clamp(s.passes, 1, 3);
     if (panel.focus >= visRows) panel.focus = visRows - 1;
     const int rowsLeft = (visRows + 1) / 2;   // rows in the first column; the rest go right
     const float colW = (W - pad * 2.0f) / 2.0f;
@@ -2314,8 +2323,9 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         switch (r)
         {
         case kOn:
-        case kSplit: {
-            bool v = r == kOn ? n.enabled : n.split;
+        case kSplit:
+        case kAnime: {
+            bool v = r == kOn ? n.enabled : r == kSplit ? n.split : n.anime;
             clicked = Segments(r, cx1 - U(120), sy, cx1, sh, {L"关", L"开"}, v ? 1 : 0, 3, 0, &hover, dt, true);
             bool nv = v;
             if (clicked >= 0) nv = clicked == 1;
@@ -2323,16 +2333,10 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             if (focused && in.enter) nv = !v;
             if (nv != v)
             {
-                if (r == kOn)
-                {
-                    n.enabled = nv;
-                    changed = true;
-                }
-                else
-                {
-                    n.split = nv;
-                    changed = true;
-                }
+                if (r == kOn) n.enabled = nv;
+                else if (r == kSplit) n.split = nv;
+                else n.anime = nv;
+                changed = true;
             }
             break;
         }

@@ -1446,6 +1446,24 @@ namespace mgpu::psimple
             ImGui::TextDisabled("-");
         }
 
+        // 二次元: protect pale / cel-shaded skin and vivid character colours only
+        // where the neural result darkened them. Live on the next finish dispatch.
+        {
+            row_label("二次元", "anime colour protection");
+            if (mgpu::pfinish::active())
+            {
+                static const char *an[2] = {};
+                if (an[0] == nullptr) { an[0] = T_("关", "OFF"); an[1] = T_("开", "ON"); }
+                int cur = mgpu::pfinish::anime() ? 1 : 0;
+                if (segments("pf.anime", an, 2, cur, ctrl_w * 0.5f))
+                {
+                    mgpu::pfinish::set_anime(cur == 1);
+                    (void)mgpu::gpu1::ui_ini_write("FinishAnime", cur);
+                }
+            }
+            else ImGui::TextDisabled("-");
+        }
+
         // 分屏对比: 关 / 开 (the P7.4 split view, input left of the seam, output right).
         {
             row_label("分屏对比", "split compare");
