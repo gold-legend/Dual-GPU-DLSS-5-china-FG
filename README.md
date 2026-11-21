@@ -119,6 +119,15 @@ src/worker.cpp             神经开关与呈现线程交接
 
 详细归属见[第三方授权说明](THIRD_PARTY.md)。项目主体与新增代码沿用 [MIT 许可](LICENSE)，不代表上述作者或厂商为本分支背书。
 
+## 游戏本地参数对照
+
+这些文件是本机实机配置快照，用于玩家对照，不代表所有机器都应照抄。先退出游戏，再把目标文件复制为游戏 exe 旁的 `mgpu.ini`；替换前保留自己的配置。
+
+- [剑星本地参数](configs/stellar-blade.ini)：RTX 3070 Ti 渲染＋RTX 5060 Ti 神经处理，3840×2160、D3D12、三遍网络分辨率 69%／58%／58%、前两遍 `NRPreset=0`、第三遍 `NRPreset3=1`、`NRVectors=chain`、`PrismNRVecZero=0` 和 FG 4x。NR 保留真实游戏向量；不要混入异环的 `MVecSource=3`。文件故意不写 `FGPairFlow`，用于对照 2.4 的全局缺省开启规则。`FrameCap=115`、`Perf11=1`、`FGInstr=1`、`LatSplit=1` 是本机测试值，不是通用推荐；不需要 115 FPS 上限时删除 `FrameCap` 行。
+- [异环本地参数](configs/yihuan.ini)：保留该游戏的 NR 零向量路径，与剑星的真实 NR 向量路线不同。FGPairFlow 是 FG 的独立运动来源，不改变 NR 的每游戏向量选择。
+
+以上快照只说明对应实机配置和运行验证条件，不承诺其他机器无闪烁、无拖影或相同帧率。
+
 ## 发布文件
 
 - `MGPU-Prism-FG-2.1-Runtime.zip`：插件、默认配置、深度 tap、中文安装说明与许可。
