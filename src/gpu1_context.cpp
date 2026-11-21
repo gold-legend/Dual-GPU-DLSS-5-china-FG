@@ -10938,6 +10938,10 @@ namespace
         unsigned long long r311_dropped = 0;            // R311: copies from the game's own routes dropped under MVecSource (mvec_cs)
         bool     r311_drop_said = false;
         bool     r309_aside = false;                     // the zero field is bound in place of the vectors
+        // R403: independent vector routes. NR always receives the synthetic zero
+        // field while the real frame's transported vectors remain available to FG.
+        bool     fg_real_mv = false;
+        unsigned long long r403_real = 0, r403_fallback = 0;
         bool     r309_zero_ready = false;                // tex_mvec holds zeros and is in a read state
         bool     r309_probe_own = false;                 // the probe in flight was started by R309 alone
         int      r309_ring[6] = {0,0,0,0,0,0};          // last 6 judged probes: -1 worse, +1 better, 0 neither
@@ -11541,18 +11545,18 @@ namespace
         "; window never appears. Off: the census candidate ships at once over the\n"
         "; barrier route. Contract titles (DLSS games) make the extract inert anyway.\n"
         "MVecExtractOff=1\n"
-        "; MVecTap=0 + MVecLearned=99: the verified flicker-free recipe (NTE lineage).\n"
+        "; MVecTap=0 + MVecLearned=99: the verified NTE NR recipe (1.1 lineage).\n"
         "; 99 = no buffer of this title passed the R258 warp test - bind the synthetic\n"
         "; zero field for NR from the arm instead of spending the first launch re-learning\n"
         "; it (a fresh ini without these keys re-runs the probe and that session flickers).\n"
-        "; FG keeps working: it is fed the same zero field (R16G16).\n"
         "MVecTap=0\n"
         "MVecLearned=99\n"
-        "; Frame generation (DLSS FG on the neural card, 4x = three generated frames\n"
-        "; per real one). On titles whose vectors fail verification the bridge feeds FG\n"
-        "; the same consistent zero field NR gets (R16G16) - frame generation keeps\n"
-        "; working and stationary pictures never flicker; motion smears instead.\n"
+        "; Frame generation: DLSS FG on the neural card; 4x = three generated frames\n"
+        "; per real one. FGPairFlow gives FG an independent motion source below.\n"
         "FrameGen=4\n"
+        "; FGPairFlow defaults ON for every title: FG estimates motion from its own final colour pairs.\n"
+        "; NR keeps its per-title vector route. Set FGPairFlow=0 to restore the legacy FG input.\n"
+        "FGPairFlow=1\n"
         "FGX=4\n"
         "FGMulti=2\n"
         "FGMvScaleNow=1\n"
@@ -22742,6 +22746,18 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
                 mgpu::diag::warn("[MGPU][R309] MVecSource=3 / MVecStepAside=1 (forced): the synthetic field (MVec=1, MVecDX/MVecDY - zero "
                                  "unless you set them) is bound from the arm. No tap learning, no R280, no probes.");
             }
+            // R403: one explicit experiment key. Keep the real-vector transport
+            // alive for FG even when MVecLearned=99 would otherwise collapse the
+            // whole stream to synthetic input. NR is forced to zero separately.
+            s.fg_real_mv = ini_read_float("FGRealMV", 0.0f) != 0.0f;
+            if (s.fg_real_mv && s.mvec_mode == 3 && s.r311_src == 0)
+            {
+                s.r311_src = 2;   // census-selected real frame vectors, tap only
+                g_r311_src.store(2, std::memory_order_relaxed);
+                mgpu::diag::info("[MGPU][R403] FGRealMV=1: NR binds the synthetic ZERO field; "
+                                 "FG independently receives the transported vectors and depth of each real frame. "
+                                 "The census tap stays enabled so MVecLearned=99 cannot starve FG. Missing vectors use the zero fallback.");
+            }
             const bool auto_learn = !ini_has_key("MVecTap") && ui_ini_read("MVecLearned", -1) < 0 && s.mvec_mode == 3 && no_contract && s.r311_src == 0;
             // R311: MVecSource=1 / 2 turn the tap on the way the learning does (R278b), without the learning:
             // R280's target (1) or the census pick (2) is copied by the tap, nothing is written back.
@@ -27852,7 +27868,8 @@ void stream_poll()
                 // extract never earns one (Far Cry 6), the zero field is what DLSS-NR gets - from the first evaluate,
                 // not after a judge stepped aside from strobing vectors. The copies and the probes carry on so the
                 // verdict can still arrive. The tap path (Skyrim) and contract titles are not on this branch.
-                const bool r311e_zero = s.r309_aside || (g_mvec_x_active.load(std::memory_order_relaxed) && s.x_verdicts == 0u);
+                const bool r311e_zero = s.fg_real_mv || s.r309_aside ||
+                                        (g_mvec_x_active.load(std::memory_order_relaxed) && s.x_verdicts == 0u);
                 if (s.mvec_mode == 3 && r311e_zero && !s.r309_zero_ready &&
                     s.tex_mvec != nullptr && s.mvec_cpu != nullptr && s.mvec_up != nullptr)
                 {
@@ -29960,23 +29977,39 @@ void stream_poll()
                     barrier(s.nl, s.tex_in[ii], D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
                 }
                 }
-                // FG sees ONLY the completed final composite. MV/depth are the
-                // official stream textures, still NON_PIXEL_SHADER_RESOURCE here.
-                // Zero-field modes (MVec=1/2 synthetic, or R311e in mode 3): NR
-                // eats the zero field, so FG gets the same consistent input -
-                // its own R16G16 zero texture - instead of starving on null.
-                // Single-GPU input discipline: the two networks never see
-                // different motion for the same frame.
+                // FG sees ONLY the completed final composite. The legacy path keeps
+                // NR and FG on the same field. R403 is the deliberate exception:
+                // NR stays on zero while FG consumes this real frame's own vectors.
                 if (final_pass_ok && s.nr_final != nullptr)
                 {
-                    bool fg_zero;
-                    if (s.mvec_mode != 3)
-                        fg_zero = s.tex_mvec_fg != nullptr && s.mvec_dx == 0.0f && s.mvec_dy == 0.0f;
+                    ID3D12Resource *fg_vectors = nullptr;
+                    if (s.fg_real_mv)
+                    {
+                        fg_vectors = mvec_here ? s.tex_mvec_r[ii] : s.tex_mvec_fg;
+                        if (mvec_here) ++s.r403_real; else ++s.r403_fallback;
+                        const unsigned long long rn = s.r403_real + s.r403_fallback;
+                        if (rn == 1ull || rn % 120ull == 0ull)
+                        {
+                            char rl[360];
+                            snprintf(rl, sizeof rl,
+                                "[MGPU][R403][LIVE] frame=%llu NR=ZERO FG-real-MV=%llu FG-zero-fallback=%llu "
+                                "this-frame=%s depth=%d FGX=4",
+                                (unsigned long long)gnow, s.r403_real, s.r403_fallback,
+                                mvec_here ? "REAL" : "ZERO", depth_here ? 1 : 0);
+                            mgpu::diag::info(rl);
+                        }
+                    }
                     else
-                        fg_zero = s.tex_mvec_fg != nullptr && s.r309_zero_ready &&
-                                  (s.r309_aside || (g_mvec_x_active.load(std::memory_order_relaxed) && s.x_verdicts == 0u));
-                    mgpu::fg::record(s.nl, s.nr_final,
-                                     fg_zero ? s.tex_mvec_fg : (mvec_here ? s.tex_mvec_r[ii] : nullptr),
+                    {
+                        bool fg_zero;
+                        if (s.mvec_mode != 3)
+                            fg_zero = s.tex_mvec_fg != nullptr && s.mvec_dx == 0.0f && s.mvec_dy == 0.0f;
+                        else
+                            fg_zero = s.tex_mvec_fg != nullptr && s.r309_zero_ready &&
+                                      (s.r309_aside || (g_mvec_x_active.load(std::memory_order_relaxed) && s.x_verdicts == 0u));
+                        fg_vectors = fg_zero ? s.tex_mvec_fg : (mvec_here ? s.tex_mvec_r[ii] : nullptr);
+                    }
+                    mgpu::fg::record(s.nl, s.nr_final, fg_vectors,
                                      depth_here ? s.tex_depth[ii] : nullptr,
                                      mv_el_frame, gnow);
                     if (s.native_last_bound == gnow)

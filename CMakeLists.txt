@@ -96,6 +96,9 @@ add_library(mgpu_bridge SHARED
     src/gpu0_stage.cpp
     src/chain_colour_space.cpp
     src/fg_gpu1.cpp
+    # Independent FG-only current/previous frame-pair motion estimation.
+    # FGPairFlow defaults ON globally; FGPairFlow=0 opts out explicitly.
+    src/fg_pair_flow.cpp
     # 0.6.0 display refresh reading for DLSS FG's optional Dynamic gate.
     src/fg_instr.cpp
     # D1 (0.3.0 R&D): the discovery calibrator. OFF unless Discovery=1 in

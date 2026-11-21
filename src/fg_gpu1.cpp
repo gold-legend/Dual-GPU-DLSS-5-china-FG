@@ -19,6 +19,7 @@
 #include "diag.hpp"
 #include "fg_instr.hpp"
 #include "fg_pace.hpp"
+#include "fg_pair_flow.hpp"
 #include "gpu1_context.hpp"
 #include "mgpu_ini_parser.hpp"
 #include "native_gpu1.hpp"
@@ -79,6 +80,7 @@ unsigned long long g_evals = 0, g_fallbacks = 0, g_half_n = 0;
 std::atomic<unsigned long long> g_pres_gen{0}, g_pres_real{0}, g_handoffs{0}, g_dropped{0};
 double g_half_sum = 0, g_ema_ms = 0;
 bool g_pace = true;
+bool g_pair_flow = true;                // FGPairFlow: global default ON; 0 opts out.
 int g_pace_mode = 1;                    // FGPace: 0 immediate, 1 relative, 2 scene clock, 3 absolute.
 int g_fgx = 2;                          // FGX: 2 = one interpolated frame (2x), 4 = three (4x, DLSS4 MFG)
 bool g_fgx_refused = false;             // a 4x evaluate was rejected: 2x for the rest of this arm
@@ -135,7 +137,7 @@ bool module_dir(wchar_t *dir, size_t n)
 bool read_keys(int &framegen, unsigned long long &app_id, bool &diagnose, bool &pace)
 {
     framegen = 0; app_id = 0x4D475055ull; diagnose = false; pace = true;
-    g_pace_mode = 1; g_phase_req = 0; g_dcheck = 0;
+    g_pace_mode = 1; g_phase_req = 0; g_dcheck = 0; g_pair_flow = true;
     wchar_t dir[MAX_PATH];
     if (!module_dir(dir, MAX_PATH)) return false;
     wchar_t path[MAX_PATH];
@@ -156,6 +158,8 @@ bool read_keys(int &framegen, unsigned long long &app_id, bool &diagnose, bool &
     pace = g_pace_mode != 0;
     v = mgpu::config::find(buf.data(), got, "FGX");
     g_fgx = (v != nullptr && atoi(v) == 4) ? 4 : 2;
+    v = mgpu::config::find(buf.data(), got, "FGPairFlow");
+    g_pair_flow = v == nullptr || atoi(v) != 0;
     v = mgpu::config::find(buf.data(), got, "FGPhase");
     if (v != nullptr && (atoi(v) == 67 || atoi(v) == 75)) g_phase_req = atoi(v);
     v = mgpu::config::find(buf.data(), got, "FGDisplayCheck");
@@ -403,7 +407,7 @@ bool extents(ID3D12Resource *r, unsigned &w, unsigned &h, DXGI_FORMAT &fmt)
 NVSDK_NGX_Result evaluate(ID3D12GraphicsCommandList *cl, set_t &set, ID3D12Resource *out,
                           ID3D12Resource *mvec, ID3D12Resource *depth, float mv_el,
                           bool reset, unsigned long long fid,
-                          unsigned mfc = 1u, unsigned mfi = 1u)
+                          unsigned mfc = 1u, unsigned mfi = 1u, bool pair_flow = false)
 {
     unsigned rw = 0, rh = 0, ow = 0, oh = 0, mw = 0, mh = 0, dw = 0, dh = 0;
     DXGI_FORMAT rf = DXGI_FORMAT_UNKNOWN, of = DXGI_FORMAT_UNKNOWN, mf = DXGI_FORMAT_UNKNOWN, df = DXGI_FORMAT_UNKNOWN;
@@ -416,8 +420,10 @@ NVSDK_NGX_Result evaluate(ID3D12GraphicsCommandList *cl, set_t &set, ID3D12Resou
     const float hrad = g_fov * 3.14159265f / 180.0f;
     const float vfov = 2.0f * atanf(tanf(hrad * 0.5f) / aspect);
     const float sign = g_invert_mv ? -1.0f : 1.0f;
-    const float sx = sign * g_i.mvec_scale_x * mv_el / (g_mv_pixels ? 1.0f : (float)mw);
-    const float sy = sign * g_i.mvec_scale_y * mv_el / (g_mv_pixels ? 1.0f : (float)mh);
+    // PairFlow already spans the whole real-frame interval in output pixels.
+    // Never apply the game's sign, elapsed multiplier or unit conversion again.
+    const float sx = pair_flow ? 1.0f : sign * g_i.mvec_scale_x * mv_el / (g_mv_pixels ? 1.0f : (float)mw);
+    const float sy = pair_flow ? 1.0f : sign * g_i.mvec_scale_y * mv_el / (g_mv_pixels ? 1.0f : (float)mh);
     auto *p = g_params;
     p->Set("DLSSG.Backbuffer", set.real);
     p->Set("DLSSG.MVecs", mvec);
@@ -633,12 +639,13 @@ bool arm(const arm_info &i)
         return false;
     }
     g_armed = true;
+    mgpu::fgpair::arm(i.ndev, g_pair_flow, i.w, i.h, i.fmt);
     g_on.store(true, std::memory_order_release);
-    char pace_line[520];
+    char pace_line[560];
     snprintf(pace_line, sizeof pace_line,
-        "[MGPU][FG] 0.6.0 scheduler: FGPace=%d FGPhase=%d FGX=%d FGDisplayCheck=%d display-ms=%.3f. "
+        "[MGPU][FG] 0.6.0 scheduler: FGPace=%d FGPhase=%d FGX=%d FGDisplayCheck=%d FGPairFlow=%d display-ms=%.3f. "
         "FINAL colour + official GPU1-local MV/depth -> DLSSG -> present; estimated camera. Missing inputs present real colour only.",
-        g_pace_mode, g_phase_req, g_fgx, g_dcheck, g_refresh_ms);
+        g_pace_mode, g_phase_req, g_fgx, g_dcheck, mgpu::fgpair::active() ? 1 : 0, g_refresh_ms);
     mgpu::diag::info(pace_line);
     mgpu::diag::info(g_fgx >= 4
         ? "[MGPU][FG] experimental 4x ARMED on the neural card: three DLSSG evaluates per real frame "
@@ -720,12 +727,22 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
 
     // Match 0.6.0: create DLSSG before recording the real-colour copy and use
     // the textures already on GPU1. No second cross-adapter import is involved.
-    if (dynamic != 1u && mvec != nullptr && depth != nullptr && !g_up && !ensure_feature(cl)) return;
+    if (dynamic != 1u && (mvec != nullptr || mgpu::fgpair::active()) && depth != nullptr && !g_up && !ensure_feature(cl)) return;
     transition(cl, nr_final, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(cl, set.real, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST);
     cl->CopyResource(set.real, nr_final);
     transition(cl, set.real, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
     transition(cl, nr_final, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+
+    ID3D12Resource *eval_mvec = mvec;
+    bool pair_flow = false, pair_estimated = false;
+    if (mgpu::fgpair::active())
+    {
+        ID3D12Resource *estimated = mgpu::fgpair::record(cl, set.real, g_k, &pair_estimated);
+        if (estimated != nullptr) { eval_mvec = estimated; pair_flow = true; }
+        if (pair_estimated && g_evals == (g_fgx >= 4 ? 3u : 1u))
+            mgpu::diag::info("[MGPU][FG][PairFlow] first non-reset frame-pair estimate submitted; DLSSG MvecScale=(1,1), NR vector path unchanged.");
+    }
     set.frame = game_frame; set.gen_n = 0; set.handed = false; set.phase = 0.0f;
     set.elapsed = mv_el > 0.0f ? mv_el : 1.0f;
     const unsigned long long fid = ++g_fid;
@@ -735,7 +752,7 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
         ++g_dgate_real_only;
         g_need_reset = true;
     }
-    else if (mvec == nullptr || depth == nullptr)
+    else if (eval_mvec == nullptr || depth == nullptr)
     {
         ++g_nomv;
         g_need_reset = true;
@@ -768,7 +785,7 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
                 NVSDK_NGX_Result r = NVSDK_NGX_Result_Success;
                 for (unsigned mfi = 1u; mfi <= 3u; ++mfi)
                 {
-                    r = evaluate(cl, set, set.gen[mfi - 1u], mvec, depth, mv_el, reset, fid, 3u, mfi);
+                    r = evaluate(cl, set, set.gen[mfi - 1u], eval_mvec, depth, mv_el, reset, fid, 3u, mfi, pair_flow);
                     ++g_evals;
                     if (r != NVSDK_NGX_Result_Success)
                     {
@@ -827,7 +844,7 @@ void record(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final,
         }
         if (g_evals < 3u)
             mgpu::diag::info("[MGPU][FG] entering EvaluateFeature with official GPU1-local MV/depth");
-        const NVSDK_NGX_Result r = evaluate(cl, set, set.gen[0], mvec, depth, mv_el, reset, fid, mfc, mfi);
+        const NVSDK_NGX_Result r = evaluate(cl, set, set.gen[0], eval_mvec, depth, mv_el, reset, fid, mfc, mfi, pair_flow);
         ++g_evals;
         if (r != NVSDK_NGX_Result_Success && mfi != 1u)
         {
@@ -914,13 +931,15 @@ bool handoff(float r, float g, float b)
     const unsigned long long n = g_handoffs.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n % 120 == 0)
     {
-        char line[680];
+        unsigned long long pair_n = 0, pair_fallback = 0;
+        mgpu::fgpair::stats(pair_n, pair_fallback);
+        char line[760];
         snprintf(line, sizeof(line), "[MGPU][FG] handoffs=%llu generated=%llu presented-gen=%llu presented-real=%llu "
             "dropped=%llu real-fallbacks=%llu invalid-input=%llu busy=%llu errors=%llu pace=%d phase=%d dynamic-real=%llu "
-            "half-ms=%.2f; GPU1 imports=%llu",
+            "pair-pairs=%llu pair-history-fallback=%llu half-ms=%.2f; GPU1 imports=%llu",
             n, g_made, g_pres_gen.load(), g_pres_real.load(), g_dropped.load(), g_fallbacks, g_nomv, g_busy_skips,
             g_errors, g_pace_mode, g_phase_refused ? 0 : g_phase_req, g_dgate_real_only,
-            g_half_n ? g_half_sum / g_half_n : 0.0,
+            pair_n, pair_fallback, g_half_n ? g_half_sum / g_half_n : 0.0,
             (unsigned long long)native_gpu1::imported_frames());
         mgpu::diag::info(line);
     }
@@ -975,6 +994,9 @@ void release()
     // Return each provider lease while its slot/fence still exists. Only then
     // release the GPU1 textures and shared heap; reset must not orphan a lease
     // merely because its tracking fence was destroyed first.
+    // PairFlow descriptors reference set.real; release them only after both
+    // presentation and neural queues have drained, before freeing those sets.
+    mgpu::fgpair::release();
     free_sets();
     native_gpu1::reset(g_i.nqueue, true);
     if (g_eval_fence != nullptr) { g_eval_fence->Release(); g_eval_fence = nullptr; }
