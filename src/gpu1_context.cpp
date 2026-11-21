@@ -11568,6 +11568,11 @@ namespace
         "CopyQueue=2\n"
         "NRScale=0.58\n"
         "NRScale2=0.48\n"
+        "; R401: per-pass network scales are FREE - NRScale1/2/3 accept 0.30..4.00\n"
+        "; (above 1.00 = supersampling). The NGX feature is built ONCE at the cap:\n"
+        "; absent NRScaleCap the cap auto-fits the largest requested scale at arm;\n"
+        "; write NRScaleCap=N (1.00..4.00) to give the panel sliders headroom to N.\n"
+        "; Live panel pulls past the built cap clamp with an [R401] log warning.\n"
         "Calib=2\n"
         "CalibRung=0\n"
         "MvecFromEval=2\n"
@@ -11598,6 +11603,11 @@ namespace
         "; neighbourhood clamp, only still pixels are temporally damped.\n"
         "TemporalStrength=70\n"
         "TemporalMotionAdaptive=1\n"
+        "; R402: residual domain - the CURRENT game colour is the only base, the\n"
+        "; neural output contributes only a rate-limited residual (TemporalResidDelta).\n"
+        "; 1 = on (shipped default), 0 = the classic golden colour kernel.\n"
+        "TemporalResidual=1\n"
+        "TemporalResidDelta=0.10\n"
         "PresentQueue=0\n"
         "Finish=1\n"
         "FinishLook=5\n"
@@ -15449,7 +15459,20 @@ namespace
             s.nrs_stage_pmask &= ~bit;
             float scale = s.nrs_stage_pscale[pass];
             if (scale < 0.05f) scale = 0.05f;
-            if (scale > 1.0f) scale = 1.0f;
+            // R401: staged per-pass scale may exceed Native; cap at 4x like the
+            // ui_set_scale entry (was 1.0, silently truncating supersampling).
+            if (scale > 4.0f) scale = 4.0f;
+            // R401: the feature is built once at nrs_cap_scale; a live pull can never
+            // exceed it (the NGX subrect would overrun the feature). Clamp instead of
+            // refusing, and tell the operator.
+            if (scale > s.nrs_cap_scale)
+            {
+                char lc[220];
+                snprintf(lc, sizeof lc, "[MGPU][R401] pass %u scale %.3f exceeds the built cap %.3f - clamped (raise NRScaleCap and restart to go higher).",
+                         pass + 1u, (double)scale, (double)s.nrs_cap_scale);
+                mgpu::diag::warn(lc);
+                scale = s.nrs_cap_scale;
+            }
             const auto pe = mgpu::b1::pass_extent(s.width, s.height, scale);
             const unsigned pw = pe.width, ph = pe.height;
             if (s.nrs_on && s.nrs_sw != 0u && (pw > s.nrs_sw || ph > s.nrs_sh))
@@ -15462,7 +15485,7 @@ namespace
             }
             s.nrs_pscale[pass] = scale;
             s.nrs_pw[pass] = pw; s.nrs_ph[pass] = ph;
-            if (scale < 0.999f) s.nrs_pass_mask |= bit; else s.nrs_pass_mask &= ~bit;
+            if (scale < 0.999f || scale > 1.001f) s.nrs_pass_mask |= bit; else s.nrs_pass_mask &= ~bit;
             if (s.local_nr)
             {
                 s.local_nr_ngx_reset_mask.fetch_or(bit, std::memory_order_release);
@@ -15729,9 +15752,12 @@ namespace
                                  "depth-gated, motion is never smeared.");
             // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
             // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
+            // R401 (2026-11-21): free scaling - the valid range is 0.05..4.0 on each axis.
+            // The hard ceiling stays because the feature is created once at the cap and
+            // extents above 8192 are refused by the allocator anyway.
             const bool nrs_want = ini_has_key("NRScale") &&
-                                  ((nrs_scx > 0.05f && nrs_scx <= 2.0f) ||
-                                   (nrs_scy > 0.05f && nrs_scy <= 2.0f));
+                                  ((nrs_scx > 0.05f && nrs_scx <= 4.0f) ||
+                                   (nrs_scy > 0.05f && nrs_scy <= 4.0f));
             s.nrs_on = false;
             if (nrs_want)
             {
@@ -15751,9 +15777,25 @@ namespace
                 // rebuild either - it only means the one-time NGX allocation is larger.
                 // (Rebuilding a feature per setting is what leaked gigabytes; the cap is the
                 // way to offer >1.00 without that.)
-                float capsc = ini_read_float("NRScaleCap", 1.0f);
+                // R401: absent NRScaleCap no longer means "1.00 wall". The feature is
+                // created ONCE at the largest scale actually requested (across NRScale
+                // and every NRScale1/2/3), so >100% costs the bigger one-time NGX
+                // allocation and nothing else. An explicit NRScaleCap still wins.
+                float capsc = ini_read_float("NRScaleCap", -1.0f);
+                if (capsc < 1.0f)
+                {
+                    capsc = (sxl > syl) ? sxl : syl;
+                    for (unsigned pi = 0; pi < stream_state::MAX_PASSES; ++pi)
+                    {
+                        char pk[16];
+                        snprintf(pk, sizeof pk, "NRScale%u", pi + 1u);
+                        const float ps = ini_read_float(pk, -1.0f);
+                        if (ps > capsc) capsc = ps;
+                    }
+                    if (capsc < 1.0f) capsc = 1.0f;
+                }
                 if (capsc < 1.0f) capsc = 1.0f;
-                if (capsc > 2.0f) capsc = 2.0f;
+                if (capsc > 4.0f) capsc = 4.0f;
                 s.nrs_cap_scale = capsc;
                 s.nrs_cap_w = ((unsigned)((double)s.width  * (double)capsc + 0.5)) & ~1u;
                 s.nrs_cap_h = ((unsigned)((double)s.height * (double)capsc + 0.5)) & ~1u;
@@ -15784,7 +15826,7 @@ namespace
                         char pk[16];
                         snprintf(pk, sizeof pk, "NRScale%u", pi + 1u);
                         float ps = ini_read_float(pk, -1.0f);
-                        if (ps < 0.05f || ps > 2.0f) ps = (pi == 0u) ? nrs_sc : 1.0f;
+                        if (ps < 0.05f || ps > 4.0f) ps = (pi == 0u) ? nrs_sc : 1.0f;
                         if (ps > capsc) ps = capsc;
                         unsigned pw = (unsigned)((double)s.width  * (double)ps + 0.5);
                         unsigned ph = (unsigned)((double)s.height * (double)ps + 0.5);
@@ -15796,12 +15838,18 @@ namespace
                     }
                     unsigned mxw = nw, mxh = nh;
                     for (unsigned i = 0; i < s.nr_built && i < stream_state::MAX_PASSES; ++i)
-                        if (s.nrs_all || s.nrs_pscale[i] < 0.999f)
+                        if (s.nrs_all || s.nrs_pscale[i] < 0.999f || s.nrs_pscale[i] > 1.001f)
                         {
                             if (s.nrs_pw[i] > mxw) mxw = s.nrs_pw[i];
                             if (s.nrs_ph[i] > mxh) mxh = s.nrs_ph[i];
                         }
-                    s.nrs_sw = mxw; s.nrs_sh = mxh;
+                    // R401: the scratch is sized to the FEATURE CAP (never smaller than
+                    // any carrying pass by construction), so a live panel pull past
+                    // Native - up to NRScaleCap - never hits the old "exceeds the
+                    // arm-time scratch, restart" wall. Default run: cap = 1.00, byte-
+                    // identical to the old mxw/mxh result.
+                    s.nrs_sw = s.nrs_cap_w; s.nrs_sh = s.nrs_cap_h;
+                    (void)mxw; (void)mxh;
                 }
                 if (nrs_init(ndev, s, line, sizeof line) && nrs_alloc(ndev, s, line, sizeof line))
                 {
@@ -15810,7 +15858,7 @@ namespace
                     // path iff its own scale is below native (NRSPass=2 still forces all).
                     s.nrs_pass_mask = 0u;
                     for (unsigned i = 0; i < s.nr_built && i < stream_state::MAX_PASSES; ++i)
-                        if (s.nrs_all || s.nrs_pscale[i] < 0.999f) s.nrs_pass_mask |= 1u << i;
+                        if (s.nrs_all || s.nrs_pscale[i] < 0.999f || s.nrs_pscale[i] > 1.001f) s.nrs_pass_mask |= 1u << i;
                     g_pr_on.store(1, std::memory_order_relaxed);   // R299
                     s.nrs_dev = ndev;
                     s.nrs_cre_v = (void *)p_cre;   // [OURS] NRS: stashed for live scale changes
@@ -20483,7 +20531,10 @@ void ui_set_scale(unsigned pass, float scale)
     stream_state &s = str();
     std::lock_guard<std::mutex> lk(s.cs);
     if (scale < 0.05f) scale = 0.05f;
-    if (scale > 1.0f) scale = 1.0f;
+    // R401: allow per-pass network scales above 100% (up to 4x). The old 1.0
+    // wall here silently undid any slider pull past Native, which is why >100%
+    // looked accepted in the panel but never took effect in the pass extent.
+    if (scale > 4.0f) scale = 4.0f;
     // R375: stage only. The pre-debounce version applied every slider tick live -
     // a drag was a Reset=1 storm on the pass (see nrs_flush_staged_scales).
     if (s.nrs_stage_pmask == 0u) s.nrs_stage_pt.QuadPart = 0;
@@ -20569,7 +20620,8 @@ void ui_set_cadence(unsigned n)
 void ui_nrs_stage(float scale)
 {
     if (!(scale > 0.05f)) return;
-    if (scale > 2.0f) scale = 2.0f;
+    // R401: allow up to 4x supersampling (was 2.0).
+    if (scale > 4.0f) scale = 4.0f;
     stream_state &s = str();
     unsigned count = 0u;
     {
@@ -20578,7 +20630,8 @@ void ui_nrs_stage(float scale)
         // per-pass extents exist. It must not arm the old global scratch resize.
         if (s.nrs_pw[0] != 0u && s.nr_built != 0u)
         {
-            if (scale > 1.0f) scale = 1.0f;
+            // R401: master slider may drive per-pass scales past Native too.
+            if (scale > 4.0f) scale = 4.0f;
             count = s.passes < s.nr_built ? s.passes : s.nr_built;
             if (count > stream_state::MAX_PASSES) count = stream_state::MAX_PASSES;
             if (s.nrs_stage_pmask == 0u) s.nrs_stage_pt.QuadPart = 0;
@@ -22969,31 +23022,39 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
         {
             float master = ini_read_float("NRScale", 0.62f);
             if (!(master > 0.05f)) master = 0.62f;
-            if (master > 1.0f) master = 1.0f;
+            // R401: the local (single-GPU) path accepts >Native scales too, up to 4x.
+            if (master > 4.0f) master = 4.0f;
             s.nrs_scale = master;
             s.nrs_on = true;
             s.nrs_live = true;
-            s.nrs_cap_scale = 1.0f;
-            s.nrs_cap_w = s.width; s.nrs_cap_h = s.height;
-            s.nrs_sw = s.width; s.nrs_sh = s.height;
             s.nrs_pass_mask = 0u;
+            float capl = master;
             for (unsigned pi = 0; pi < 3u; ++pi)
             {
                 char key[16];
                 snprintf(key, sizeof key, "NRScale%u", pi + 1u);
                 float ps = ini_read_float(key, master);
                 if (!(ps > 0.05f)) ps = master;
-                if (ps > 1.0f) ps = 1.0f;
+                if (ps > 4.0f) ps = 4.0f; // R401: per-pass ini may exceed Native, cap 4x
                 const auto pe = mgpu::b1::pass_extent(s.width, s.height, ps);
                 s.nrs_pscale[pi] = ps;
                 s.nrs_pw[pi] = pe.width; s.nrs_ph[pi] = pe.height;
-                if (ps < 0.999f) s.nrs_pass_mask |= 1u << pi;
+                if (ps < 0.999f || ps > 1.001f) s.nrs_pass_mask |= 1u << pi;
+                if (ps > capl) capl = ps;
             }
+            // R401: the feature and the slot storage are built at the largest
+            // requested scale, so a >Native pass never writes past its buffers.
+            s.nrs_cap_scale = capl;
+            s.nrs_cap_w = ((unsigned)((double)s.width  * (double)capl + 0.5)) & ~1u;
+            s.nrs_cap_h = ((unsigned)((double)s.height * (double)capl + 0.5)) & ~1u;
+            if (s.nrs_cap_w > 8192u) s.nrs_cap_w = 8192u;
+            if (s.nrs_cap_h > 8192u) s.nrs_cap_h = 8192u;
+            s.nrs_sw = s.nrs_cap_w; s.nrs_sh = s.nrs_cap_h;
             const unsigned final_pass = (s.passes >= 1u && s.passes <= 3u) ? s.passes - 1u : 0u;
             s.local_nr_width = s.nrs_pw[final_pass];
             s.local_nr_height = s.nrs_ph[final_pass];
-            s.local_nr_max_width = s.width;
-            s.local_nr_max_height = s.height;
+            s.local_nr_max_width = s.nrs_cap_w;
+            s.local_nr_max_height = s.nrs_cap_h;
             s.local_nr_format = (unsigned)s.format;
             s.nrs_w = s.local_nr_width;
             s.nrs_h = s.local_nr_height;
@@ -29231,7 +29292,7 @@ void stream_poll()
                             // waiting on the fence. Forcing a free without the fence is exactly
                             // what froze the stream on 2026-10-12 00:31, so the rebuild simply
                             // waits a frame - the tick above drains the list in two or three.
-                            if (!per_pass_extents && s.nrs_park_n < 2u && want > 0.05f && want <= 2.0f && fabsf(want - s.nrs_scale) > 0.005f)
+                            if (!per_pass_extents && s.nrs_park_n < 2u && want > 0.05f && want <= 4.0f && fabsf(want - s.nrs_scale) > 0.005f)
                             {
                                 unsigned nw = (unsigned)((double)s.width  * (double)want + 0.5);
                                 unsigned nh = (unsigned)((double)s.height * (double)want + 0.5);
@@ -29830,8 +29891,10 @@ void stream_poll()
                 // Golden Prism 1.1 stabilises the final same-size colour only after
                 // a real evaluation. Held frames reuse the last stabilised output;
                 // no pass count, extent, preset, transport or present timing changes.
+                // R402: with TemporalResidual=1 the same call instead limits the
+                // neural RESIDUAL against the live game colour (s.tex_in[ii]).
                 if (final_pass_ok && s.nr_final != nullptr)
-                    mgpu::temporal_stab::apply(s.nl, s.nr_final);
+                    mgpu::temporal_stab::apply(s.nl, s.nr_final, s.tex_in[ii]);
 
                 if (cv_ran)   // R217: restore only after PWARP has sampled the chain
                     barrier(s.nl, s.cv_out, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,

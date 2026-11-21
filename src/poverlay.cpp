@@ -1623,7 +1623,7 @@ struct OvSet
 {
     bool enabled = false, split = false, armed = false;
     int look = 0, modelStyle = 0, passes = 1, cadence = 1, gradeSlot = 0, fpsCap = 0;
-    float intensity = 1.0f, guard = 1.0f, faceMask = 0.30f, nrs = 0.75f, splitPos = 0.5f;
+    float intensity = 1.0f, guard = 1.0f, faceMask = 0.30f, nrs = 0.75f, nrsCap = 1.0f, splitPos = 0.5f;
     bool nrsOn = false;
     unsigned outW = 0, outH = 0, netW = 0, netH = 0;
     prism::GradeValues grade[prism::kGradeSlots];
@@ -1700,6 +1700,7 @@ void ReadSet(OvSet &s)
     // The old global row is a master for the new per-pass scales. Mirror pass 1
     // so an edit cannot snap back while NRScale1/2/3 override the legacy value.
     s.nrs = st.nrs_pscale[0] > 0.05f ? st.nrs_pscale[0] : st.nrs_scale;
+    s.nrsCap = st.nrs_cap > 1.001f ? st.nrs_cap : 1.0f;   // R401: slider top = the built cap
     s.split = st.present_mode == 2;
     s.splitPos = st.split_pos;
     s.outW = st.nrs_native_w;
@@ -2287,6 +2288,20 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         const int c = r < rowsLeft ? 0 : 1, i = c ? r - rowsLeft : r;
         const float colX0 = x0 + pad + float(c) * colW, colX1 = colX0 + colW;
         const float cx0 = colX0 + labelW, cx1 = colX1 - pad;
+        // R401: piecewise NRS bar mapping. With the cap at 1.00 (default) the bar
+        // is exactly the old 30..100%. With NRScaleCap>1 the first 75 bar units
+        // stay 30..100% (fine control untouched) and the top quarter spans
+        // 100%..cap%.
+        auto nrsBarFromScale = [](float sc, float cap) -> float {
+            if (cap <= 1.001f) return (sc - 0.30f) / 0.70f * 100.0f;
+            if (sc <= 1.0f) return (sc - 0.30f) / 0.70f * 75.0f;
+            return 75.0f + (sc - 1.0f) / (cap - 1.0f) * 25.0f;
+        };
+        auto nrsScaleFromBar = [](float v, float cap) -> float {
+            if (cap <= 1.001f) return 0.30f + v / 100.0f * 0.70f;
+            if (v <= 75.0f) return 0.30f + v / 75.0f * 0.70f;
+            return 1.0f + (v - 75.0f) / 25.0f * (cap - 1.0f);
+        };
         const float ry = y + float(i) * rowH;
         const bool focused = panel.focus == r && keysHere;
         const bool rowEnabled = true;
@@ -2419,10 +2434,13 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             // R370: per-pass resolution slider, 30..100% (100% = a native full pass on
             // this pass). Writes NRScale1/2/3 to the ini and applies live through
             // ui_set_scale - no recreate, a mask flip + Reset on that pass's next evaluate.
+            // R401: with NRScaleCap>1 the slider continues past Native up to the cap
+            // (the feature is built once at the cap, so no rebuild is ever needed).
             const unsigned pi = unsigned(r - kP1Res) / 2u;
             mgpu::gpu1::ui_state stn;
             mgpu::gpu1::ui_read(stn);
             const bool live = stn.armed && stn.nr_ok;
+            const float cap = stn.nrs_cap > 1.001f ? stn.nrs_cap : 1.0f;
             float cur;
             if (live)
                 cur = stn.nrs_pscale[pi] > 0.05f ? stn.nrs_pscale[pi] : stn.nrs_scale;
@@ -2433,7 +2451,7 @@ void DrawPanel(UINT bw, UINT bh, float dt)
                 cur = mgpu::gpu1::ui_ini_read_float(pk, -1.0f);
                 if (cur < 0.05f)
                     cur = (pi == 0u) ? mgpu::gpu1::ui_ini_read_float("NRScale", 1.0f) : 1.0f;
-                cur = std::clamp(cur, 0.30f, 1.00f);
+                cur = std::clamp(cur, 0.30f, cap);
             }
             // A drag only previews here. Apply and persist once on release: applying
             // during the drag resets DLSS-NR history repeatedly and leaves old/new
@@ -2441,11 +2459,11 @@ void DrawPanel(UINT bw, UINT bh, float dt)
             static float pendingScale[3] = {-1.0f, -1.0f, -1.0f};
             const float shown = pendingScale[pi] > 0.0f ? pendingScale[pi] : cur;
             const float max = 100.0f;
-            const float val = (shown - 0.30f) / 0.70f * max;
+            const float val = nrsBarFromScale(shown, cap);
             const float vw = U(52);
             const Bars b =
                 BarSlider(cx0, sy + U(5), cx1 - vw - U(8), sh - U(14), val, max, 0.0f, 0.0f, true, focused);
-            TextRight(cx1, ty, shown >= 0.999f ? L"原生" : Fmt(L"%.0f%%", shown * 100.0), kValue,
+            TextRight(cx1, ty, std::fabs(shown - 1.0f) < 0.005f ? L"原生" : Fmt(L"%.0f%%", shown * 100.0), kValue,
                       focused ? kWhite : kReadout);
             float nv = val;
             const bool over = in.mx >= b.x0 - U(4) && in.mx < b.x1 + U(4) && in.my >= ry && in.my < ry + rowH && !in.pad;
@@ -2454,11 +2472,13 @@ void DrawPanel(UINT bw, UINT bh, float dt)
                 panel.drag = Panel::kSlide;
                 panel.dragRow = r;
             }
+            // R401: half-unit steps - 0.47% each in the 30..100% span, (cap-1)/50
+            // above Native (6% at cap 4.0).
             if (panel.drag == Panel::kSlide && panel.dragRow == r && in.down)
-                nv = std::round(std::clamp((in.mx - b.x0) / (b.x1 - b.x0), 0.0f, 1.0f) * max / 5.0f) * 5.0f;
-            if (over && in.wheelSteps) nv = std::clamp(nv + in.wheelSteps * 5.0f, 0.0f, max);
-            if (keyStep) nv = std::clamp(std::round((nv + step * 5.0f) / 5.0f) * 5.0f, 0.0f, max);
-            const float scale = 0.30f + nv / max * 0.70f;
+                nv = std::round(std::clamp((in.mx - b.x0) / (b.x1 - b.x0), 0.0f, 1.0f) * max / 0.5f) * 0.5f;
+            if (over && in.wheelSteps) nv = std::clamp(nv + in.wheelSteps * 2.0f, 0.0f, max);
+            if (keyStep) nv = std::clamp(std::round((nv + step * 2.0f) / 0.5f) * 0.5f, 0.0f, max);
+            const float scale = nrsScaleFromBar(nv, cap);
             if (std::fabs(scale - shown) > 1e-4f) pendingScale[pi] = scale;
             const bool dragging = panel.drag == Panel::kSlide && panel.dragRow == r && in.down;
             if (!dragging && pendingScale[pi] > 0.0f)
@@ -2474,12 +2494,13 @@ void DrawPanel(UINT bw, UINT bh, float dt)
         }
         case kNetScale: {
             const float max = 100.0f;
-            const float val = n.nrsOn ? (n.nrs - 0.30f) / 0.70f * max : 0.0f;
-            const float ref = (0.75f - 0.30f) / 0.70f * max;
+            const float cap = n.nrsCap;   // R401: piecewise top = the built cap
+            const float val = n.nrsOn ? nrsBarFromScale(n.nrs, cap) : 0.0f;
+            const float ref = nrsBarFromScale(0.75f, cap);
             const float vw = U(52);
             const Bars b = BarSlider(cx0, sy + U(5), cx1 - vw - U(8), sh - U(14),
                                      n.nrsOn ? val : 0.0f, max, ref, 0.0f, n.nrsOn, focused);
-            TextRight(cx1, ty, n.nrsOn ? (n.nrs >= 0.999f ? L"原生" : Fmt(L"%.0f%%", n.nrs * 100.0)) : L"—",
+            TextRight(cx1, ty, n.nrsOn ? (std::fabs(n.nrs - 1.0f) < 0.005f ? L"原生" : Fmt(L"%.0f%%", n.nrs * 100.0)) : L"—",
                       kValue, focused ? kWhite : n.nrsOn ? kReadout : kQuiet);
             float nv = val;
             const bool over = n.nrsOn && in.mx >= b.x0 - U(4) && in.mx < b.x1 + U(4) &&
@@ -2490,10 +2511,10 @@ void DrawPanel(UINT bw, UINT bh, float dt)
                 panel.dragRow = r;
             }
             if (panel.drag == Panel::kSlide && panel.dragRow == r && in.down)
-                nv = std::round(std::clamp((in.mx - b.x0) / (b.x1 - b.x0), 0.0f, 1.0f) * max / 5.0f) * 5.0f;
-            if (over && in.wheelSteps) nv = std::clamp(nv + in.wheelSteps * 5.0f, 0.0f, max);
-            if (keyStep && n.nrsOn) nv = std::clamp(std::round((nv + step * 5.0f) / 5.0f) * 5.0f, 0.0f, max);
-            const float scale = 0.30f + nv / max * 0.70f;
+                nv = std::round(std::clamp((in.mx - b.x0) / (b.x1 - b.x0), 0.0f, 1.0f) * max / 0.5f) * 0.5f;
+            if (over && in.wheelSteps) nv = std::clamp(nv + in.wheelSteps * 2.0f, 0.0f, max);
+            if (keyStep && n.nrsOn) nv = std::clamp(std::round((nv + step * 2.0f) / 0.5f) * 0.5f, 0.0f, max);
+            const float scale = nrsScaleFromBar(nv, cap);
             if (n.nrsOn && std::fabs(scale - n.nrs) > 1e-4f)
             {
                 n.nrs = scale;

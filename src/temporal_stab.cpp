@@ -22,28 +22,33 @@ std::atomic<bool> g_active{false};
 ID3D12Device *g_dev = nullptr;
 ID3D12RootSignature *g_rs = nullptr;
 ID3D12PipelineState *g_pso = nullptr;
+ID3D12PipelineState *g_pso_resid = nullptr;   // R402: residual-domain mode
 ID3D12DescriptorHeap *g_heap = nullptr;
 ID3D12Resource *g_history[2] = {nullptr, nullptr};
 ID3D12Resource *g_dummy_motion = nullptr;
+ID3D12Resource *g_out = nullptr;              // R402: composite target in residual mode
 UINT g_inc = 0;
 unsigned g_w = 0, g_h = 0;
 DXGI_FORMAT g_fmt = DXGI_FORMAT_UNKNOWN;
 float g_strength = 0.0f;
 unsigned g_adaptive = 1;
+bool g_residual_mode = false;                 // R402: TemporalResidual=1
+float g_delta = 0.10f;                        // R402: TemporalResidDelta (relative rate limit)
 bool g_history_valid = false;
 unsigned long long g_frame = 0;
 unsigned g_slot = 0;
 unsigned long long g_applies = 0;
 
 constexpr UINT RING = 8;
-constexpr UINT DESCRIPTORS_PER_SLOT = 4; // t0, t1, t2, u0
+constexpr UINT DESCRIPTORS_PER_SLOT = 5; // t0 current, t1 history, t2 motion/base, u0 out/history, u1 composite
 
 struct consts_t
 {
     unsigned w, h;
     float strength;
     unsigned adaptive, history_valid, motion_valid;
-    unsigned pad0, pad1;
+    float delta_limit;   // R402: residual rate limit (golden mode ignores it)
+    unsigned pad1;
 };
 static_assert(sizeof(consts_t) == 32, "eight root constants");
 
@@ -98,6 +103,53 @@ void main(uint3 id : SV_DispatchThreadID) {
 }
 )";
 
+// R402: residual-domain stabiliser. The colour base is ALWAYS the current game
+// frame; the neural output contributes only its residual (NR - base), and it is
+// the RESIDUAL that is rate-limited and low-passed over time. A held/stale
+// neural colour therefore never reaches the screen as colour - only as an
+// enhancement delta on top of the live frame. Mirrors Veyra's documented
+// "residual extrapolation + temporal stability" model for video/capture input.
+const char kShaderResid[] = R"(
+cbuffer C : register(b0) {
+  uint2 Extent; float Strength; uint Adaptive; uint HistoryValid; uint MotionValid;
+  float DeltaLimit; uint Pad1;
+};
+Texture2D<float4> Current : register(t0);   // nr_final (native, float)
+Texture2D<float4> HistRes : register(t1);   // previous filtered residual
+Texture2D<float4> Base : register(t2);      // CURRENT game colour, same extent
+RWTexture2D<float4> OutRes : register(u0);  // filtered residual -> next history
+RWTexture2D<float4> OutCol : register(u1);  // base + residual -> copied to nr_final
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+  if (any(id.xy >= Extent)) return;
+  const int2 p = int2(id.xy);
+  const float4 c = Current.Load(int3(p, 0));
+  const float3 base = Base.Load(int3(p, 0)).rgb;
+  const float3 rcur = c.rgb - base;
+  float3 rf = rcur;
+  if (HistoryValid != 0 && Strength > 0.0) {
+    const float3 rp = HistRes.Load(int3(p, 0)).rgb;
+    const float3 delta = rcur - rp;
+    // Per-frame residual rate limit, scaled by the local magnitudes so dark
+    // pixels are not over-clamped and bright ones cannot jump. Boiling is a
+    // small high-frequency residual oscillation: this is exactly what it kills.
+    const float3 lim = DeltaLimit * (0.05 + abs(rp) + 0.25 * abs(base));
+    const float3 limited = rp + clamp(delta, -lim, lim);
+    // Adaptive escape: a LARGE residual change is new content / a cut, not
+    // noise - drop the limiter there so enhancement never lags a scene change.
+    const float3 d = abs(rcur - limited);
+    const float3 range = max(0.04, max(abs(rcur), abs(limited)) + 0.05);
+    const float difference = max(d.r / range.r, max(d.g / range.g, d.b / range.b));
+    const float keep = Adaptive ? 1.0 - smoothstep(0.18, 0.72, difference) : 1.0;
+    const float w = clamp(Strength, 0.0, 0.95) * keep;
+    rf = lerp(rcur, limited, w);
+  }
+  OutRes[p] = float4(rf, 1.0);
+  OutCol[p] = float4(base + rf, c.a);
+}
+)";
+
 typedef HRESULT (WINAPI *pfn_d3dcompile)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO *,
                                          ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
                                          ID3DBlob **, ID3DBlob **);
@@ -112,13 +164,17 @@ void release_all()
     g_active.store(false, std::memory_order_relaxed);
     IUnknown *u;
     u = g_pso; rel(u); g_pso = nullptr;
+    u = g_pso_resid; rel(u); g_pso_resid = nullptr;
     u = g_rs; rel(u); g_rs = nullptr;
     u = g_heap; rel(u); g_heap = nullptr;
     u = g_history[0]; rel(u); g_history[0] = nullptr;
     u = g_history[1]; rel(u); g_history[1] = nullptr;
     u = g_dummy_motion; rel(u); g_dummy_motion = nullptr;
+    u = g_out; rel(u); g_out = nullptr;
     g_dev = nullptr;
     g_w = g_h = 0;
+    // NOTE: g_residual_mode / g_delta / g_strength are read_keys() products and
+    // arm() calls release_all() AFTER read_keys() - do not clear them here.
     g_history_valid = false;
     g_frame = 0;
     g_slot = 0;
@@ -167,6 +223,10 @@ bool read_keys()
     g_strength = key_float(buf.data(), got, "TemporalStrength", 0.0f, 0.0f, 100.0f) / 100.0f;
     if (g_strength <= 0.0f) return false;
     g_adaptive = (unsigned)key_float(buf.data(), got, "TemporalMotionAdaptive", 1.0f, 0.0f, 1.0f);
+    // R402: opt-in residual domain. Default 0 keeps the golden colour kernel.
+    // (The float-format guard lives in arm(), after g_fmt is known.)
+    g_residual_mode = key_float(buf.data(), got, "TemporalResidual", 0.0f, 0.0f, 1.0f) > 0.5f;
+    g_delta = key_float(buf.data(), got, "TemporalResidDelta", 0.10f, 0.01f, 1.0f);
     return true;
 }
 
@@ -284,12 +344,31 @@ bool build(ID3D12Device *dev)
     }
     if (err != nullptr) { err->Release(); err = nullptr; }
 
+    ID3DBlob *csr = nullptr;   // R402: residual kernel, only in residual mode
+    if (g_residual_mode)
+    {
+        hr = compile(kShaderResid, sizeof(kShaderResid) - 1u, "temporal_stab_resid", nullptr,
+                     nullptr, "main", "cs_5_0", 0, 0, &csr, &err);
+        if (FAILED(hr) || csr == nullptr)
+        {
+            char line[1000];
+            snprintf(line, sizeof line, "[MGPU][TEMPORAL][R402] residual kernel compile failed: 0x%08X %s",
+                     (unsigned)hr, err != nullptr ? (const char *)err->GetBufferPointer() : "");
+            mgpu::diag::error(line);
+            if (err != nullptr) err->Release();
+            if (csr != nullptr) csr->Release();
+            cs->Release();
+            return false;
+        }
+        if (err != nullptr) { err->Release(); err = nullptr; }
+    }
+
     D3D12_DESCRIPTOR_RANGE ranges[2] = {};
     ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
     ranges[0].NumDescriptors = 3;
     ranges[0].BaseShaderRegister = 0;
     ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
-    ranges[1].NumDescriptors = 1;
+    ranges[1].NumDescriptors = 2;   // R402: u0 history/composite, u1 residual composite (unused by golden)
     ranges[1].BaseShaderRegister = 0;
     ranges[1].OffsetInDescriptorsFromTableStart = 3;
     D3D12_ROOT_PARAMETER rp[2] = {};
@@ -319,6 +398,15 @@ bool build(ID3D12Device *dev)
         hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pso));
     }
     cs->Release();
+    if (SUCCEEDED(hr) && g_residual_mode)
+    {
+        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+        pd.pRootSignature = g_rs;
+        pd.CS.pShaderBytecode = csr->GetBufferPointer();
+        pd.CS.BytecodeLength = csr->GetBufferSize();
+        hr = dev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g_pso_resid));
+    }
+    if (csr != nullptr) csr->Release();
     if (FAILED(hr))
     {
         char line[200];
@@ -336,6 +424,9 @@ bool build(ID3D12Device *dev)
     if (SUCCEEDED(hr))
         hr = make_texture(dev, 1, 1, DXGI_FORMAT_R32G32_FLOAT, D3D12_RESOURCE_FLAG_NONE,
                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &g_dummy_motion);
+    if (SUCCEEDED(hr) && g_residual_mode)
+        hr = make_texture(dev, g_w, g_h, g_fmt, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS, &g_out);
     if (FAILED(hr)) return false;
 
     D3D12_DESCRIPTOR_HEAP_DESC hd{};
@@ -357,6 +448,14 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt)
     g_w = width;
     g_h = height;
     g_fmt = view_format(fmt);
+    if (g_residual_mode && g_fmt != DXGI_FORMAT_R16G16B16A16_FLOAT)
+    {
+        // Residuals are signed; an UNORM history cannot store them. Refuse the
+        // mode loudly rather than silently clipping every negative delta.
+        mgpu::diag::error("[MGPU][TEMPORAL][R402] TemporalResidual=1 needs an R16G16B16A16_FLOAT "
+                          "nr_final; this stream is not float - using the golden colour kernel.");
+        g_residual_mode = false;
+    }
     if (!build(dev))
     {
         release_all();
@@ -364,10 +463,17 @@ bool arm(ID3D12Device *dev, unsigned width, unsigned height, DXGI_FORMAT fmt)
     }
     g_active.store(true, std::memory_order_relaxed);
     char line[360];
-    snprintf(line, sizeof line,
-             "[MGPU][TEMPORAL] same-size residual/history colour stabiliser armed: %ux%u "
-             "strength=%.0f%% motion-adaptive=%u flow=0; no SR/upscaling pass",
-             g_w, g_h, (double)(g_strength * 100.0f), g_adaptive);
+    if (g_residual_mode)
+        snprintf(line, sizeof line,
+                 "[MGPU][TEMPORAL][R402] RESIDUAL-domain stabiliser armed: %ux%u strength=%.0f%% "
+                 "delta=%.3f adaptive=%u; base = CURRENT game colour every evaluation, the neural "
+                 "output contributes only a rate-limited residual (no stale neural colour on screen)",
+                 g_w, g_h, (double)(g_strength * 100.0f), (double)g_delta, g_adaptive);
+    else
+        snprintf(line, sizeof line,
+                 "[MGPU][TEMPORAL] same-size residual/history colour stabiliser armed: %ux%u "
+                 "strength=%.0f%% motion-adaptive=%u flow=0; no SR/upscaling pass",
+                 g_w, g_h, (double)(g_strength * 100.0f), g_adaptive);
     mgpu::diag::info(line);
     mgpu::diag::info("[MGPU][AMD-OF] colour flow unavailable; temporal falls back to same-pixel history");
     return true;
@@ -378,9 +484,10 @@ bool active()
     return g_active.load(std::memory_order_relaxed);
 }
 
-void apply(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final)
+void apply(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final, ID3D12Resource *base)
 {
     if (!active() || cl == nullptr || nr_final == nullptr) return;
+    const bool resid = g_residual_mode && g_pso_resid != nullptr && g_out != nullptr && base != nullptr;
 
     const unsigned out_index = (unsigned)(g_frame & 1ull);
     ID3D12Resource *output = g_history[out_index];
@@ -400,8 +507,12 @@ void apply(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final)
     g_slot = (g_slot + 1u) % RING;
     write_srv(cpu_slot(slot, 0), nr_final, g_fmt);
     write_srv(cpu_slot(slot, 1), previous, g_fmt);
-    write_srv(cpu_slot(slot, 2), g_dummy_motion, DXGI_FORMAT_R32G32_FLOAT);
+    if (resid)
+        write_srv(cpu_slot(slot, 2), base, g_fmt);   // R402: CURRENT game colour (PWARP binds it the same way, no transitions)
+    else
+        write_srv(cpu_slot(slot, 2), g_dummy_motion, DXGI_FORMAT_R32G32_FLOAT);
     write_uav(cpu_slot(slot, 3), output, g_fmt);
+    write_uav(cpu_slot(slot, 4), g_out, g_fmt);      // null in golden mode: the golden kernel has no u1
 
     consts_t c{};
     c.w = g_w;
@@ -410,26 +521,31 @@ void apply(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final)
     c.adaptive = g_adaptive;
     c.history_valid = g_history_valid ? 1u : 0u;
     c.motion_valid = 0u;
+    c.delta_limit = resid ? g_delta : 0.0f;
 
     ID3D12DescriptorHeap *heaps[] = {g_heap};
     cl->SetComputeRootSignature(g_rs);
-    cl->SetPipelineState(g_pso);
+    cl->SetPipelineState(resid ? g_pso_resid : g_pso);
     cl->SetDescriptorHeaps(1, heaps);
     cl->SetComputeRoot32BitConstants(0, 8, &c, 0);
     cl->SetComputeRootDescriptorTable(1, gpu_slot(slot));
     cl->Dispatch((g_w + 7u) / 8u, (g_h + 7u) / 8u, 1u);
     uav_barrier(cl, output);
+    if (resid) uav_barrier(cl, g_out);
 
     // Present still consumes nr_final. Copy the stabilised output back once;
     // the other history texture remains the previous frame for the next call.
-    transition(cl, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+    // R402: in residual mode the colour copy comes from g_out (base+residual);
+    // `output` keeps the filtered residual as next frame's history.
+    ID3D12Resource *const colour = resid ? g_out : output;
+    transition(cl, colour, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                D3D12_RESOURCE_STATE_COPY_SOURCE);
     transition(cl, nr_final, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                D3D12_RESOURCE_STATE_COPY_DEST);
-    cl->CopyResource(nr_final, output);
+    cl->CopyResource(nr_final, colour);
     transition(cl, nr_final, D3D12_RESOURCE_STATE_COPY_DEST,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    transition(cl, output, D3D12_RESOURCE_STATE_COPY_SOURCE,
+    transition(cl, colour, D3D12_RESOURCE_STATE_COPY_SOURCE,
                D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
 
     g_history_valid = true;
@@ -438,8 +554,8 @@ void apply(ID3D12GraphicsCommandList *cl, ID3D12Resource *nr_final)
     if (g_applies == 1ull || g_applies % 300ull == 0ull)
     {
         char line[160];
-        snprintf(line, sizeof line, "[MGPU][TEMPORAL][LIVE] applies=%llu history=%ux%u",
-                 g_applies, g_w, g_h);
+        snprintf(line, sizeof line, "[MGPU][TEMPORAL][LIVE] applies=%llu history=%ux%u resid=%u",
+                 g_applies, g_w, g_h, resid ? 1u : 0u);
         mgpu::diag::info(line);
     }
 }
